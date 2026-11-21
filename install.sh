@@ -35,7 +35,7 @@ jq -er '.bins | select(type == "array" and length > 0 and
     all(.[]; type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._+-]*\\z")))[]' \
     "$work/manifest.json" > "$work/bins" || die "invalid bin list in manifest"
 
-tar --zstd --extract --file "$archive" --directory / --exclude=manifest.json
+tar --zstd --extract --file "$archive" --directory / --anchored --exclude=manifest.json
 while IFS= read -r bin; do
     [ -x "$store_path/bin/$bin" ] || die "missing executable $store_path/bin/$bin"
 done < "$work/bins"
