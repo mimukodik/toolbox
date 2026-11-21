@@ -31,3 +31,9 @@ into `/usr/local/bin`. It works without Nix.
    The archive must include an install manifest with `store_path` and `bins`.
 4. When a change alters a published archive, bump the tool's patch level. A
    published tag can only be reused when the archive digest is identical.
+
+## License
+
+Licensed under either of Apache License 2.0 or MIT at your option.
+Patches to upstream tools under `tools/*/patches/` are also subject to the
+upstream tool's license (Codex: Apache-2.0).
