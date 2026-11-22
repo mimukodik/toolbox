@@ -1231,7 +1231,7 @@ index 0000000..643c9cc
 +}
 diff --git a/src/lint/plugins/effect/rules/bun_global_error_in_effect_catch.rs b/src/lint/plugins/effect/rules/bun_global_error_in_effect_catch.rs
 new file mode 100644
-index 0000000..70b5e0e
+index 0000000..306b258
 --- /dev/null
 +++ b/src/lint/plugins/effect/rules/bun_global_error_in_effect_catch.rs
 @@ -0,0 +1,30 @@
@@ -1250,7 +1250,7 @@ index 0000000..70b5e0e
 +    On::new().exprs(&[ExprTag::Call]),
 +    fn expr<'a>(&self, expr: Expr<'a>, cx: &mut Cx<'a, Self>) {
 +        let call = expr.ts_node();
-+        let mut output = type_parser::catch_return_types(call);
++        let mut output = type_parser::catch_return_types(call, cx.file().modules());
 +        let Some(first) = output.next() else { return };
 +        let Some(global) = type_parser::global_error(cx.file().type_checker()) else {
 +            return;
@@ -1305,10 +1305,10 @@ index 0000000..533f9a9
 +);
 diff --git a/src/lint/plugins/effect/rules/bun_unknown_in_effect_catch.rs b/src/lint/plugins/effect/rules/bun_unknown_in_effect_catch.rs
 new file mode 100644
-index 0000000..4968be8
+index 0000000..6c24f75
 --- /dev/null
 +++ b/src/lint/plugins/effect/rules/bun_unknown_in_effect_catch.rs
-@@ -0,0 +1,24 @@
+@@ -0,0 +1,25 @@
 +use crate::effect::{report, type_parser};
 +use bun_lint::prelude::*;
 +use bun_lint::types::TypeFlags;
@@ -1325,7 +1325,8 @@ index 0000000..4968be8
 +    On::new().exprs(&[ExprTag::Call]),
 +    fn expr<'a>(&self, expr: Expr<'a>, cx: &mut Cx<'a, Self>) {
 +        let call = expr.ts_node();
-+        if type_parser::catch_return_types(call).any(|ty| ty.has_flags(TypeFlags::ANY | TypeFlags::UNKNOWN))
++        if type_parser::catch_return_types(call, cx.file().modules())
++            .any(|ty| ty.has_flags(TypeFlags::ANY | TypeFlags::UNKNOWN))
 +            && let Some(callee) = call.expression()
 +            && let Some(report) = report(cx, self.hidden_by_default, callee.span(), MESSAGE)
 +        {
@@ -1380,12 +1381,13 @@ index 0000000..e944696
 +);
 diff --git a/src/lint/plugins/effect/type_parser.rs b/src/lint/plugins/effect/type_parser.rs
 new file mode 100644
-index 0000000..c308023
+index 0000000..acd956c
 --- /dev/null
 +++ b/src/lint/plugins/effect/type_parser.rs
-@@ -0,0 +1,223 @@
+@@ -0,0 +1,233 @@
 +// Adapted from Effect's MIT-licensed ets_typeparser at 0e722d359c969bdf1b1316f08e8637022cde3cce.
 +// Bun's typed handles delegate these queries to the checker for the current file.
++use bun_lint::modules::Modules;
 +use bun_lint::types::{
 +    NodeFlags, Signature, SymbolFlags, SyntaxKind as Kind, TsNode, TsSymbol, Type, TypeFlags, Types,
 +};
@@ -1573,15 +1575,21 @@ index 0000000..c308023
 +}
 +
 +/// Compare resolved export identity, including renamed imports and local const aliases.
-+fn is_node_reference_to_effect_module_api(node: TsNode<'_>, names: &[&[u8]]) -> bool {
++fn is_node_reference_to_effect_module_api(
++    node: TsNode<'_>,
++    names: &[&[u8]],
++    modules: &dyn Modules,
++) -> bool {
 +    let Some(target) = reference_symbol(node) else {
 +        return false;
 +    };
 +    target.declarations().any(|decl| {
 +        let source = decl.get_source_file();
-+        // Bun gives files in node_modules a package ID with the file's subpath.
-+        let package = source.package_name().and_then(|path| path.split(|&byte| byte == b'/').next());
-+        if !package.is_some_and(|name| name.eq_ignore_ascii_case(b"effect")) {
++        // An npm alias changes the installation directory, while the manifest still names the package.
++        let package_name = modules
++            .package_json(source.file_name())
++            .and_then(|package| package.get(b"name")?.as_str());
++        if !package_name.is_some_and(|name| name.eq_ignore_ascii_case(b"effect")) {
 +            return false;
 +        }
 +        let Some(module) = source.symbol() else { return false };
@@ -1594,10 +1602,13 @@ index 0000000..c308023
 +    })
 +}
 +
-+pub(super) fn catch_return_types(call: TsNode<'_>) -> impl Iterator<Item = Type<'_>> {
++pub(super) fn catch_return_types<'a>(
++    call: TsNode<'a>,
++    modules: Option<&'a dyn Modules>,
++) -> impl Iterator<Item = Type<'a>> {
 +    const APIS: &[&[u8]] = &[b"tryPromise", b"try", b"tryMap", b"tryMapPromise"];
 +    call.expression()
-+        .filter(|&callee| is_node_reference_to_effect_module_api(callee, APIS))
++        .filter(|&callee| modules.is_some_and(|modules| is_node_reference_to_effect_module_api(callee, APIS, modules)))
 +        .and_then(|_| call.get_resolved_signature()?.get_parameters().first())
 +        .into_iter()
 +        .flat_map(move |param| union_members(param.get_type_at_location(call)))
@@ -1609,7 +1620,7 @@ index 0000000..c308023
 +}
 diff --git a/test/cli/lint/effect.test.ts b/test/cli/lint/effect.test.ts
 new file mode 100644
-index 0000000..e32ef10
+index 0000000..38c8bf4
 --- /dev/null
 +++ b/test/cli/lint/effect.test.ts
 @@ -0,0 +1,206 @@
@@ -1776,7 +1787,7 @@ index 0000000..e32ef10
 +  });
 +});
 +
-+test.concurrent("recognizes Effect catch APIs through package exports and aliases", async () => {
++test.concurrent("recognizes Effect catch APIs through an npm package alias and re-exports", async () => {
 +  const files = {
 +    ".oxlintrc.json": JSON.stringify({ options: { typeAware: true }, categories: { correctness: "off" } }),
 +    "tsconfig.json": JSON.stringify({
@@ -1791,9 +1802,9 @@ index 0000000..e32ef10
 +        }],
 +      },
 +    }),
-+    "node_modules/effect/package.json": '{ "name": "effect", "types": "./dist/index.d.ts" }',
-+    "node_modules/effect/dist/index.d.ts": 'export * as Effect from "./Effect";',
-+    "node_modules/effect/dist/Effect.d.ts": [
++    "node_modules/effect-v4/package.json": '{ "name": "effect", "types": "./dist/index.d.ts" }',
++    "node_modules/effect-v4/dist/index.d.ts": 'export * as Effect from "./Effect";',
++    "node_modules/effect-v4/dist/Effect.d.ts": [
 +      'declare const TypeId: "~effect/Effect";',
 +      "export interface Effect<A, E> { readonly [TypeId]: { _A: () => A; _E: () => E; _R: () => never } }",
 +      "type Options<A, E> = { try: () => A; catch: (error: unknown) => E };",
@@ -1802,7 +1813,7 @@ index 0000000..e32ef10
 +      "export { try_ as try };",
 +    ].join("\n"),
 +    "a.ts": [
-+      'import { Effect } from "effect";',
++      'import { Effect } from "effect-v4";',
 +      "const attempt = Effect.try;",
 +      "export const promised = Effect.tryPromise({ try: async () => 1, catch: error => error });",
 +      'export const tried = attempt({ try: () => 1, catch: () => new Error("failed") });',
