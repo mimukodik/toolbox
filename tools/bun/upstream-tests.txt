@@ -1,0 +1,5 @@
+# Always run these upstream tests to cover the code our Bun patches change.
+cli/lint/type-services.test.ts
+cli/lint/glob.test.ts
+cli/lint/rule-docs.test.ts
+cli/lint/rules.test.ts
