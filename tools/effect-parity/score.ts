@@ -12,6 +12,10 @@ const gatedBunRules = new Set<string>([
   "effectInFailure",
   "anyUnknownInErrorContext",
   "unsafeEffectTypeAssertion",
+  "tryCatchInEffectGen",
+  "returnEffectInGen",
+  "missingStarInYieldEffectGen",
+  "missingReturnYieldStar",
 ]);
 const requestedRules = new Set<string>(parityRules);
 const oxlintRules = new Map(parityRules.map((name) => [
@@ -259,19 +263,27 @@ function gatedDiagnostics(pass: Pass): Diagnostic[] {
 
 export function candidateGate(compiler: Pass, oxlint: Pass, bun: Pass): { passed: boolean; evidence: string } {
   const candidate = gatedDiagnostics(bun);
-  const lint = compareLocations(gatedDiagnostics(oxlint), candidate);
-  const direct = compareLocations(gatedDiagnostics(compiler), candidate);
+  const lintReference = gatedDiagnostics(oxlint);
+  const compilerReference = gatedDiagnostics(compiler);
+  const lint = compareLocations(lintReference, candidate);
+  const direct = compareLocations(compilerReference, candidate);
   // Oxlint reports the compiler's warnings as errors in its Unix output.
   const severityMismatches = direct.matched.filter(({ expected, actual }) => expected.severity !== actual.severity);
-  const fixture = "floatingEffect_directivePrecedence.ts";
-  const expectedOmissions = [[23, "message"], [27, "suggestion"]] as const;
-  const omissionsMatch = direct.missing.length === expectedOmissions.length
-    && expectedOmissions.every(([line, severity]) => direct.missing.some((diagnostic) =>
-      diagnostic.rule === "floatingEffect" && diagnostic.fixture === fixture && diagnostic.file === `/.src/${fixture}`
-      && diagnostic.col === 1 && diagnostic.line === line && diagnostic.severity === severity));
-  const passed = lint.matched.length === 114 && lint.missing.length === 0
+  const expectedOmissions = compilerReference.filter(({ severity }) => severity === "message" || severity === "suggestion");
+  const omissions = compareLocations(expectedOmissions, direct.missing);
+  const omissionsMatch = omissions.missing.length === 0 && omissions.extra.length === 0
+    && omissions.matched.every(({ expected, actual }) => expected.severity === actual.severity);
+  const passed = lint.matched.length === 136 && lint.missing.length === 0
     && lint.extra.length === 0 && bun.failures.length === 0
+    && direct.matched.length === 136 && direct.missing.length === 7
     && direct.extra.length === 0 && omissionsMatch && severityMismatches.length === 0;
+  const ruleRows = [...gatedBunRules].map((rule) => {
+    const lintCount = lintReference.filter((diagnostic) => diagnostic.rule === rule).length;
+    const compilerCount = compilerReference.filter((diagnostic) => diagnostic.rule === rule).length;
+    const bunCount = candidate.filter((diagnostic) => diagnostic.rule === rule).length;
+    const hiddenCount = expectedOmissions.filter((diagnostic) => diagnostic.rule === rule).length;
+    return `| ${rule} | ${lintCount} | ${compilerCount} | ${bunCount} | ${hiddenCount} |`;
+  });
   const location = ({ fixture, file, line, col, rule, severity }: Diagnostic) =>
     `\`${fixture}\` at \`${file}:${line}:${col}\` (${rule}, ${severity})`;
 
@@ -284,8 +296,11 @@ export function candidateGate(compiler: Pass, oxlint: Pass, bun: Pass): { passed
       "| --- | ---: | ---: | ---: |",
       `| Oxlint | ${lint.matched.length} | ${lint.missing.length} | ${lint.extra.length} |`,
       `| Direct compiler | ${direct.matched.length} | ${direct.missing.length} | ${direct.extra.length} |`, "",
+      "| Rule | Oxlint | Direct compiler | Bun | Compiler-only severity |",
+      "| --- | ---: | ---: | ---: | ---: |",
+      ...ruleRows, "",
       `- Fixture execution or parsing failures: ${bun.failures.length}`,
-      `- Direct compiler omissions match the expected message on line 23 and suggestion on line 27: ${omissionsMatch ? "yes" : "no"}`,
+      `- Direct compiler omissions are exactly the message and suggestion diagnostics: ${omissionsMatch ? "yes" : "no"}`,
       `- Direct compiler severity mismatches: ${severityMismatches.length}`,
       ...lint.missing.map((item) => `- Missing Oxlint location: ${location(item)}`),
       ...lint.extra.map((item) => `- Extra Bun location: ${location(item)}`),

@@ -16,6 +16,10 @@ on:
         description: Successful Bun build run ID for this commit. Leave blank to score the pinned release.
         type: string
         required: false
+      regenerate_rule_docs:
+        description: Regenerate Bun rule docs with the candidate and verify the checked-in output.
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -30,8 +34,8 @@ jobs:
     env:
       BUN_BUILD_RUN: ${{ inputs.bun_build_run }}
       EFFECT_REV: 0e722d359c969bdf1b1316f08e8637022cde3cce
-      BUN_RELEASE: bun-1.4.6-canary.1-b15f513-p2
-      BUN_RELEASE_SHA256: 2a005ab0a9eff121afa283bee50e0e5249eb59c1b1706557340640f23f83d03d
+      BUN_RELEASE: bun-1.4.6-canary.1-b15f513-p3
+      BUN_RELEASE_SHA256: c5f5d133f764f912ebdad9776f807f64cc415e33b6b57ad8fa41504bebe54b7d
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
@@ -139,6 +143,23 @@ jobs:
         run: |
           mkdir -p "$RUNNER_TEMP/effect-parity"
           "$STOCK_BUN" tools/effect-parity/parity.ts .effect-tsgo "$RUNNER_TEMP/effect-parity"
+
+      - name: Regenerate candidate Bun rule docs
+        if: ${{ !cancelled() && env.EFFECT_PARITY_CANDIDATE_BUN != '' && inputs.regenerate_rule_docs }}
+        shell: bash
+        run: |
+          source=$(nix build --no-link --print-out-paths .#bun.src)
+          scratch=$(mktemp -d "$RUNNER_TEMP/bun-rule-docs.XXXXXX")
+          tar -xzf "$source" -C "$scratch" --strip-components=1 --wildcards \
+            '*/src/codegen/lint-rule-docs.ts' '*/src/codegen/lint-rule-options.ts' '*/docs/lint/rules/*'
+          for patch in "$GITHUB_WORKSPACE"/tools/bun/patches/*.patch; do
+            [[ -f "$patch" && ! -L "$patch" ]] || continue
+            git -C "$scratch" apply --include='docs/lint/rules/**' "$patch"
+          done
+          cd "$scratch"
+          cp -a docs/lint/rules checked-in
+          "$EFFECT_PARITY_CANDIDATE_BUN" src/codegen/lint-rule-docs.ts --write
+          diff -ru checked-in docs/lint/rules | tee "$RUNNER_TEMP/effect-parity/bun-rule-docs.diff"
 
       - name: Upload parity evidence
         if: ${{ !cancelled() }}
