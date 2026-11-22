@@ -627,10 +627,10 @@ index 0000000..a8fc712
 +```
 diff --git a/src/lint/driver/effect.rs b/src/lint/driver/effect.rs
 new file mode 100644
-index 0000000..e530899
+index 0000000..4387fd2
 --- /dev/null
 +++ b/src/lint/driver/effect.rs
-@@ -0,0 +1,98 @@
+@@ -0,0 +1,101 @@
 +use crate::configs::Flavor;
 +use crate::lint::Context;
 +use crate::typed::Typed;
@@ -677,6 +677,9 @@ index 0000000..e530899
 +        return None;
 +    }
 +    let settings = plugin.get(b"diagnosticSeverity");
++    if matches!(settings, Some(Json::Null)) {
++        return None;
++    }
 +    Some(
 +        RULES
 +            .iter()
@@ -731,10 +734,10 @@ index 0000000..e530899
 +}
 diff --git a/src/lint/plugins/effect/mod.rs b/src/lint/plugins/effect/mod.rs
 new file mode 100644
-index 0000000..8951e9c
+index 0000000..ad55759
 --- /dev/null
 +++ b/src/lint/plugins/effect/mod.rs
-@@ -0,0 +1,224 @@
+@@ -0,0 +1,231 @@
 +use bstr::ByteSlice;
 +use bun_lint::context::Severity;
 +
@@ -753,12 +756,19 @@ index 0000000..8951e9c
 +
 +impl EffectSeverity {
 +    pub fn parse(text: &[u8]) -> Self {
-+        match text.trim_ascii().to_ascii_lowercase().as_slice() {
-+            b"warning" | b"warn" => Self::Warn,
-+            b"suggestion" => Self::Suggestion,
-+            b"message" => Self::Message,
-+            b"off" => Self::Off,
-+            b"skip-file" => Self::SkipFile,
++        let Ok(text) = text.to_str() else { return Self::Error };
++        // Effect trims Unicode whitespace and uses Go's simple lowercase mapping.
++        let normalized: String = text
++            .trim()
++            .chars()
++            .map(|ch| ch.to_lowercase().next().unwrap_or(ch))
++            .collect();
++        match normalized.as_str() {
++            "warning" | "warn" => Self::Warn,
++            "suggestion" => Self::Suggestion,
++            "message" => Self::Message,
++            "off" => Self::Off,
++            "skip-file" => Self::SkipFile,
 +            _ => Self::Error,
 +        }
 +    }
@@ -1730,10 +1740,10 @@ index 0000000..5ffb87b
 +}
 diff --git a/test/cli/lint/effect.test.ts b/test/cli/lint/effect.test.ts
 new file mode 100644
-index 0000000..27ae76f
+index 0000000..1766fdc
 --- /dev/null
 +++ b/test/cli/lint/effect.test.ts
-@@ -0,0 +1,227 @@
+@@ -0,0 +1,251 @@
 +import { describe, expect, test } from "bun:test";
 +import { bunEnv, bunExe, tempDir } from "harness";
 +
@@ -1774,7 +1784,7 @@ index 0000000..27ae76f
 +          "lib": ["es2022"],
 +          "types": [],
 +          "strict": true,
-+          "plugins": [{ "name": "@effect/language-service", "diagnosticSeverity": { "floatingEffect": "${severity}" } }],
++          "plugins": [{ "name": "@effect/language-service", "diagnosticSeverity": { "floatingEffect": ${JSON.stringify(severity)} } }],
 +        },
 +      }`,
 +      "src/a.ts": [
@@ -1832,13 +1842,37 @@ index 0000000..27ae76f
 +    expect(enabled.stdout).toContain("[Error/bun/floating-effect]");
 +  });
 +
-+  test.concurrent("uses project severity and respects off", async () => {
-+    const warned = await lint(project("warning"), ["src"]);
-+    expect(warned.stdout).toContain("[Warning/bun(floating-effect)]");
-+    expect(warned.exitCode).toBe(0);
-+    const disabled = await lint(project("off"), ["src"]);
++  test.concurrent("disables Effect diagnostics for null and uses defaults when omitted", async () => {
++    const projectWithPlugin = (settings: { diagnosticSeverity?: null }) => ({
++      ".oxlintrc.json": JSON.stringify({ options: { typeAware: true }, categories: { correctness: "off" } }),
++      "tsconfig.json": JSON.stringify({
++        compilerOptions: { ...options, strict: true, plugins: [{ name: "@effect/language-service", ...settings }] },
++      }),
++      "a.ts": floating,
++    });
++
++    const defaults = await lint(projectWithPlugin({}), ["a.ts"]);
++    expect(defaults.stdout).toContain("[Error/bun(floating-effect)]");
++    expect(defaults.errors).toEqual(["4:1 This Effect value is neither yielded nor used in an assignment."]);
++    expect(defaults.exitCode).toBe(1);
++
++    const disabled = await lint(projectWithPlugin({ diagnosticSeverity: null }), ["a.ts"]);
 +    expect(disabled.stdout).not.toContain("bun(floating-effect)");
++    expect(disabled.errors).toEqual([]);
 +    expect(disabled.exitCode).toBe(0);
++  });
++
++  test.concurrent("uses project severity and respects off", async () => {
++    for (const severity of ["warning", "\u00a0WaRn\u3000"]) {
++      const warned = await lint(project(severity), ["src"]);
++      expect(warned.stdout).toContain("[Warning/bun(floating-effect)]");
++      expect(warned.exitCode).toBe(0);
++    }
++    for (const severity of ["off", "sk\u0130p-file"]) {
++      const disabled = await lint(project(severity), ["src"]);
++      expect(disabled.stdout).not.toContain("bun(floating-effect)");
++      expect(disabled.exitCode).toBe(0);
++    }
 +  });
 +
 +  test.concurrent("applies Effect directives at the report location", async () => {
