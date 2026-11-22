@@ -22,6 +22,10 @@ in
       ./patches/remap-paths.patch
     ];
 
+    postInstall = (old.postInstall or "") + ''
+      install -Dm444 LICENSE "$out/share/licenses/sccache/LICENSE"
+    '';
+
     # These unit tests need neither a server socket nor external services.
     doCheck = true;
     cargoTestFlags = [ "--lib" ];

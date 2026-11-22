@@ -129,6 +129,9 @@ jobs:
               grep -F "SHA-256 mismatch" /tmp/bad-sha.log
               test ! -e /nix/store
               sh /install.sh "$url" "$2"
+              store_path=$(jq -er .store_path /release/manifest.json)
+              test -s "$store_path/share/licenses/sccache/LICENSE"
+              printf "%s\n" "Upstream license installed"
               version=$(sccache --version)
               printf "%s\n" "$version"
               test "$version" = "sccache $3"
