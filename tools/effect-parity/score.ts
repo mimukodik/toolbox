@@ -1,6 +1,6 @@
 import { mkdirSync, symlinkSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { type Diagnostic, parityRules } from "./diagnostics";
+import { type Diagnostic, type ParsedOutput, parityRules, parseTypeScript } from "./diagnostics";
 import type { Fixture } from "./fixtures";
 
 const linterModules = join(import.meta.dir, "linter/node_modules");
@@ -11,8 +11,29 @@ const requestedRules = new Set<string>(parityRules);
 const oxlintRules = new Map(parityRules.map((name) => [
   name.replace(/([a-z0-9])([A-Z])/g, "$1-$2").toLowerCase(), name,
 ]));
-const reference = [join(linterModules, ".bin/effect-tsgo"), "--tsrs-lint", "oxlint"];
-const patchedBun = ["/usr/local/bin/bun", "lint", "--no-script"];
+const effectTsgo = join(linterModules, ".bin/effect-tsgo");
+
+function lintCommand(command: string[], { tsconfig, directory }: Fixture): string[] {
+  return [...command, "--type-aware", "--type-check", "--tsconfig", tsconfig, "--format=unix", directory];
+}
+
+const subjects = {
+  compiler: {
+    label: "Effect TSRS compiler",
+    command: ({ tsconfig }: Fixture) => [effectTsgo, "tsrs", "--noEmit", "--pretty", "false", "-p", tsconfig],
+    parse: parseCompiler,
+  },
+  oxlint: {
+    label: "Effect TSRS Oxlint",
+    command: (fixture: Fixture) => lintCommand([effectTsgo, "--tsrs-lint", "oxlint"], fixture),
+    parse: parseUnix,
+  },
+  bun: {
+    label: "Patched Bun",
+    command: (fixture: Fixture) => lintCommand(["/usr/local/bin/bun", "lint", "--no-script"], fixture),
+    parse: parseUnix,
+  },
+};
 
 type RawResult = { fixture: string; exitCode: number; stdout: string; stderr: string };
 type Match = { expected: Diagnostic; actual: Diagnostic };
@@ -39,7 +60,19 @@ export function exposeReferencePackages(root: string): void {
   }
 }
 
-function parseUnix(fixture: Fixture, output: string): { effect: Diagnostic[]; nonEffect: number } {
+function virtualFile(fixture: Fixture, path: string): string {
+  return fixture.files[resolve(fixture.cwd, path)]
+    ?? fixture.files[resolve(fixture.directory, path)]
+    ?? path;
+}
+
+function parseCompiler(fixture: Fixture, output: string): ParsedOutput {
+  const parsed = parseTypeScript(fixture.name, output);
+  for (const diagnostic of parsed.effect) diagnostic.file = virtualFile(fixture, diagnostic.file);
+  return parsed;
+}
+
+function parseUnix(fixture: Fixture, output: string): ParsedOutput {
   const header = /^(.*?):(\d+):(\d+): /;
   const diagnostics = output.split(/\r?\n/).reduce<string[]>((records, line) => {
     if (header.test(line)) records.push(line);
@@ -67,11 +100,8 @@ function parseUnix(fixture: Fixture, output: string): { effect: Diagnostic[]; no
       nonEffect++;
       continue;
     }
-    const file = fixture.files[resolve(fixture.cwd, path)]
-      ?? fixture.files[resolve(fixture.directory, path)]
-      ?? path;
     effect.push({
-      fixture: fixture.name, file, line: Number(row), col: Number(col),
+      fixture: fixture.name, file: virtualFile(fixture, path), line: Number(row), col: Number(col),
       rule, severity: severity.toLowerCase(), message: effectTag ? text.slice(0, effectTag.index) : text,
     });
   }
@@ -82,7 +112,7 @@ function key({ fixture, file, line, col, rule }: Diagnostic): string {
   return JSON.stringify([fixture, file, line, col, rule]);
 }
 
-function compare(fixture: string, baseline: Diagnostic[], result: ReturnType<typeof parseUnix>): FixtureScore {
+function compare(fixture: string, baseline: Diagnostic[], result: ParsedOutput): FixtureScore {
   const expected = new Map<string, Diagnostic[]>();
   for (const item of baseline) {
     if (!requestedRules.has(item.rule)) continue;
@@ -103,10 +133,9 @@ function compare(fixture: string, baseline: Diagnostic[], result: ReturnType<typ
 }
 
 export async function runPass(
-  subject: "reference" | "bun", fixtures: Fixture[], baselines: Diagnostic[],
+  subject: keyof typeof subjects, fixtures: Fixture[], baselines: Diagnostic[],
 ): Promise<Pass> {
-  const command = subject === "reference" ? reference : patchedBun;
-  const label = subject === "reference" ? "effect-tsgo" : "Patched Bun";
+  const { command, label, parse } = subjects[subject];
   const expected = Map.groupBy(baselines, ({ fixture }) => fixture);
   const scores: FixtureScore[] = [];
   const raw: RawResult[] = [];
@@ -117,8 +146,7 @@ export async function runPass(
     while (index < fixtures.length) {
       const fixture = fixtures[index++];
       try {
-        const run = Bun.spawn([...command, "--type-aware", "--type-check", "--tsconfig", fixture.tsconfig,
-          "--format=unix", fixture.directory], {
+        const run = Bun.spawn(command(fixture), {
           cwd: fixture.cwd,
           env: { ...process.env, NO_COLOR: "1" },
           stdout: "pipe",
@@ -129,7 +157,7 @@ export async function runPass(
           new Response(run.stdout).text(), new Response(run.stderr).text(), run.exited,
         ]);
         raw.push({ fixture: fixture.name, exitCode, stdout, stderr });
-        const result = parseUnix(fixture, stdout);
+        const result = parse(fixture, stdout);
         scores.push(compare(fixture.name, expected.get(fixture.name) ?? [], result));
         if (exitCode !== 0 && (exitCode !== 1 || result.effect.length + result.nonEffect === 0)) {
           failures.push(`${fixture.name}: exit ${exitCode}: ${stderr || stdout}`);
@@ -186,10 +214,23 @@ export function passTable(pass: Pass): string {
   ].join("\n");
 }
 
-export function isExact(pass: Pass): boolean {
-  const { matched, missing, extra } = totals(pass);
-  return pass.failures.length === 0 && matched.length === 230 && missing.length === 0
-    && extra.every((item) => !requestedRules.has(item.rule));
+export function referenceGateFailures(compiler: Pass, oxlint: Pass): string[] {
+  const failures: string[] = [];
+  const direct = totals(compiler);
+  const lint = totals(oxlint);
+  const scoredExtra = ({ rule }: Diagnostic) => requestedRules.has(rule);
+  if (compiler.failures.length || direct.matched.length !== 230 || direct.missing.length
+    || direct.extra.some(scoredExtra)) {
+    failures.push("Direct compiler gate failed. Expected 230 matched, zero missing and zero scored extras.");
+  }
+  const suggestions = lint.missing.filter(({ severity }) => severity === "suggestion").length;
+  const messages = lint.missing.filter(({ severity }) => severity === "message").length;
+  const visible = lint.matched.every(({ expected }) => expected.severity === "error" || expected.severity === "warning");
+  if (oxlint.failures.length || lint.matched.length !== 195 || lint.missing.length !== 35
+    || suggestions !== 34 || messages !== 1 || !visible || lint.extra.some(scoredExtra)) {
+    failures.push("Oxlint gate failed. Expected 195 error/warning matches, zero scored extras, and 34 suggestions plus one message missing.");
+  }
+  return failures;
 }
 
 export function floatingEffectTable(pass: Pass): string {
@@ -200,14 +241,23 @@ export function floatingEffectTable(pass: Pass): string {
     const extras = extra.filter((diagnostic) => diagnostic.rule === rule).length;
     return matches + misses + extras > 0 ? [`| ${fixture} | ${matches} | ${misses} | ${extras} |`] : [];
   });
-  const extras = totals(pass).extra.filter((diagnostic) => diagnostic.rule === rule);
+  const { matched, missing, extra } = totals(pass);
+  const matchCount = matched.filter(({ expected }) => expected.rule === rule).length;
+  const misses = missing.filter((diagnostic) => diagnostic.rule === rule);
+  const extras = extra.filter((diagnostic) => diagnostic.rule === rule);
+  const lowerSeverity = misses.filter(({ severity }) => severity === "suggestion" || severity === "message");
   return [
     "### Patched Bun floatingEffect by fixture", "",
     "| Fixture | Matched | Missing | Extra |",
     "| --- | ---: | ---: | ---: |",
-    ...rows, "",
+    ...rows,
+    `| **Total** | **${matchCount}** | **${misses.length}** | **${extras.length}** |`, "",
     "#### False positives", "",
     ...(extras.length ? extras.map(({ fixture, file, line, col, severity }) =>
+      `- \`${fixture}\` at \`${file}:${line}:${col}\` (${severity})`) : ["None."]),
+    "",
+    "#### Missing suggestions and messages", "",
+    ...(lowerSeverity.length ? lowerSeverity.map(({ fixture, file, line, col, severity }) =>
       `- \`${fixture}\` at \`${file}:${line}:${col}\` (${severity})`) : ["None."]),
     "",
   ].join("\n");

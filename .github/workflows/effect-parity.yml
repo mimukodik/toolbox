@@ -67,17 +67,15 @@ jobs:
           sudo sh "$RUNNER_TEMP/toolbox-install.sh" "$url" "$BUN_RELEASE_SHA256"
           /usr/local/bin/bun --revision
 
-      - name: Score the reference linter, then patched Bun
-        run: '"$STOCK_BUN" tools/effect-parity/parity.ts .effect-tsgo "$RUNNER_TEMP/effect-layout.json" "$RUNNER_TEMP/effect-baselines.json"'
+      - name: Score both reference paths, then patched Bun
+        run: |
+          mkdir -p "$RUNNER_TEMP/effect-parity"
+          "$STOCK_BUN" tools/effect-parity/parity.ts .effect-tsgo "$RUNNER_TEMP/effect-parity"
 
       - name: Upload parity evidence
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: effect-parity
-          path: |
-            ${{ runner.temp }}/effect-layout.json
-            ${{ runner.temp }}/effect-baselines.json
-            ${{ runner.temp }}/effect-reference-*.json
-            ${{ runner.temp }}/effect-bun-*.json
+          path: ${{ runner.temp }}/effect-parity
           if-no-files-found: warn
