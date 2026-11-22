@@ -6,15 +6,17 @@
 }:
 
 let
-  unpack = ''
-    # Vendoring needs the manifests and lockfiles. Skip source symlinks, which
-    # can fail to unpack under an unprivileged Nix compatibility layer.
-    python3 - ${src} <<'PYTHON'
+  unpack = paths: ''
+    python3 - ${src} '${paths}' <<'PYTHON'
+    import re
     import sys
     import tarfile
 
+    paths = re.compile(sys.argv[2])
+
     def include(member, destination):
-        if member.issym():
+        path = member.name.partition("/")[2]
+        if not member.isfile() or not paths.search(path):
             return None
         return tarfile.data_filter(member, destination)
 
@@ -22,13 +24,16 @@ let
         archive.extractall(filter=include)
     PYTHON
     cd bun-*
+    export HOME="$TMPDIR/home"
+    mkdir -p "$HOME"
+    export SSL_CERT_FILE="''${NIX_SSL_CERT_FILE:-$SSL_CERT_FILE}"
   '';
 
   fixed = hash: {
     outputHash = hash;
     outputHashAlgo = "sha256";
     outputHashMode = "recursive";
-    impureEnvVars = pkgs.lib.fetchers.proxyImpureEnvVars;
+    impureEnvVars = pkgs.lib.fetchers.proxyImpureEnvVars ++ [ "NIX_SSL_CERT_FILE" ];
     SSL_CERT_FILE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
   };
 
@@ -38,12 +43,12 @@ let
   # Bun's Rust workspace has two archive path dependencies. std has a
   # separate lockfile used by -Zbuild-std, so vendor it in the same pass.
   cargoDeps = pkgs.runCommand "bun-cargo-vendor" (
-    fixed pkgs.lib.fakeHash
+    fixed "sha256-bZBfHrmJc51CfoivmW2OuKp25c4zDUhFXTXW22Ny/e8="
     // {
       nativeBuildInputs = [ pkgs.python3 rust ];
     }
   ) ''
-    ${unpack}
+    ${unpack ''^\.cargo/|(^|/)(Cargo\.(toml|lock)|[^/]+\.rs)$''}
     mkdir -p vendor/lolhtml vendor/rust-argon2
     tar -xzf ${lolhtml} --strip-components=1 -C vendor/lolhtml
     tar -xzf ${argon2} --strip-components=1 -C vendor/rust-argon2
@@ -56,12 +61,12 @@ let
   # Use Bun's existing bun.lock -> package-lock.json conversion. The adapter
   # called in place of npm copies the locked registry packages into a cache.
   npmDeps = pkgs.runCommand "bun-npm-cache" (
-    fixed pkgs.lib.fakeHash
+    fixed "sha256-hqUhz3AyByDeCBrryDUR+KqreWm2ebQKWdEUrDrru0o="
     // {
       nativeBuildInputs = [ pkgs.python3 pkgs.bun pkgs.prefetch-npm-deps ];
     }
   ) ''
-    ${unpack}
+    ${unpack ''(^|/)package\.json$|^(packages/bun-error/|src/node-fallbacks/)?bun\.lock$|^scripts/build/npm-ci\.ts$''}
     mkdir -p "$out"
     cat > "$TMPDIR/prefetch-with-lock" <<'SCRIPT'
     #!${pkgs.runtimeShell}
