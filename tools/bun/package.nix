@@ -1,6 +1,5 @@
 {
   lib,
-  bun-src,
   bootstrapBun,
   patched,
   callPackage,
@@ -22,10 +21,21 @@
 }:
 let
   version = "1.4.6-canary.1";
+  rev = "b15f51302d72e1cd9038ecd0cf33782c02ee7681";
+  bunSrc = fetchurl {
+    url = "https://codeload.github.com/oven-sh/bun/tar.gz/${rev}";
+    name = "bun-${rev}.tar.gz";
+    sha256 = "c02e7192d610b7efbfe354f50fff1d0343261172f5b365912074930c076c4f2b";
+  };
   patchlevel = lib.strings.trim (builtins.readFile ./PATCHLEVEL);
   llvm = llvmPackages_23;
   rust = rust-bin.nightly."2026-11-14".minimal.override { extensions = [ "rust-src" ]; };
-  bunCargo = rustPlatform.importCargoLock { lockFile = "${bun-src}/Cargo.lock"; };
+  bunCargo = rustPlatform.importCargoLock {
+    lockFile = builtins.fetchurl {
+      url = "https://raw.githubusercontent.com/oven-sh/bun/${rev}/Cargo.lock";
+      sha256 = "60298a790da9c5ef9b87efc9b88e771a2b9fb31c4a7002ae8141da896ac92057";
+    };
+  };
   rustCargo = rustPlatform.importCargoLock {
     lockFile = builtins.fetchurl {
       url = "https://raw.githubusercontent.com/rust-lang/rust/5f4effd579500175af844241eb179e756190f1e7/library/Cargo.lock";
@@ -45,7 +55,7 @@ let
   npmVendor = stdenvNoCC.mkDerivation {
     pname = "bun-npm-vendor";
     inherit version;
-    src = bun-src;
+    src = bunSrc;
     nativeBuildInputs = [ bootstrapBun ];
     dontConfigure = true;
     dontFixup = true;
@@ -74,7 +84,7 @@ let
   release = llvm.stdenv.mkDerivation {
     pname = if patched then "bun-toolbox" else "bun-unpatched";
     version = version + lib.optionalString patched "-${patchlevel}";
-    src = bun-src;
+    src = bunSrc;
     patches = lib.optionals patched (lib.mapAttrsToList
       (name: _: ./patches + "/${name}")
       (lib.filterAttrs (name: type: type == "regular" && lib.hasSuffix ".patch" name)
@@ -104,7 +114,7 @@ let
       export HOME="$TMPDIR/home"
       export CARGO_HOME="$TMPDIR/cargo"
       export CARGO_NET_OFFLINE=true
-      export GIT_SHA=${bun-src.rev}
+      export GIT_SHA=${rev}
       export BUN_BUILD_PREFETCH_DIR=${prefetch}
       export BUN_TOOLCHAIN_RUST=${rust}
       mkdir -p "$HOME" "$CARGO_HOME"

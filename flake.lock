@@ -1,22 +1,5 @@
 {
   "nodes": {
-    "bun-src": {
-      "flake": false,
-      "locked": {
-        "lastModified": 1795243322,
-        "narHash": "sha256-9njcJBTh7z8UCv869HGL2tkCNaNcHVXpbpk2fU2ygiQ=",
-        "owner": "oven-sh",
-        "repo": "bun",
-        "rev": "b15f51302d72e1cd9038ecd0cf33782c02ee7681",
-        "type": "github"
-      },
-      "original": {
-        "owner": "oven-sh",
-        "repo": "bun",
-        "rev": "b15f51302d72e1cd9038ecd0cf33782c02ee7681",
-        "type": "github"
-      }
-    },
     "nixpkgs": {
       "locked": {
         "lastModified": 1795192263,
@@ -35,7 +18,6 @@
     },
     "root": {
       "inputs": {
-        "bun-src": "bun-src",
         "nixpkgs": "nixpkgs",
         "rust-overlay": "rust-overlay"
       }

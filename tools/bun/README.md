@@ -28,8 +28,9 @@ schema and conformance bundle. The Blacksmith proof exercises the CLI.
 
 ## Build inputs and evidence
 
-Bun's build graph runs with a Nix-provided bootstrap Bun and LLVM 23, with
-the upstream nightly Rust pin and `rust-src`. The dependency cache lists
+Bun's source archive is a fixed-output fetch. Its build graph runs with a
+Nix-provided bootstrap Bun and LLVM 23, with the upstream nightly Rust pin
+and `rust-src`. The dependency cache lists
 upstream's archives and published WebKit and Node header hashes. Cargo
 dependencies come from Bun's lockfile and the matching Rust standard library
 lockfile. A fixed-output derivation installs the three locked JavaScript
@@ -44,6 +45,7 @@ usage and closure size. The proof script runs on slack-listener at
 `8132ecc`, then interleaves five fresh, cold filesystem-cache runs per tool.
 For local use on a Nix machine, run the binary through its flake result link.
 
-When updating the pin, refresh the flake locks, the Rust nightly and std
-lockfile hash, the build dependency URLs and hashes, and the JavaScript
-dependency derivation hash. Check patch application and rerun the workflow.
+When updating the pin, refresh the Bun source and lockfile hashes, the Rust
+nightly and std lockfile hash, the build dependency URLs and hashes, and the
+JavaScript dependency derivation hash. Check patch application and rerun the
+workflow.
