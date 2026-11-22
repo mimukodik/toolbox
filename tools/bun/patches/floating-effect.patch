@@ -644,7 +644,7 @@ index a98898f..9b0a954 100644
          };
          let specified = |name: &[u8]| compiler.get(name).and_then(Json::as_bool);
 diff --git a/test/cli/lint/type-services.test.ts b/test/cli/lint/type-services.test.ts
-index 5041488..eaf7bbc 100644
+index 5041488..d35cfdf 100644
 --- a/test/cli/lint/type-services.test.ts
 +++ b/test/cli/lint/type-services.test.ts
 @@ -14,7 +14,7 @@ async function lint(files: Record<string, string>, args: string[]) {
@@ -729,10 +729,10 @@ index 5041488..eaf7bbc 100644
 +    const args = [...rule("restrict-template-expressions"), "a.ts"];
 +    const implicit = await lint(files, args);
 +    expect(implicit.stdout).toContain("Invalid type");
-+    expect(implicit.stdout).not.toContain("bun(floating-effect)");
++    expect(implicit.stdout).not.toContain("bun/floating-effect");
 +
 +    const enabled = await lint(files, ["--type-aware", ...args]);
-+    expect(enabled.stdout).toContain("[Error/bun(floating-effect)]");
++    expect(enabled.stdout).toContain("[Error/bun/floating-effect]");
 +  });
 +
 +  test.concurrent("uses project severity and respects off", async () => {
