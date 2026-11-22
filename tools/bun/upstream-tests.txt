@@ -1,6 +1,6 @@
 # Always run these upstream tests to cover the code our Bun patches change.
 cli/lint/type-services.test.ts
 cli/lint/glob.test.ts
-# Parked 2026-11-22 (BER-2393): main's floating-effect.patch hand-edits docs/lint/rules/index.mdx and its example doesn't fire. Re-enable with the next Bun patch that regenerates the docs (bun src/codegen/lint-rule-docs.ts --write).
+# Parked 2026-11-22 (BER-2393). Owner: bun-patch lane. Ends with the next Bun patch release that regenerates docs/lint/rules (bun src/codegen/lint-rule-docs.ts --write) and fixes the example. The current floating-effect.patch hand-edits index.mdx and its example produces no diagnostic.
 # cli/lint/rule-docs.test.ts
 cli/lint/rules.test.ts

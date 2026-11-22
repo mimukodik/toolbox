@@ -101,7 +101,16 @@ jobs:
       - name: Run patched and listed Bun lint tests
         shell: bash
         run: |
-          parked=$(sed -nE 's@^[[:space:]]*#[[:space:]]+(cli/lint/[^/[:space:]]+\.test\.ts)[[:space:]]*$@- \1@p' tools/bun/upstream-tests.txt)
+          parked=$(awk '
+            /^[[:space:]]*#[[:space:]]+cli\/lint\/[^/[:space:]]+\.test\.ts[[:space:]]*$/ {
+              printf "PARKED: %s%s\n\n", $2, note
+            }
+            { note = "" }
+            /^[[:space:]]*#[[:space:]]+Parked / {
+              sub(/^[[:space:]]*#[[:space:]]+/, "")
+              note = " (" $0 ")"
+            }
+          ' tools/bun/upstream-tests.txt)
           if [[ -n "$parked" ]]; then
             printf '### Parked upstream Bun lint tests\n\n%s\n\n' "$parked" | tee -a "$GITHUB_STEP_SUMMARY"
           fi
