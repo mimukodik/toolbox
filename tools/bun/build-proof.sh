@@ -84,6 +84,10 @@ wall=$(tail -n 1 "$evidence/wall-seconds.txt")
 cat "$evidence/summary.md"
 
 if (( status != 0 )); then
+  if nix log "$drv_path" > "$evidence/nix-compile.log" 2> "$evidence/nix-log-errors.txt"; then
+    rg -n -m 35 -e '^FAILED:|(^|[ :])(fatal )?error([ :]|\[[[:alnum:]]+\])|CMake Error|npm ERR!' \
+      "$evidence/nix-compile.log" || true
+  fi
   exit "$status"
 fi
 if ! rg -F "building '$drv_path'" "$evidence/nix-build.log"; then
