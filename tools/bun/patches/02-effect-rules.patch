@@ -961,10 +961,10 @@ index 0000000..8951e9c
 +}
 diff --git a/src/lint/plugins/effect/rules/bun_any_unknown_in_error_context.rs b/src/lint/plugins/effect/rules/bun_any_unknown_in_error_context.rs
 new file mode 100644
-index 0000000..4730ff2
+index 0000000..eb0b0e6
 --- /dev/null
 +++ b/src/lint/plugins/effect/rules/bun_any_unknown_in_error_context.rs
-@@ -0,0 +1,125 @@
+@@ -0,0 +1,119 @@
 +use crate::effect::{report, type_parser};
 +use bun_lint::prelude::*;
 +use bun_lint::types::{SyntaxKind as TsKind, TsNode, Type, TypeFlags};
@@ -1013,6 +1013,7 @@ index 0000000..4730ff2
 +    type_parser::strict_effect(ty).or_else(|| type_parser::layer(ty))
 +}
 +
++// ets_rules/src/any_unknown_in_error_context.rs:50–81.
 +fn ignore_subtree(node: TsNode<'_>) -> bool {
 +    match node.kind() {
 +        TsKind::TypeAliasDeclaration | TsKind::InterfaceDeclaration => true,
@@ -1033,18 +1034,13 @@ index 0000000..4730ff2
 +        let file = cx.file();
 +        let root = file.type_checker().ts_node(file);
 +        let mut pending: Vec<_> = root.children().collect();
-+        let mut matches: Vec<(Span, FlaggedChannels)> = Vec::new();
++        let mut matches: Vec<(TsNode<'_>, Span, FlaggedChannels)> = Vec::new();
 +
 +        while let Some(node) = pending.pop() {
 +            let kind = node.kind();
++            // ets_rules/src/any_unknown_in_error_context.rs:43–49.
 +            if kind.is_type_node() {
-+                // A class extends clause has a type-shaped wrapper around an expression.
-+                if kind == TsKind::ExpressionWithTypeArguments
-+                    && node.parent().is_some_and(|clause| {
-+                        clause.kind() == TsKind::HeritageClause
-+                            && clause.parent().is_some_and(|class| class.kind().is_class_like())
-+                    })
-+                {
++                if type_parser::in_class_extends(node) {
 +                    pending.extend(node.expression());
 +                }
 +                continue;
@@ -1053,6 +1049,7 @@ index 0000000..4730ff2
 +                continue;
 +            }
 +
++            // ets_rules/src/any_unknown_in_error_context.rs:83–111.
 +            pending.extend(node.children());
 +            if type_parser::has_equivalent_node(node) {
 +                continue;
@@ -1072,18 +1069,15 @@ index 0000000..4730ff2
 +                continue;
 +            }
 +            let span = node.span();
-+            if span.start >= span.end {
-+                continue;
-+            }
-+            // Drop a containing match only if this node reports all of its channels
-+            // with the same flags. An outer match can contribute a distinct finding.
-+            matches.retain(|&(outer, previous)| {
++            // ets_rules/src/any_unknown_in_error_context.rs:170–200 uses the raw span for containment.
++            matches.retain(|&(_, outer, previous)| {
 +                !(outer.start <= span.start && span.end <= outer.end && flagged.covers(previous))
 +            });
-+            matches.push((span, flagged));
++            matches.push((node, span, flagged));
 +        }
 +
-+        for (span, flags) in matches {
++        for (node, _, flags) in matches {
++            let span = type_parser::diagnostic_span(file, node);
 +            if let Some(report) = report(cx, self.hidden_by_default, span, MESSAGE) {
 +                report.data("details", flags.message());
 +            }
@@ -1092,10 +1086,10 @@ index 0000000..4730ff2
 +);
 diff --git a/src/lint/plugins/effect/rules/bun_effect_in_failure.rs b/src/lint/plugins/effect/rules/bun_effect_in_failure.rs
 new file mode 100644
-index 0000000..ead0512
+index 0000000..8138004
 --- /dev/null
 +++ b/src/lint/plugins/effect/rules/bun_effect_in_failure.rs
-@@ -0,0 +1,55 @@
+@@ -0,0 +1,52 @@
 +use crate::effect::{report, type_parser};
 +use bun_lint::prelude::*;
 +use std::collections::HashSet;
@@ -1113,12 +1107,12 @@ index 0000000..ead0512
 +    fn finish(&self, cx: &mut Cx<'_, Self>) {
 +        let file = cx.file();
 +        let root = file.type_checker().ts_node(file);
-+        let mut pending: Vec<_> = root.children().map(|child| (child, false)).collect();
++        // ets_rules/src/effect_in_failure.rs:32–56.
++        let mut pending = vec![(root, false)];
 +        let mut matched_children = HashSet::new();
 +
 +        while let Some((node, visited)) = pending.pop() {
-+            // Post-order keeps the report on the innermost Effect and propagates
-+            // that match through all ancestors, even non-Effect nodes.
++            // ets_rules/src/effect_in_failure.rs:48–105 propagates the innermost match to all ancestors.
 +            if !visited {
 +                pending.push((node, true));
 +                pending.extend(node.children().map(|child| (child, false)));
@@ -1140,10 +1134,7 @@ index 0000000..ead0512
 +            else {
 +                continue;
 +            };
-+            let span = node.span();
-+            if span.start >= span.end {
-+                continue;
-+            }
++            let span = type_parser::diagnostic_span(file, node);
 +            if let Some(report) = report(cx, self.hidden_by_default, span, MESSAGE) {
 +                report.data("type", nested.to_text());
 +            }
@@ -1153,13 +1144,14 @@ index 0000000..ead0512
 +);
 diff --git a/src/lint/plugins/effect/rules/bun_floating_effect.rs b/src/lint/plugins/effect/rules/bun_floating_effect.rs
 new file mode 100644
-index 0000000..643c9cc
+index 0000000..d2479c0
 --- /dev/null
 +++ b/src/lint/plugins/effect/rules/bun_floating_effect.rs
-@@ -0,0 +1,72 @@
+@@ -0,0 +1,74 @@
 +use crate::effect::{Directives, report, type_parser};
 +use bun_lint::prelude::*;
 +use bun_lint::rule::Plugin;
++use bun_lint::types::SyntaxKind;
 +
 +/// Detects Effect values that are neither yielded nor assigned.
 +pub struct FloatingEffect {
@@ -1178,6 +1170,7 @@ index 0000000..643c9cc
 +
 +impl Rule for FloatingEffect {
 +    const META: Meta = Meta::plugin(Plugin::Bun, "floating-effect", Kind::Problem).requires_types();
++    // ets_rules/src/floating_effect.rs:119–127.
 +    const ON: On = On::new().stmts(&[StmtTag::Expr]);
 +    type State<'a> = Directives;
 +
@@ -1196,11 +1189,19 @@ index 0000000..643c9cc
 +        let StmtKind::Expr(expr) = stmt.kind() else {
 +            return;
 +        };
-+        if stmt.is_wrapper() || matches!(expr.tag(), ExprTag::Assign) {
++        if stmt.is_wrapper() {
++            return;
++        }
++        let node = expr.ts_node_with_parentheses();
++        // ets_rules/src/floating_effect.rs:129–132 and 162–180.
++        if node.kind() == SyntaxKind::BinaryExpression
++            && expr.as_assign().is_some_and(|(op, _, _)| matches!(op, None | Some(BinOp::Nullish | BinOp::And | BinOp::Or)))
++        {
 +            return;
 +        }
 +
-+        let ty = expr.ty();
++        // ets_rules/src/floating_effect.rs:134–159.
++        let Some(ty) = type_parser::type_at(node) else { return };
 +        if type_parser::has_effect_type_id(ty) {
 +            if type_parser::effect(ty).is_none() || type_parser::is_effect_subtype(ty) || type_parser::is_fiber(ty) {
 +                return;
@@ -1209,16 +1210,8 @@ index 0000000..643c9cc
 +            return;
 +        }
 +
-+        // Effect asks TypeScript for the diagnostic span of the expression. For
-+        // a satisfies expression, TypeScript's scanner points at its keyword.
-+        let span = expr
-+            .as_satisfies()
-+            .and_then(|(operand, annotation)| {
-+                cx.file()
-+                    .tokens_between(operand.outer_span(), annotation)
-+                    .find(|token| token.text() == b"satisfies")
-+            })
-+            .map_or(expr.outer_span(), |token| token.span());
++        // ets_rules/src/floating_effect.rs:91–98.
++        let span = type_parser::diagnostic_span(cx.file(), node);
 +
 +        let strict = type_parser::strict_effect(ty).is_some();
 +        let message = if strict { FLOATING_EFFECT } else { FLOATING_EFFECT_ABLE };
@@ -1231,10 +1224,10 @@ index 0000000..643c9cc
 +}
 diff --git a/src/lint/plugins/effect/rules/bun_global_error_in_effect_catch.rs b/src/lint/plugins/effect/rules/bun_global_error_in_effect_catch.rs
 new file mode 100644
-index 0000000..306b258
+index 0000000..2ef6565
 --- /dev/null
 +++ b/src/lint/plugins/effect/rules/bun_global_error_in_effect_catch.rs
-@@ -0,0 +1,30 @@
+@@ -0,0 +1,31 @@
 +use crate::effect::{report, type_parser};
 +use bun_lint::prelude::*;
 +
@@ -1247,7 +1240,8 @@ index 0000000..306b258
 +    GlobalErrorInEffectCatch,
 +    b"globalErrorInEffectCatch",
 +    "global-error-in-effect-catch",
-+    On::new().exprs(&[ExprTag::Call]),
++    // ets_rules/src/global_error_in_effect_catch.rs:34–47.
++    On::new().exprs(&[ExprTag::Call, ExprTag::ImportCall]),
 +    fn expr<'a>(&self, expr: Expr<'a>, cx: &mut Cx<'a, Self>) {
 +        let call = expr.ts_node();
 +        let mut output = type_parser::catch_return_types(call, cx.file().modules());
@@ -1259,7 +1253,7 @@ index 0000000..306b258
 +            .chain(output)
 +            .any(|ty| type_parser::is_global_error(ty, global))
 +            && let Some(callee) = call.expression()
-+            && let Some(report) = report(cx, self.hidden_by_default, callee.span(), MESSAGE)
++            && let Some(report) = report(cx, self.hidden_by_default, type_parser::diagnostic_span(cx.file(), callee), MESSAGE)
 +        {
 +            report.data("callee", callee.get_source_text());
 +        }
@@ -1267,10 +1261,10 @@ index 0000000..306b258
 +);
 diff --git a/src/lint/plugins/effect/rules/bun_global_error_in_effect_failure.rs b/src/lint/plugins/effect/rules/bun_global_error_in_effect_failure.rs
 new file mode 100644
-index 0000000..533f9a9
+index 0000000..369ad25
 --- /dev/null
 +++ b/src/lint/plugins/effect/rules/bun_global_error_in_effect_failure.rs
-@@ -0,0 +1,32 @@
+@@ -0,0 +1,33 @@
 +use crate::effect::{report, type_parser};
 +use bun_lint::prelude::*;
 +
@@ -1283,6 +1277,7 @@ index 0000000..533f9a9
 +    GlobalErrorInEffectFailure,
 +    b"globalErrorInEffectFailure",
 +    "global-error-in-effect-failure",
++    // ets_rules/src/global_error_in_effect_failure.rs:27–38.
 +    On::new().exprs(&[ExprTag::New]),
 +    fn expr<'a>(&self, expr: Expr<'a>, cx: &mut Cx<'a, Self>) {
 +        let Some(global) = type_parser::global_error(cx.file().type_checker()) else {
@@ -1291,7 +1286,7 @@ index 0000000..533f9a9
 +        if !type_parser::is_global_error(expr.ty(), global) {
 +            return;
 +        }
-+        // Stop at the nearest enclosing Effect, even if its error channel is different.
++        // ets_rules/src/global_error_in_effect_failure.rs:59–78 stops at the nearest enclosing Effect.
 +        let Some(effect) = expr.ts_node().ancestors().find_map(type_parser::effect_at) else {
 +            return;
 +        };
@@ -1299,16 +1294,16 @@ index 0000000..533f9a9
 +            .into_iter()
 +            .any(|ty| type_parser::is_global_error(ty, global))
 +        {
-+            let _ = report(cx, self.hidden_by_default, expr.ts_node().span(), MESSAGE);
++            let _ = report(cx, self.hidden_by_default, type_parser::diagnostic_span(cx.file(), expr.ts_node()), MESSAGE);
 +        }
 +    }
 +);
 diff --git a/src/lint/plugins/effect/rules/bun_unknown_in_effect_catch.rs b/src/lint/plugins/effect/rules/bun_unknown_in_effect_catch.rs
 new file mode 100644
-index 0000000..6c24f75
+index 0000000..df4ba9a
 --- /dev/null
 +++ b/src/lint/plugins/effect/rules/bun_unknown_in_effect_catch.rs
-@@ -0,0 +1,25 @@
+@@ -0,0 +1,26 @@
 +use crate::effect::{report, type_parser};
 +use bun_lint::prelude::*;
 +use bun_lint::types::TypeFlags;
@@ -1322,13 +1317,14 @@ index 0000000..6c24f75
 +    UnknownInEffectCatch,
 +    b"unknownInEffectCatch",
 +    "unknown-in-effect-catch",
-+    On::new().exprs(&[ExprTag::Call]),
++    // ets_rules/src/unknown_in_effect_catch.rs:34–47.
++    On::new().exprs(&[ExprTag::Call, ExprTag::ImportCall]),
 +    fn expr<'a>(&self, expr: Expr<'a>, cx: &mut Cx<'a, Self>) {
 +        let call = expr.ts_node();
 +        if type_parser::catch_return_types(call, cx.file().modules())
 +            .any(|ty| ty.has_flags(TypeFlags::ANY | TypeFlags::UNKNOWN))
 +            && let Some(callee) = call.expression()
-+            && let Some(report) = report(cx, self.hidden_by_default, callee.span(), MESSAGE)
++            && let Some(report) = report(cx, self.hidden_by_default, type_parser::diagnostic_span(cx.file(), callee), MESSAGE)
 +        {
 +            report.data("callee", callee.get_source_text());
 +        }
@@ -1336,10 +1332,10 @@ index 0000000..6c24f75
 +);
 diff --git a/src/lint/plugins/effect/rules/bun_unsafe_effect_type_assertion.rs b/src/lint/plugins/effect/rules/bun_unsafe_effect_type_assertion.rs
 new file mode 100644
-index 0000000..e944696
+index 0000000..1670f53
 --- /dev/null
 +++ b/src/lint/plugins/effect/rules/bun_unsafe_effect_type_assertion.rs
-@@ -0,0 +1,39 @@
+@@ -0,0 +1,40 @@
 +use crate::effect::{report, type_parser};
 +use bun_lint::prelude::*;
 +use bun_lint::types::{SyntaxKind as TsKind, TsNode, Type, TypeFlags};
@@ -1364,7 +1360,8 @@ index 0000000..e944696
 +    UnsafeEffectTypeAssertion,
 +    b"unsafeEffectTypeAssertion",
 +    "unsafe-effect-type-assertion",
-+    On::new().exprs(&[ExprTag::As]),
++    // ets_rules/src/unsafe_effect_type_assertion.rs:89–107.
++    On::new().exprs(&[ExprTag::As, ExprTag::AsConst]),
 +    fn expr<'a>(&self, expr: Expr<'a>, cx: &mut Cx<'a, Self>) {
 +        let assertion = expr.ts_node();
 +        if !matches!(assertion.kind(), TsKind::AsExpression | TsKind::TypeAssertionExpression) {
@@ -1375,19 +1372,21 @@ index 0000000..e944696
 +        };
 +        let Some(asserted) = channels(assertion) else { return };
 +        if narrows(original.error, asserted.error) || narrows(original.requirements, asserted.requirements) {
-+            let _ = report(cx, self.hidden_by_default, assertion.span(), MESSAGE);
++            let _ = report(cx, self.hidden_by_default, type_parser::diagnostic_span(cx.file(), assertion), MESSAGE);
 +        }
 +    }
 +);
 diff --git a/src/lint/plugins/effect/type_parser.rs b/src/lint/plugins/effect/type_parser.rs
 new file mode 100644
-index 0000000..acd956c
+index 0000000..5ffb87b
 --- /dev/null
 +++ b/src/lint/plugins/effect/type_parser.rs
-@@ -0,0 +1,233 @@
+@@ -0,0 +1,346 @@
 +// Adapted from Effect's MIT-licensed ets_typeparser at 0e722d359c969bdf1b1316f08e8637022cde3cce.
 +// Bun's typed handles delegate these queries to the checker for the current file.
++use bun_lint::ast::File;
 +use bun_lint::modules::Modules;
++use bun_lint::span::Span;
 +use bun_lint::types::{
 +    NodeFlags, Signature, SymbolFlags, SyntaxKind as Kind, TsNode, TsSymbol, Type, TypeFlags, Types,
 +};
@@ -1466,6 +1465,7 @@ index 0000000..acd956c
 +}
 +
 +pub(super) fn type_at(node: TsNode<'_>) -> Option<Type<'_>> {
++    // ets_typeparser/src/node_cannot_be_effect_library_type.rs:16–35.
 +    match node.kind() {
 +        Kind::ArrayLiteralExpression
 +        | Kind::ArrowFunction
@@ -1488,7 +1488,29 @@ index 0000000..acd956c
 +    (!ty.is_error() && !ty.is_unresolved()).then_some(ty)
 +}
 +
++// tsrs_ast/src/utilities_1.rs:1702–1727.
++pub(super) fn in_class_extends(node: TsNode<'_>) -> bool {
++    node.kind() == Kind::ExpressionWithTypeArguments
++        && node.parent().is_some_and(|clause| {
++            clause.kind() == Kind::HeritageClause
++                && clause.token() == Kind::ExtendsKeyword
++                && clause.parent().is_some_and(|class| class.kind().is_class_like())
++        })
++}
++
++// tsrs_ast/src/utilities_1.rs:1702–1727 and ets_typeparser/src/get_type_at_location.rs:119–161.
++fn is_type_only_heritage_access(node: TsNode<'_>) -> bool {
++    node.ancestors()
++        .find(|parent| parent.kind() != Kind::PropertyAccessExpression)
++        .is_some_and(|wrapper| {
++            wrapper.kind() == Kind::ExpressionWithTypeArguments
++                && wrapper.parent().is_some_and(|clause| clause.kind() == Kind::HeritageClause)
++                && !in_class_extends(wrapper)
++        })
++}
++
 +/// This node's type is also checked when the rule visits its syntactic counterpart.
++// ets_typeparser/src/type_equivalent_node.rs:13–41.
 +pub(super) fn has_equivalent_node(node: TsNode<'_>) -> bool {
 +    if matches!(node.kind(), Kind::ParenthesizedExpression | Kind::SatisfiesExpression) {
 +        return true;
@@ -1496,16 +1518,54 @@ index 0000000..acd956c
 +    node.kind() == Kind::Identifier
 +        && node.parent().is_some_and(|parent| {
 +            parent.name() == Some(node)
-+                && matches!(
-+                    parent.kind(),
-+                    Kind::PropertyAccessExpression
-+                        | Kind::VariableDeclaration
-+                        | Kind::Parameter
-+                        | Kind::PropertyDeclaration
-+                        | Kind::PropertyAssignment
-+                        | Kind::ShorthandPropertyAssignment
-+                )
++                && match parent.kind() {
++                    Kind::PropertyAccessExpression => !is_type_only_heritage_access(parent),
++                    Kind::VariableDeclaration
++                    | Kind::Parameter
++                    | Kind::PropertyDeclaration
++                    | Kind::PropertyAssignment
++                    | Kind::ShorthandPropertyAssignment => true,
++                    _ => false,
++                }
 +        })
++}
++
++// tsrs_scanner/src/scanner.rs:3677–3792 in the compiler pinned by Effect.
++pub(super) fn diagnostic_span<'a>(file: &'a File<'a>, node: TsNode<'a>) -> Span {
++    let span = node.span();
++    match node.kind() {
++        Kind::FunctionDeclaration
++        | Kind::MethodDeclaration
++        | Kind::VariableDeclaration
++        | Kind::BindingElement
++        | Kind::ClassDeclaration
++        | Kind::InterfaceDeclaration
++        | Kind::ModuleDeclaration
++        | Kind::EnumDeclaration
++        | Kind::EnumMember
++        | Kind::FunctionExpression
++        | Kind::GetAccessor
++        | Kind::SetAccessor
++        | Kind::TypeAliasDeclaration
++        | Kind::JSTypeAliasDeclaration
++        | Kind::PropertyDeclaration
++        | Kind::PropertySignature
++        | Kind::NamespaceImport
++        | Kind::ClassExpression => {
++            if let Some(name) = node.name() {
++                return name.span();
++            }
++            file.first_token(span).map_or(span, |token| token.span())
++        }
++        Kind::SourceFile | Kind::ReturnStatement | Kind::YieldExpression => {
++            file.first_token(span).map_or(span, |token| token.span())
++        }
++        Kind::SatisfiesExpression => node
++            .expression()
++            .and_then(|operand| file.token_after(operand.span()))
++            .map_or(span, |token| token.span()),
++        _ => span,
++    }
 +}
 +
 +pub(super) fn global_error(types: Types<'_>) -> Option<Type<'_>> {
@@ -1528,16 +1588,61 @@ index 0000000..acd956c
 +    !ty.has_flags(TypeFlags::ANY | TypeFlags::UNKNOWN) && ty.is_assignable_to(global) && global.is_assignable_to(ty)
 +}
 +
++// ets_typeparser/src/module_export_reference.rs:136–166.
++fn can_have_symbol_at_location(kind: Kind) -> bool {
++    matches!(
++        kind,
++        Kind::SourceFile
++            | Kind::Identifier
++            | Kind::PrivateIdentifier
++            | Kind::StringLiteral
++            | Kind::NumericLiteral
++            | Kind::BigIntLiteral
++            | Kind::NoSubstitutionTemplateLiteral
++            | Kind::ComputedPropertyName
++            | Kind::PropertyAccessExpression
++            | Kind::ElementAccessExpression
++            | Kind::QualifiedName
++            | Kind::ThisKeyword
++            | Kind::ThisType
++            | Kind::SuperKeyword
++            | Kind::ConstructorKeyword
++            | Kind::DefaultKeyword
++            | Kind::FunctionKeyword
++            | Kind::EqualsGreaterThanToken
++            | Kind::ClassKeyword
++            | Kind::ImportType
++            | Kind::ExportKeyword
++            | Kind::ImportKeyword
++            | Kind::NewKeyword
++            | Kind::InstanceOfKeyword
++            | Kind::MetaProperty
++            | Kind::JsxNamespacedName
++    )
++}
++
 +fn reference_symbol(node: TsNode<'_>) -> Option<TsSymbol<'_>> {
-+    let node = skip_parentheses(node);
-+    match node.kind() {
-+        Kind::Identifier | Kind::PropertyAccessExpression | Kind::ElementAccessExpression => {}
-+        _ => return None,
++    // ets_typeparser/src/module_export_reference.rs:109–125. Source callees are TS/TSX, so the
++    // reference's exemption for reparsed JSDoc nodes does not apply here.
++    if !can_have_symbol_at_location(node.kind()) {
++        return None;
 +    }
-+    let mut symbol = symbol_at(node)?;
-+    if node.kind() != Kind::Identifier {
++
++    // ets_typeparser/src/module_export_reference.rs:197–205.
++    let mut symbol = symbol_at(node)
++        .or_else(|| {
++            if node.kind() == Kind::PropertyAccessExpression {
++                return symbol_at(node.name()?);
++            }
++            None
++        })?
++        .get_aliased_symbol();
++    if node.kind() != Kind::Identifier
++        || node.parent().is_some_and(|parent| parent.kind().is_declaration() && parent.name() == Some(node))
++    {
 +        return Some(symbol);
 +    }
++    // ets_typeparser/src/module_export_reference.rs:210–245.
 +    let mut seen = HashSet::new();
 +    while let Some(declaration) = symbol.value_declaration() {
 +        if declaration.kind() != Kind::VariableDeclaration
@@ -1554,11 +1659,12 @@ index 0000000..acd956c
 +        let Some(target) = symbol_at(skip_parentheses(initializer)) else {
 +            break;
 +        };
-+        symbol = target;
++        symbol = target.get_aliased_symbol();
 +    }
 +    Some(symbol)
 +}
 +
++// ets_typeparser/src/module_export_reference.rs:236–245.
 +fn skip_parentheses(mut node: TsNode<'_>) -> TsNode<'_> {
 +    while node.kind() == Kind::ParenthesizedExpression {
 +        let Some(inner) = node.expression() else { break };
@@ -1568,10 +1674,12 @@ index 0000000..acd956c
 +}
 +
 +fn symbol_at(node: TsNode<'_>) -> Option<TsSymbol<'_>> {
++    // ets_typeparser/src/helpers.rs:82–114. Neither a call callee nor a const initializer is
++    // the operand of a delete expression.
++    if node.kind() == Kind::MetaProperty {
++        return None;
++    }
 +    node.get_symbol_at_location()
-+        .or_else(|| node.name()?.get_symbol_at_location())
-+        .map(TsSymbol::get_aliased_symbol)
-+        .map(TsSymbol::get_export_symbol)
 +}
 +
 +/// Compare resolved export identity, including renamed imports and local const aliases.
@@ -1583,6 +1691,7 @@ index 0000000..acd956c
 +    let Some(target) = reference_symbol(node) else {
 +        return false;
 +    };
++    let exported_target = target.get_export_symbol();
 +    target.declarations().any(|decl| {
 +        let source = decl.get_source_file();
 +        // An npm alias changes the installation directory, while the manifest still names the package.
@@ -1598,7 +1707,7 @@ index 0000000..acd956c
 +            export.name() == b"Effect" && effect(export.get_aliased_symbol().get_declared_type()).is_some()
 +        }) && exports
 +            .into_iter()
-+            .any(|export| names.contains(&export.name()) && export.get_aliased_symbol().get_export_symbol() == target)
++            .any(|export| names.contains(&export.name()) && export.get_aliased_symbol().get_export_symbol() == exported_target)
 +    })
 +}
 +
@@ -1607,23 +1716,24 @@ index 0000000..acd956c
 +    modules: Option<&'a dyn Modules>,
 +) -> impl Iterator<Item = Type<'a>> {
 +    const APIS: &[&[u8]] = &[b"tryPromise", b"try", b"tryMap", b"tryMapPromise"];
-+    call.expression()
++    // ets_rules/src/{global_error_in_effect_catch,unknown_in_effect_catch}.rs:58–96.
++    let callee = if call.kind() == Kind::CallExpression { call.expression() } else { None };
++    callee
 +        .filter(|&callee| modules.is_some_and(|modules| is_node_reference_to_effect_module_api(callee, APIS, modules)))
 +        .and_then(|_| call.get_resolved_signature()?.get_parameters().first())
 +        .into_iter()
 +        .flat_map(move |param| union_members(param.get_type_at_location(call)))
 +        .filter_map(move |options| {
 +            let catch = options.get_property(b"catch")?.get_type_at_location(call);
-+            let output = catch.get_call_signatures().first()?.get_return_type();
-+            (!output.is_error() && !output.is_unresolved()).then_some(output)
++            Some(catch.get_call_signatures().first()?.get_return_type())
 +        })
 +}
 diff --git a/test/cli/lint/effect.test.ts b/test/cli/lint/effect.test.ts
 new file mode 100644
-index 0000000..38c8bf4
+index 0000000..27ae76f
 --- /dev/null
 +++ b/test/cli/lint/effect.test.ts
-@@ -0,0 +1,206 @@
+@@ -0,0 +1,227 @@
 +import { describe, expect, test } from "bun:test";
 +import { bunEnv, bunExe, tempDir } from "harness";
 +
@@ -1689,6 +1799,7 @@ index 0000000..38c8bf4
 +        'pool();',
 +        'ordinary();',
 +        'impostor();',
++        '(kept = make());',
 +      ].join("\n"),
 +    };
 +  }
@@ -1699,6 +1810,7 @@ index 0000000..38c8bf4
 +      expect(errors).toEqual([
 +        "11:1 This Effect value is neither yielded nor used in an assignment.",
 +        "12:1 This Effect-able `Stream` value is neither yielded nor assigned to a variable.",
++        "22:1 This Effect value is neither yielded nor used in an assignment.",
 +      ]);
 +      expect(exitCode).toBe(1);
 +    }
@@ -1812,9 +1924,22 @@ index 0000000..38c8bf4
 +      "declare function try_<A, E>(options: Options<A, E>): Effect<A, E>;",
 +      "export { try_ as try };",
 +    ].join("\n"),
++    "node_modules/bridge/package.json": '{ "name": "bridge", "types": "./index.d.ts" }',
++    "node_modules/bridge/index.d.ts": 'export { tryPromise } from "effect-v4/dist/Effect";',
++    "parenthesized.ts": [
++      'import { tryPromise } from "bridge";',
++      "export const directUnknown = tryPromise({ try: async () => 1, catch: error => error });",
++      "export const parenthesizedUnknown = (tryPromise)({ try: async () => 1, catch: error => error });",
++      'export const directError = tryPromise({ try: async () => 1, catch: () => new Error("failed") });',
++      'export const parenthesizedError = (tryPromise)({ try: async () => 1, catch: () => new Error("failed") });',
++      "export const nonNull = tryPromise!({ try: async () => 1, catch: error => error });",
++      "export const cast = (tryPromise as typeof tryPromise)({ try: async () => 1, catch: error => error });",
++      "export const satisfies = (tryPromise satisfies typeof tryPromise)({ try: async () => 1, catch: error => error });",
++      "export const comma = (0, tryPromise)({ try: async () => 1, catch: error => error });",
++    ].join("\n"),
 +    "a.ts": [
 +      'import { Effect } from "effect-v4";',
-+      "const attempt = Effect.try;",
++      "const attempt = (Effect.try);",
 +      "export const promised = Effect.tryPromise({ try: async () => 1, catch: error => error });",
 +      'export const tried = attempt({ try: () => 1, catch: () => new Error("failed") });',
 +      "const local = { tryPromise: <A, E>(options: { try: () => A; catch: (error: unknown) => E }) => options };",
@@ -1829,4 +1954,10 @@ index 0000000..38c8bf4
 +  expect(errors.map(line => line.split(" ", 1)[0])).toEqual(["3:25", "4:22", "8:32", "9:31"]);
 +  expect(stdout).toContain("[Error/bun(unknown-in-effect-catch)]");
 +  expect(stdout).toContain("[Error/bun(global-error-in-effect-catch)]");
++
++  const parenthesized = await lint(files, ["parenthesized.ts"]);
++  expect(parenthesized.exitCode).toBe(1);
++  expect(parenthesized.errors.map(line => line.split(" ", 1)[0])).toEqual(["2:30", "4:28"]);
++  expect(parenthesized.stdout).toMatch(/parenthesized\.ts:2:30: .*\[Error\/bun\(unknown-in-effect-catch\)\]/);
++  expect(parenthesized.stdout).toMatch(/parenthesized\.ts:4:28: .*\[Error\/bun\(global-error-in-effect-catch\)\]/);
 +});
