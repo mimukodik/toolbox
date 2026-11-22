@@ -98,40 +98,23 @@ jobs:
           BUN_BUILD_CONTROL: ${{ steps.control.outputs.build_control }}
         run: bash tools/bun/slack-lint-proof.sh
 
-      - name: Run Bun lint test files touched by patches
+      - name: Run patched and listed Bun lint tests
         shell: bash
         run: |
-          source=$(nix eval --raw .#bun.src.outPath)
-          fixture="$RUNNER_TEMP/bun-type-services"
-          mkdir -p "$fixture"
-          tar -xzf "$source" -C "$fixture" --strip-components=1 --wildcards '*/test/*'
-
-          export LC_ALL=C
-          shopt -s dotglob
-          changes="$RUNNER_TEMP/bun-patched-tests"
-          {
-            for patch in "$PWD"/tools/bun/patches/*.patch; do
-              # Match the regular files selected by package.nix.
-              [[ -f "$patch" && ! -L "$patch" ]] || continue
-              git -C "$fixture" apply --apply --numstat -z \
-                --exclude='test/cli/lint/*/*' --include='test/cli/lint/*.test.ts' "$patch"
-            done
-          } > "$changes"
-
-          tests=()
-          declare -A seen=()
-          while IFS=$'\t' read -r -d '' _added _removed path; do
-            if [[ -f "$fixture/$path" && ! ${seen[$path]+x} ]]; then
-              tests+=("./${path#test/}")
-              seen[$path]=1
-            fi
-          done < "$changes"
-          if (( ${#tests[@]} == 0 )); then
-            echo 'No patched Bun lint test files found.' >&2
-            exit 1
+          parked=$(awk '
+            /^[[:space:]]*#[[:space:]]+cli\/lint\/[^/[:space:]]+\.test\.ts[[:space:]]*$/ {
+              printf "PARKED: %s%s\n\n", $2, note
+            }
+            { note = "" }
+            /^[[:space:]]*#[[:space:]]+Parked / {
+              sub(/^[[:space:]]*#[[:space:]]+/, "")
+              note = " (" $0 ")"
+            }
+          ' tools/bun/upstream-tests.txt)
+          if [[ -n "$parked" ]]; then
+            printf '### Parked upstream Bun lint tests\n\n%s\n\n' "$parked" | tee -a "$GITHUB_STEP_SUMMARY"
           fi
-          cd "$fixture/test"
-          "$RUNNER_TEMP/bun-result/bin/bun" test "${tests[@]}"
+          bash tools/bun/test-upstream.sh
 
       - name: Package and measure the runtime closure
         run: bash tools/bun/package-release.sh
