@@ -67,5 +67,13 @@ jobs:
           sudo sh "$RUNNER_TEMP/toolbox-install.sh" "$url" "$BUN_RELEASE_SHA256"
           /usr/local/bin/bun --revision
 
-      - name: Check pinned parity inputs
-        run: '"$STOCK_BUN" tools/effect-parity/parity.ts .effect-tsgo'
+      - name: Lay out Effect fixtures
+        run: '"$STOCK_BUN" tools/effect-parity/parity.ts .effect-tsgo "$RUNNER_TEMP/effect-layout.json"'
+
+      - name: Upload fixture inventory
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: effect-parity
+          path: ${{ runner.temp }}/effect-layout.json
+          if-no-files-found: warn
