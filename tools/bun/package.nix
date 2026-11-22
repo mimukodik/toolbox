@@ -47,7 +47,7 @@ let
     for vendor in ${bunCargo} ${rustCargo}; do
       for crate in "$vendor"/*; do
         if [[ -d "$crate" && ! -e "$out/''${crate##*/}" ]]; then
-          ln -s "$(readlink -f "$crate")" "$out/"
+          ln -s "$(readlink -f "$crate")" "$out/''${crate##*/}"
         fi
       done
     done
