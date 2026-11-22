@@ -22,16 +22,20 @@ const subjects = {
     label: "Effect TSRS compiler",
     command: ({ tsconfig }: Fixture) => [effectTsgo, "tsrs", "--noEmit", "--pretty", "false", "-p", tsconfig],
     parse: parseCompiler,
+    // TSRS uses the compiler's DiagnosticsPresent exit statuses.
+    diagnosticExits: [1, 2],
   },
   oxlint: {
     label: "Effect TSRS Oxlint",
     command: (fixture: Fixture) => lintCommand([effectTsgo, "--tsrs-lint", "oxlint"], fixture),
     parse: parseUnix,
+    diagnosticExits: [1],
   },
   bun: {
     label: "Patched Bun",
     command: (fixture: Fixture) => lintCommand(["/usr/local/bin/bun", "lint", "--no-script"], fixture),
     parse: parseUnix,
+    diagnosticExits: [1],
   },
 };
 
@@ -135,7 +139,7 @@ function compare(fixture: string, baseline: Diagnostic[], result: ParsedOutput):
 export async function runPass(
   subject: keyof typeof subjects, fixtures: Fixture[], baselines: Diagnostic[],
 ): Promise<Pass> {
-  const { command, label, parse } = subjects[subject];
+  const { command, label, parse, diagnosticExits } = subjects[subject];
   const expected = Map.groupBy(baselines, ({ fixture }) => fixture);
   const scores: FixtureScore[] = [];
   const raw: RawResult[] = [];
@@ -159,7 +163,8 @@ export async function runPass(
         raw.push({ fixture: fixture.name, exitCode, stdout, stderr });
         const result = parse(fixture, stdout);
         scores.push(compare(fixture.name, expected.get(fixture.name) ?? [], result));
-        if (exitCode !== 0 && (exitCode !== 1 || result.effect.length + result.nonEffect === 0)) {
+        const reportedDiagnostics = result.effect.length + result.nonEffect > 0;
+        if (exitCode !== 0 && !(diagnosticExits.includes(exitCode) && reportedDiagnostics)) {
           failures.push(`${fixture.name}: exit ${exitCode}: ${stderr || stdout}`);
         }
       } catch (error) {
