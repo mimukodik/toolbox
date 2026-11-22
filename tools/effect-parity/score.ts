@@ -258,7 +258,7 @@ export function floatingEffectTable(pass: Pass): string {
     "| --- | ---: | ---: | ---: |",
     ...rows,
     `| **Total** | **${matchCount}** | **${misses.length}** | **${extras.length}** |`, "",
-    "#### False positives", "",
+    "#### Extra diagnostics", "",
     ...(extras.length ? extras.map(({ fixture, file, line, col, severity }) =>
       `- \`${fixture}\` at \`${file}:${line}:${col}\` (${severity})`) : ["None."]),
     "",

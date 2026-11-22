@@ -40,3 +40,26 @@ plugin for all passes. Two reference gates must pass before Bun runs.
 
 The Bun comparison uses the full `floatingEffect` baseline, including its
 suggestion and message. Its score is informational.
+
+## Bun p1 findings
+
+P1 matched 66 of the 67 `floatingEffect` locations and emitted 22 extras.
+A `satisfies` expression in `promiseInEffectSuccess.ts` accounts for both the
+miss and one extra. Effect highlights column 30 on line 80, while p1 highlights
+column 1. The other 21 extras occur at expressions covered by Effect
+suppression directives. The artifact lists every location.
+
+The location score includes the message on line 23 and the suggestion on
+line 27 of `floatingEffect_directivePrecedence.ts`. P1 reported both as errors.
+The slack-listener command omits both. P1 agreed with the baseline severity
+at 59 of the 66 matching locations.
+
+In [Blacksmith run 45038112140](https://github.com/mimukodik/toolbox/actions/runs/45038112140), the workflow took
+101 s from creation to completion, including 94 s on
+Blacksmith (1.57 job-minutes).
+
+| Pass over 553 fixtures | Wall time |
+| --- | ---: |
+| Effect TSRS compiler | 34.78 s |
+| Effect TSRS Oxlint | 40.92 s |
+| Patched Bun p1 | 4.85 s |
