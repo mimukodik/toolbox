@@ -98,7 +98,7 @@ jobs:
           BUN_BUILD_CONTROL: ${{ steps.control.outputs.build_control }}
         run: bash tools/bun/slack-lint-proof.sh
 
-      - name: Test the Effect rule with Bun's type-service fixtures
+      - name: Run Bun lint test files touched by patches
         shell: bash
         run: |
           source=$(nix eval --raw .#bun.src.outPath)
@@ -107,6 +107,7 @@ jobs:
           tar -xzf "$source" -C "$fixture" --strip-components=1 --wildcards '*/test/*'
 
           export LC_ALL=C
+          shopt -s dotglob
           changes="$RUNNER_TEMP/bun-patched-tests"
           {
             for patch in "$PWD"/tools/bun/patches/*.patch; do
