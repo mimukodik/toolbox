@@ -16,6 +16,7 @@ in
         sha256 = "a08f5abdbe25e71c55da1c4b20a002f08feecfa3011f96d6b4197d3c5bf4140b";
       };
     };
+    buildInputs = old.buildInputs ++ [ final.aws-lc ];
     patches = (old.patches or [ ]) ++ [
       ./patches/cargo-build-dir.patch
       ./patches/remap-paths.patch
