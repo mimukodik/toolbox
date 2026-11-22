@@ -30,8 +30,8 @@ jobs:
     env:
       BUN_BUILD_RUN: ${{ inputs.bun_build_run }}
       EFFECT_REV: 0e722d359c969bdf1b1316f08e8637022cde3cce
-      BUN_RELEASE: bun-1.4.6-canary.1-b15f513-p1
-      BUN_RELEASE_SHA256: 4459084d6fec6be890aa2a9fa24d5f433eb5d48b5149d74bbe9b37a5965d72c5
+      BUN_RELEASE: bun-1.4.6-canary.1-b15f513-p2
+      BUN_RELEASE_SHA256: 2a005ab0a9eff121afa283bee50e0e5249eb59c1b1706557340640f23f83d03d
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
