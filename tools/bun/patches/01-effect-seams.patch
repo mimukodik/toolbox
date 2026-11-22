@@ -27,7 +27,7 @@ index b9b5c8f..c78fe92 100644
      #[inline]
      pub fn data(mut self, name: &'static str, value: impl IntoText<'a>) -> Self {
 diff --git a/src/lint/driver/for_tests.rs b/src/lint/driver/for_tests.rs
-index 70b33df..a836c76 100644
+index 70b33df..1fc686a 100644
 --- a/src/lint/driver/for_tests.rs
 +++ b/src/lint/driver/for_tests.rs
 @@ -137,6 +137,7 @@ impl Host for Tester<'_> {
@@ -38,6 +38,14 @@ index 70b33df..a836c76 100644
                  };
                  Some(
                      typed::lint(&context, &environment, &[file], &|_| ())
+@@ -157,6 +158,7 @@ fn registry() -> Registry {
+         bun_lint_eslint::RULES,
+         bun_lint_typescript::RULES,
+         bun_lint_plugins::RULES,
++        bun_lint_plugins::effect::RULES,
+         bun_lint_unicorn::RULES,
+         bun_lint_react::RULES,
+         bun_lint_jest::RULES,
 diff --git a/src/lint/driver/lib.rs b/src/lint/driver/lib.rs
 index eb5d36b..7321248 100644
 --- a/src/lint/driver/lib.rs
@@ -50,16 +58,33 @@ index eb5d36b..7321248 100644
  mod embedded;
  mod eslintrc;
  mod evaluate;
+diff --git a/src/lint/driver/rules.rs b/src/lint/driver/rules.rs
+index 55f88a4..0e8e7a2 100644
+--- a/src/lint/driver/rules.rs
++++ b/src/lint/driver/rules.rs
+@@ -1,10 +1,13 @@
+ //! All of `bun lint`'s rules.
+ 
++use bun_lint_plugins::effect;
++
+ bun_lint::rule_sets! {
+     pub enum Rules / Runs {
+         eslint: bun_lint_eslint,
+         typescript: bun_lint_typescript,
+         plugins: bun_lint_plugins,
++        effect: effect,
+         unicorn: bun_lint_unicorn,
+         react: bun_lint_react,
+         jest: bun_lint_jest,
 diff --git a/src/lint/driver/run.rs b/src/lint/driver/run.rs
-index dfd45cd..4823a5f 100644
+index dfd45cd..0c7ff8d 100644
 --- a/src/lint/driver/run.rs
 +++ b/src/lint/driver/run.rs
-@@ -763,14 +763,17 @@ impl Run<'_> {
+@@ -763,14 +763,16 @@ impl Run<'_> {
              inferred.files(vec![path.clone()]);
          }
          let has_rules_with_types = config.has_enabled(|it| it.triggers_type_check());
-+        let effect_plugin =
-+            crate::effect::may_use_effect_plugin(loaded.flavor, self.options.type_aware, &path);
++        let effect_plugin = crate::effect::may_use_effect_plugin(loaded.flavor, self.options.type_aware, &path);
          let needs_types = name.is_some()
              && loader.wants_types(&loaded, config)
 -            && (has_rules_with_types || context.checks_types);
@@ -73,15 +98,12 @@ index dfd45cd..4823a5f 100644
              };
              if let Some(Some(result)) =
                  typed::lint(context, self.environment, &[file], &on_circular_fixes).pop()
-@@ -929,14 +932,23 @@ impl Run<'_> {
+@@ -929,14 +931,20 @@ impl Run<'_> {
              let needing = config
                  .configured()
                  .filter(|it| it.severity != Severity::Off && it.entry.meta.requires_types);
-+            let effect_plugin = crate::effect::may_use_effect_plugin(
-+                target.loaded.flavor,
-+                self.options.type_aware,
-+                &target.path,
-+            );
++            let effect_plugin =
++                crate::effect::may_use_effect_plugin(target.loaded.flavor, self.options.type_aware, &target.path);
              if loader.wants_types(&target.loaded, config) {
 -                match config.has_enabled(|it| it.triggers_type_check()) || context.checks_types {
 +                match config.has_enabled(|it| it.triggers_type_check())
@@ -98,6 +120,14 @@ index dfd45cd..4823a5f 100644
                          },
                      )),
                      false => without_types.push(target),
+@@ -1126,6 +1134,7 @@ impl Run<'_> {
+             bun_lint_eslint::RULES,
+             bun_lint_typescript::RULES,
+             bun_lint_plugins::RULES,
++            bun_lint_plugins::effect::RULES,
+             bun_lint_unicorn::RULES,
+             bun_lint_react::RULES,
+             bun_lint_jest::RULES,
 diff --git a/src/lint/driver/typed.rs b/src/lint/driver/typed.rs
 index 49b2f56..cd047e7 100644
 --- a/src/lint/driver/typed.rs
@@ -173,10 +203,10 @@ index 7da903c..005a88b 100644
      {
        "type": "object",
 diff --git a/src/lint/plugins/lib.rs b/src/lint/plugins/lib.rs
-index 1516853..93a8caa 100644
+index 1516853..0c87b85 100644
 --- a/src/lint/plugins/lib.rs
 +++ b/src/lint/plugins/lib.rs
-@@ -24,11 +24,13 @@ mod import_type;
+@@ -24,6 +24,7 @@ mod import_type;
  mod module_visitor;
  mod n;
  mod oxlint;
@@ -184,12 +214,6 @@ index 1516853..93a8caa 100644
  mod prettier;
  
  bun_lint::rules! {
-     bun_axios_no_unbounded_requests::AxiosNoUnboundedRequests,
-     bun_consistent_directive_prefix::ConsistentDirectivePrefix,
-+    bun_floating_effect::FloatingEffect,
-     bun_fast_check_no_unseeded_random::FastCheckNoUnseededRandom,
-     bun_jsx_no_forbidden_nesting::JsxNoForbiddenNesting,
-     bun_no_array_just_to_count::NoArrayJustToCount,
 diff --git a/src/sema/resolve.rs b/src/sema/resolve.rs
 index a98898f..9b0a954 100644
 --- a/src/sema/resolve.rs

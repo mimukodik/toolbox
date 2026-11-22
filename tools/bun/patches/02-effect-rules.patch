@@ -58,10 +58,10 @@ index 0000000..7545689
 +```
 diff --git a/src/lint/driver/effect.rs b/src/lint/driver/effect.rs
 new file mode 100644
-index 0000000..1dcc399
+index 0000000..e530899
 --- /dev/null
 +++ b/src/lint/driver/effect.rs
-@@ -0,0 +1,80 @@
+@@ -0,0 +1,98 @@
 +use crate::configs::Flavor;
 +use crate::lint::Context;
 +use crate::typed::Typed;
@@ -74,30 +74,48 @@ index 0000000..1dcc399
 +use bun_threading::Guarded;
 +use std::sync::Arc;
 +
-+const RULES: &[(&[u8], &[u8])] = &[(b"floatingEffect", b"bun/floating-effect")];
++use EffectSeverity::{Error, Off, Warn};
++
++const RULES: &[(&[u8], &[u8], EffectSeverity)] = &[
++    (b"floatingEffect", b"bun/floating-effect", Error),
++    (
++        b"globalErrorInEffectFailure",
++        b"bun/global-error-in-effect-failure",
++        Warn,
++    ),
++    (b"globalErrorInEffectCatch", b"bun/global-error-in-effect-catch", Warn),
++    (b"unknownInEffectCatch", b"bun/unknown-in-effect-catch", Warn),
++    (b"effectInFailure", b"bun/effect-in-failure", Warn),
++    (b"anyUnknownInErrorContext", b"bun/any-unknown-in-error-context", Off),
++    (b"unsafeEffectTypeAssertion", b"bun/unsafe-effect-type-assertion", Off),
++];
 +
 +pub(crate) fn may_use_effect_plugin(flavor: Flavor, type_aware: Option<bool>, path: &[u8]) -> bool {
 +    // With built-in lint, a native rule can request types independently of the Effect plugin.
 +    // The caller still checks the effective lint config, including Oxlint's typeAware setting.
-+    matches!((flavor, type_aware), (Flavor::BuiltIn, Some(true)) | (Flavor::Oxlint, _))
-+        && matches!(ScriptKind::from_file_name(path), Some(ScriptKind::Ts | ScriptKind::Tsx))
++    matches!(
++        (flavor, type_aware),
++        (Flavor::BuiltIn, Some(true)) | (Flavor::Oxlint, _)
++    ) && matches!(ScriptKind::from_file_name(path), Some(ScriptKind::Ts | ScriptKind::Tsx))
 +}
 +
 +fn effect_severities(plugins: &Json) -> Option<Vec<EffectSeverity>> {
-+    let plugin = plugins.as_array()?.iter().find(|plugin| {
-+        plugin.get(b"name").and_then(Json::as_str) == Some(b"@effect/language-service")
-+    })?;
++    let plugin = plugins
++        .as_array()?
++        .iter()
++        .find(|plugin| plugin.get(b"name").and_then(Json::as_str) == Some(b"@effect/language-service"))?;
 +    if matches!(plugin.get(b"diagnostics"), Some(Json::Bool(false))) {
 +        return None;
 +    }
 +    let settings = plugin.get(b"diagnosticSeverity");
 +    Some(
-+        RULES.iter()
-+            .map(|(name, _)| {
++        RULES
++            .iter()
++            .map(|(name, _, default)| {
 +                settings
 +                    .and_then(|it| it.get(name))
 +                    .and_then(Json::as_str)
-+                    .map_or(EffectSeverity::Error, EffectSeverity::parse)
++                    .map_or(*default, EffectSeverity::parse)
 +            })
 +            .collect(),
 +    )
@@ -125,7 +143,7 @@ index 0000000..1dcc399
 +        if let Some(config) = configs.get(&key) {
 +            return Some(Arc::clone(config));
 +        }
-+        let additions = RULES.iter().zip(&key.1).filter_map(|((_, name), severity)| {
++        let additions = RULES.iter().zip(&key.1).filter_map(|((_, name, _), severity)| {
 +            let rule = config.find_rule(context.linter.registry(), name)?;
 +            if config.rule(rule).is_some() {
 +                return None;
@@ -144,10 +162,10 @@ index 0000000..1dcc399
 +}
 diff --git a/src/lint/plugins/effect/mod.rs b/src/lint/plugins/effect/mod.rs
 new file mode 100644
-index 0000000..ddb22ec
+index 0000000..61316c0
 --- /dev/null
 +++ b/src/lint/plugins/effect/mod.rs
-@@ -0,0 +1,170 @@
+@@ -0,0 +1,225 @@
 +use bstr::ByteSlice;
 +use bun_lint::context::Severity;
 +
@@ -318,16 +336,262 @@ index 0000000..ddb22ec
 +    let end = text.iter().position(|&byte| !word(byte)).unwrap_or(text.len());
 +    text.split_at(end)
 +}
-diff --git a/src/lint/plugins/rules/bun_floating_effect.rs b/src/lint/plugins/rules/bun_floating_effect.rs
++
++mod type_parser;
++
++macro_rules! effect_rule {
++    ($rule:ident, $effect_name:literal, $bun_name:literal, $on:expr, $($visit:item),+ $(,)?) => {
++        pub struct $rule {
++            hidden_by_default: bool,
++        }
++
++        impl Rule for $rule {
++            const META: Meta = Meta::plugin(bun_lint::rule::Plugin::Bun, $bun_name, Kind::Problem)
++                .requires_types();
++            const ON: On = $on;
++            type State<'a> = crate::effect::Directives;
++
++            fn new(options: &Options) -> Self {
++                Self { hidden_by_default: options.bool(0) == Some(true) }
++            }
++
++            fn start<'a>(&self, file: &'a File<'a>) -> Option<Self::State<'a>> {
++                let directives = crate::effect::Directives::parse(file.text(), $effect_name);
++                (!directives.skips_file(self.hidden_by_default)).then_some(directives)
++            }
++
++            $($visit)+
++        }
++    };
++}
++use effect_rule;
++
++fn report<'a, R: bun_lint::rule::Rule<State<'a> = Directives>>(
++    cx: &bun_lint::context::Cx<'a, R>,
++    hidden_by_default: bool,
++    span: bun_lint::span::Span,
++    message: &'static bun_lint::rule::Message,
++) -> Option<bun_lint::context::Report<'a>> {
++    match cx.state.severity_at(cx.line_of(span.start)) {
++        Some(severity) => {
++            let severity = severity.visible()?;
++            Some(cx.report(span, message).with_severity(severity))
++        }
++        None if hidden_by_default => None,
++        None => Some(cx.report(span, message)),
++    }
++}
++
++bun_lint::rules! {
++    bun_any_unknown_in_error_context::AnyUnknownInErrorContext,
++    bun_effect_in_failure::EffectInFailure,
++    bun_floating_effect::FloatingEffect,
++    bun_global_error_in_effect_catch::GlobalErrorInEffectCatch,
++    bun_global_error_in_effect_failure::GlobalErrorInEffectFailure,
++    bun_unknown_in_effect_catch::UnknownInEffectCatch,
++    bun_unsafe_effect_type_assertion::UnsafeEffectTypeAssertion,
++}
+diff --git a/src/lint/plugins/effect/rules/bun_any_unknown_in_error_context.rs b/src/lint/plugins/effect/rules/bun_any_unknown_in_error_context.rs
 new file mode 100644
-index 0000000..10ee56e
+index 0000000..4b7eb72
 --- /dev/null
-+++ b/src/lint/plugins/rules/bun_floating_effect.rs
-@@ -0,0 +1,106 @@
-+use crate::effect::Directives;
++++ b/src/lint/plugins/effect/rules/bun_any_unknown_in_error_context.rs
+@@ -0,0 +1,125 @@
++use crate::effect::{effect_rule, report, type_parser};
++use bun_lint::prelude::*;
++use bun_lint::types::{SyntaxKind as TsKind, TsNode, Type, TypeFlags};
++
++const MESSAGE: &Message = &Message::new("anyUnknownInErrorContext", "{{details}}");
++
++#[derive(Clone, Copy)]
++struct FlaggedChannels {
++    error: TypeFlags,
++    requirements: TypeFlags,
++}
++
++impl FlaggedChannels {
++    fn covers(self, other: Self) -> bool {
++        (other.error.is_empty() || self.error == other.error)
++            && (other.requirements.is_empty() || self.requirements == other.requirements)
++    }
++
++    fn message(self) -> String {
++        fn label(flags: TypeFlags) -> &'static str {
++            if flags.contains(TypeFlags::ANY) {
++                "any"
++            } else {
++                "unknown"
++            }
++        }
++        let mut descriptions = Vec::new();
++        if !self.requirements.is_empty() {
++            descriptions.push(format!("{} in the requirements channel", label(self.requirements)));
++        }
++        if !self.error.is_empty() {
++            descriptions.push(format!("{} in the error channel", label(self.error)));
++        }
++        let mut message = format!("This has {} which is not recommended.", descriptions.join(" and "));
++        if !self.requirements.is_empty() {
++            message.push_str("\nOnly service identifiers should appear in the requirements channel.");
++        }
++        if !self.error.is_empty() {
++            message.push_str("\nHaving an unknown or any error type is not useful. Consider instead using specific error types baked by Data.TaggedError for example.");
++        }
++        message
++    }
++}
++
++fn channels(ty: Type<'_>) -> Option<type_parser::Channels<'_>> {
++    type_parser::strict_effect(ty).or_else(|| type_parser::layer(ty))
++}
++
++fn ignore_subtree(node: TsNode<'_>) -> bool {
++    match node.kind() {
++        TsKind::TypeAliasDeclaration | TsKind::InterfaceDeclaration => true,
++        TsKind::AsExpression => node.type_node().is_some_and(|ty| ty.kind() == TsKind::AnyKeyword),
++        TsKind::Parameter | TsKind::PropertyDeclaration | TsKind::VariableDeclaration => node
++            .type_node()
++            .is_some_and(|ty| channels(ty.get_type_from_type_node()).is_some()),
++        _ => false,
++    }
++}
++
++effect_rule!(
++    AnyUnknownInErrorContext,
++    b"anyUnknownInErrorContext",
++    "any-unknown-in-error-context",
++    On::new().finish(),
++    fn finish(&self, cx: &mut Cx<'_, Self>) {
++        let file = cx.file();
++        let root = file.type_checker().ts_node(file);
++        let mut pending: Vec<_> = root.children().collect();
++        let mut matches: Vec<(Span, FlaggedChannels)> = Vec::new();
++
++        while let Some(node) = pending.pop() {
++            let kind = node.kind();
++            if kind.is_type_node() {
++                // A class extends clause has a type-shaped wrapper around an expression.
++                if kind == TsKind::ExpressionWithTypeArguments
++                    && node.parent().is_some_and(|clause| {
++                        clause.kind() == TsKind::HeritageClause
++                            && clause.parent().is_some_and(|class| class.kind().is_class_like())
++                    })
++                {
++                    pending.extend(node.expression());
++                }
++                continue;
++            }
++            if ignore_subtree(node) {
++                continue;
++            }
++
++            pending.extend(node.children());
++            if type_parser::has_equivalent_node(node) {
++                continue;
++            }
++            let ty = if kind == TsKind::CallExpression {
++                node.get_resolved_signature().map(|sig| sig.get_return_type())
++            } else {
++                type_parser::type_at(node)
++            };
++            let Some(effect) = ty.and_then(channels) else { continue };
++            let mask = TypeFlags::ANY | TypeFlags::UNKNOWN;
++            let flagged = FlaggedChannels {
++                error: effect.error.flags() & mask,
++                requirements: effect.requirements.flags() & mask,
++            };
++            if flagged.error.is_empty() && flagged.requirements.is_empty() {
++                continue;
++            }
++            let span = node.span();
++            if span.start >= span.end {
++                continue;
++            }
++            // Drop a containing match only if this node reports all of its channels
++            // with the same flags. An outer match can contribute a distinct finding.
++            matches.retain(|&(outer, previous)| {
++                !(outer.start <= span.start && span.end <= outer.end && flagged.covers(previous))
++            });
++            matches.push((span, flagged));
++        }
++
++        for (span, flags) in matches {
++            if let Some(report) = report(cx, self.hidden_by_default, span, MESSAGE) {
++                report.data("details", flags.message());
++            }
++        }
++    }
++);
+diff --git a/src/lint/plugins/effect/rules/bun_effect_in_failure.rs b/src/lint/plugins/effect/rules/bun_effect_in_failure.rs
+new file mode 100644
+index 0000000..85c14e8
+--- /dev/null
++++ b/src/lint/plugins/effect/rules/bun_effect_in_failure.rs
+@@ -0,0 +1,55 @@
++use crate::effect::{effect_rule, report, type_parser};
++use bun_lint::prelude::*;
++use std::collections::HashSet;
++
++const MESSAGE: &Message = &Message::new(
++    "effectInFailure",
++    "The error channel contains an Effect ({{type}}). Putting Effect computations in the failure channel is not intended; keep only failure types there.",
++);
++
++effect_rule!(
++    EffectInFailure,
++    b"effectInFailure",
++    "effect-in-failure",
++    On::new().finish(),
++    fn finish(&self, cx: &mut Cx<'_, Self>) {
++        let file = cx.file();
++        let root = file.type_checker().ts_node(file);
++        let mut pending: Vec<_> = root.children().map(|child| (child, false)).collect();
++        let mut matched_children = HashSet::new();
++
++        while let Some((node, visited)) = pending.pop() {
++            // Post-order keeps the report on the innermost Effect and propagates
++            // that match through all ancestors, even non-Effect nodes.
++            if !visited {
++                pending.push((node, true));
++                pending.extend(node.children().map(|child| (child, false)));
++                continue;
++            }
++            if matched_children.remove(&node) {
++                matched_children.extend(node.parent());
++                continue;
++            }
++            if type_parser::has_equivalent_node(node) {
++                continue;
++            }
++            let Some(effect) = type_parser::type_at(node).and_then(type_parser::strict_effect) else {
++                continue;
++            };
++            let Some(nested) = type_parser::union_members(effect.error)
++                .into_iter()
++                .find(|&ty| type_parser::strict_effect(ty).is_some())
++            else {
++                continue;
++            };
++            let span = node.span();
++            if span.start >= span.end {
++                continue;
++            }
++            if let Some(report) = report(cx, self.hidden_by_default, span, MESSAGE) {
++                report.data("type", nested.to_text());
++            }
++            matched_children.extend(node.parent());
++        }
++    }
++);
+diff --git a/src/lint/plugins/effect/rules/bun_floating_effect.rs b/src/lint/plugins/effect/rules/bun_floating_effect.rs
+new file mode 100644
+index 0000000..643c9cc
+--- /dev/null
++++ b/src/lint/plugins/effect/rules/bun_floating_effect.rs
+@@ -0,0 +1,72 @@
++use crate::effect::{Directives, report, type_parser};
 +use bun_lint::prelude::*;
 +use bun_lint::rule::Plugin;
-+use bun_lint::types::Type;
 +
 +/// Detects Effect values that are neither yielded nor assigned.
 +pub struct FloatingEffect {
@@ -343,21 +607,6 @@ index 0000000..10ee56e
 +    "floatingEffectAble",
 +    "This Effect-able `{{type}}` value is neither yielded nor assigned to a variable.",
 +);
-+
-+const EFFECT: &[u8] = b"~effect/Effect";
-+const STREAM: &[u8] = b"~effect/Stream";
-+
-+fn has_variance_fields(variance: Type) -> bool {
-+    [&b"_A"[..], b"_E", b"_R"].into_iter().all(|name| {
-+        variance.get_type_of_property(name).is_some_and(|field| {
-+            let signatures = field.get_call_signatures();
-+            signatures.len() == 1
-+                && signatures
-+                    .first()
-+                    .is_some_and(|signature| signature.type_parameters().is_empty())
-+        })
-+    })
-+}
 +
 +impl Rule for FloatingEffect {
 +    const META: Meta = Meta::plugin(Plugin::Bun, "floating-effect", Kind::Problem).requires_types();
@@ -384,19 +633,11 @@ index 0000000..10ee56e
 +        }
 +
 +        let ty = expr.ty();
-+        if let Some(variance) = ty.get_type_of_property(EFFECT) {
-+            // The v4 checker also uses the variance struct on some Effect subtypes.
-+            if ty.get_property(b"_tag").is_some()
-+                || ty.get_property(b"get").is_some()
-+                || (ty.get_property(b"await").is_some() && ty.get_property(b"poll").is_some())
-+                || !has_variance_fields(variance)
-+            {
++        if type_parser::has_effect_type_id(ty) {
++            if type_parser::effect(ty).is_none() || type_parser::is_effect_subtype(ty) || type_parser::is_fiber(ty) {
 +                return;
 +            }
-+        } else if !ty
-+            .get_type_of_property(STREAM)
-+            .is_some_and(has_variance_fields)
-+        {
++        } else if type_parser::stream(ty).is_none() {
 +            return;
 +        }
 +
@@ -405,30 +646,409 @@ index 0000000..10ee56e
 +        let span = expr
 +            .as_satisfies()
 +            .and_then(|(operand, annotation)| {
-+                cx.file().tokens_between(operand.outer_span(), annotation)
++                cx.file()
++                    .tokens_between(operand.outer_span(), annotation)
 +                    .find(|token| token.text() == b"satisfies")
 +            })
 +            .map_or(expr.outer_span(), |token| token.span());
 +
-+        let severity = match cx.state.severity_at(cx.line_of(span.start)) {
-+            Some(severity) => match severity.visible() {
-+                Some(severity) => Some(severity),
-+                None => return,
-+            },
-+            None if self.hidden_by_default => return,
-+            None => None,
-+        };
-+        let strict = ty.symbol().is_some_and(|symbol| symbol.name() == b"Effect");
++        let strict = type_parser::strict_effect(ty).is_some();
 +        let message = if strict { FLOATING_EFFECT } else { FLOATING_EFFECT_ABLE };
-+        let report = cx.report(span, message);
-+        let report = match severity {
-+            Some(severity) => report.with_severity(severity),
-+            None => report,
-+        };
-+        if !strict {
-+            report.data("type", ty.to_text());
++        if let Some(report) = report(cx, self.hidden_by_default, span, message) {
++            if !strict {
++                report.data("type", ty.to_text());
++            }
 +        }
 +    }
++}
+diff --git a/src/lint/plugins/effect/rules/bun_global_error_in_effect_catch.rs b/src/lint/plugins/effect/rules/bun_global_error_in_effect_catch.rs
+new file mode 100644
+index 0000000..476eddf
+--- /dev/null
++++ b/src/lint/plugins/effect/rules/bun_global_error_in_effect_catch.rs
+@@ -0,0 +1,35 @@
++use crate::effect::{effect_rule, report, type_parser};
++use bun_lint::prelude::*;
++
++const MESSAGE: &Message = &Message::new(
++    "globalErrorInEffectCatch",
++    "The `catch` callback in `{{callee}}` returns the global `Error` type. Untagged errors merge together in the Effect error channel and lose type-level distinction; a tagged error preserves that distinction and can wrap the original error in a `cause` property.",
++);
++
++effect_rule!(
++    GlobalErrorInEffectCatch,
++    b"globalErrorInEffectCatch",
++    "global-error-in-effect-catch",
++    On::new().exprs(&[ExprTag::Call]).optional_chains(),
++    fn expr<'a>(&self, expr: Expr<'a>, cx: &mut Cx<'a, Self>) {
++        let call = expr.ts_node();
++        let mut output = type_parser::catch_return_types(call);
++        let Some(first) = output.next() else { return };
++        let Some(global) = type_parser::global_error(cx.file().type_checker()) else {
++            return;
++        };
++        if std::iter::once(first)
++            .chain(output)
++            .any(|ty| type_parser::is_global_error(ty, global))
++            && let Some(callee) = call.expression()
++            && let Some(report) = report(cx, self.hidden_by_default, callee.span(), MESSAGE)
++        {
++            report.data("callee", callee.get_source_text());
++        }
++    },
++    fn optional_chain<'a>(&self, expr: Expr<'a>, cx: &mut Cx<'a, Self>) {
++        if expr.tag() == ExprTag::Call {
++            self.expr(expr, cx);
++        }
++    }
++);
+diff --git a/src/lint/plugins/effect/rules/bun_global_error_in_effect_failure.rs b/src/lint/plugins/effect/rules/bun_global_error_in_effect_failure.rs
+new file mode 100644
+index 0000000..326d8f0
+--- /dev/null
++++ b/src/lint/plugins/effect/rules/bun_global_error_in_effect_failure.rs
+@@ -0,0 +1,32 @@
++use crate::effect::{effect_rule, report, type_parser};
++use bun_lint::prelude::*;
++
++const MESSAGE: &Message = &Message::new(
++    "globalErrorInEffectFailure",
++    "Global 'Error' loses type safety as untagged errors merge together in the Effect failure channel. Consider using a tagged error and optionally wrapping the original in a 'cause' property.",
++);
++
++effect_rule!(
++    GlobalErrorInEffectFailure,
++    b"globalErrorInEffectFailure",
++    "global-error-in-effect-failure",
++    On::new().exprs(&[ExprTag::New]),
++    fn expr<'a>(&self, expr: Expr<'a>, cx: &mut Cx<'a, Self>) {
++        let Some(global) = type_parser::global_error(cx.file().type_checker()) else {
++            return;
++        };
++        if !type_parser::is_global_error(expr.ty(), global) {
++            return;
++        }
++        // Stop at the nearest enclosing Effect, even if its error channel is different.
++        let Some(effect) = expr.ts_node().ancestors().find_map(type_parser::effect_at) else {
++            return;
++        };
++        if type_parser::union_members(effect.error)
++            .into_iter()
++            .any(|ty| type_parser::is_global_error(ty, global))
++        {
++            let _ = report(cx, self.hidden_by_default, expr.ts_node().span(), MESSAGE);
++        }
++    }
++);
+diff --git a/src/lint/plugins/effect/rules/bun_unknown_in_effect_catch.rs b/src/lint/plugins/effect/rules/bun_unknown_in_effect_catch.rs
+new file mode 100644
+index 0000000..be71bc8
+--- /dev/null
++++ b/src/lint/plugins/effect/rules/bun_unknown_in_effect_catch.rs
+@@ -0,0 +1,29 @@
++use crate::effect::{effect_rule, report, type_parser};
++use bun_lint::prelude::*;
++use bun_lint::types::TypeFlags;
++
++const MESSAGE: &Message = &Message::new(
++    "unknownInEffectCatch",
++    "The `catch` callback in `{{callee}}` returns `unknown`, so the Effect error type stays untyped. A specific typed error preserves error-channel information, for example by narrowing the value or wrapping it in `Data.TaggedError`.",
++);
++
++effect_rule!(
++    UnknownInEffectCatch,
++    b"unknownInEffectCatch",
++    "unknown-in-effect-catch",
++    On::new().exprs(&[ExprTag::Call]).optional_chains(),
++    fn expr<'a>(&self, expr: Expr<'a>, cx: &mut Cx<'a, Self>) {
++        let call = expr.ts_node();
++        if type_parser::catch_return_types(call).any(|ty| ty.has_flags(TypeFlags::ANY | TypeFlags::UNKNOWN))
++            && let Some(callee) = call.expression()
++            && let Some(report) = report(cx, self.hidden_by_default, callee.span(), MESSAGE)
++        {
++            report.data("callee", callee.get_source_text());
++        }
++    },
++    fn optional_chain<'a>(&self, expr: Expr<'a>, cx: &mut Cx<'a, Self>) {
++        if expr.tag() == ExprTag::Call {
++            self.expr(expr, cx);
++        }
++    }
++);
+diff --git a/src/lint/plugins/effect/rules/bun_unsafe_effect_type_assertion.rs b/src/lint/plugins/effect/rules/bun_unsafe_effect_type_assertion.rs
+new file mode 100644
+index 0000000..4ab7da6
+--- /dev/null
++++ b/src/lint/plugins/effect/rules/bun_unsafe_effect_type_assertion.rs
+@@ -0,0 +1,39 @@
++use crate::effect::{effect_rule, report, type_parser};
++use bun_lint::prelude::*;
++use bun_lint::types::{SyntaxKind as TsKind, TsNode, Type, TypeFlags};
++
++const MESSAGE: &Message = &Message::new(
++    "unsafeEffectTypeAssertion",
++    "This type assertion unsafely narrows the error or requirements channels.",
++);
++
++fn channels(node: TsNode<'_>) -> Option<type_parser::Channels<'_>> {
++    let ty = type_parser::type_at(node)?;
++    type_parser::effect(ty)
++        .or_else(|| type_parser::stream(ty))
++        .or_else(|| type_parser::layer(ty))
++}
++
++fn narrows<'a>(original: Type<'a>, asserted: Type<'a>) -> bool {
++    !original.has_flags(TypeFlags::ANY) && !original.is_assignable_to(asserted)
++}
++
++effect_rule!(
++    UnsafeEffectTypeAssertion,
++    b"unsafeEffectTypeAssertion",
++    "unsafe-effect-type-assertion",
++    On::new().exprs(&[ExprTag::As]),
++    fn expr<'a>(&self, expr: Expr<'a>, cx: &mut Cx<'a, Self>) {
++        let assertion = expr.ts_node();
++        if !matches!(assertion.kind(), TsKind::AsExpression | TsKind::TypeAssertionExpression) {
++            return;
++        }
++        let Some(original) = assertion.expression().and_then(channels) else {
++            return;
++        };
++        let Some(asserted) = channels(assertion) else { return };
++        if narrows(original.error, asserted.error) || narrows(original.requirements, asserted.requirements) {
++            let _ = report(cx, self.hidden_by_default, assertion.span(), MESSAGE);
++        }
++    }
++);
+diff --git a/src/lint/plugins/effect/type_parser.rs b/src/lint/plugins/effect/type_parser.rs
+new file mode 100644
+index 0000000..2bc2f98
+--- /dev/null
++++ b/src/lint/plugins/effect/type_parser.rs
+@@ -0,0 +1,224 @@
++// Adapted from Effect's MIT-licensed ets_typeparser at 0e722d359c969bdf1b1316f08e8637022cde3cce.
++// Bun's typed handles delegate these queries to the checker for the current file.
++use bun_lint::types::{
++    NodeFlags, Signature, SymbolFlags, SyntaxKind as Kind, TsNode, TsSymbol, Type, TypeFlags, Types,
++};
++use std::collections::HashSet;
++
++pub(super) use bun_lint::types::tsutils::union_constituents as union_members;
++
++#[derive(Clone, Copy)]
++pub(super) struct Channels<'a> {
++    // Success for Effect and Stream, provided services for Layer.
++    pub(super) _output: Type<'a>,
++    pub(super) error: Type<'a>,
++    pub(super) requirements: Type<'a>,
++}
++
++const EFFECT: &[u8] = b"~effect/Effect";
++const STREAM: &[u8] = b"~effect/Stream";
++const LAYER: &[u8] = b"~effect/Layer";
++
++fn variance_field<'a>(variance: Type<'a>, name: &[u8]) -> Option<Signature<'a>> {
++    let signatures = variance.get_type_of_property(name)?.get_call_signatures();
++    let signature = signatures.first()?;
++    (signatures.len() == 1 && signature.type_parameters().is_empty()).then_some(signature)
++}
++
++fn effect_channels(variance: Type<'_>) -> Option<Channels<'_>> {
++    Some(Channels {
++        _output: variance_field(variance, b"_A")?.get_return_type(),
++        error: variance_field(variance, b"_E")?.get_return_type(),
++        requirements: variance_field(variance, b"_R")?.get_return_type(),
++    })
++}
++
++pub(super) fn has_effect_type_id(ty: Type<'_>) -> bool {
++    ty.get_type_of_property(EFFECT).is_some()
++}
++
++pub(super) fn effect(ty: Type<'_>) -> Option<Channels<'_>> {
++    effect_channels(ty.get_type_of_property(EFFECT)?)
++}
++
++fn is_strict_effect(ty: Type<'_>) -> bool {
++    ty.get_symbol().is_some_and(|symbol| symbol.name() == b"Effect")
++}
++
++pub(super) fn strict_effect(ty: Type<'_>) -> Option<Channels<'_>> {
++    if !is_strict_effect(ty) {
++        return None;
++    }
++    effect(ty)
++}
++
++pub(super) fn stream(ty: Type<'_>) -> Option<Channels<'_>> {
++    effect_channels(ty.get_type_of_property(STREAM)?)
++}
++
++pub(super) fn layer(ty: Type<'_>) -> Option<Channels<'_>> {
++    let variance = ty.get_type_of_property(LAYER)?;
++    Some(Channels {
++        _output: variance_field(variance, b"_ROut")?.get_parameters().first()?.get_type(),
++        error: variance_field(variance, b"_E")?.get_return_type(),
++        requirements: variance_field(variance, b"_RIn")?.get_return_type(),
++    })
++}
++
++pub(super) fn is_fiber(ty: Type<'_>) -> bool {
++    ty.get_property(b"await").is_some() && ty.get_property(b"poll").is_some()
++}
++
++pub(super) fn is_effect_subtype(ty: Type<'_>) -> bool {
++    ty.get_property(b"_tag").is_some() || ty.get_property(b"get").is_some()
++}
++
++pub(super) fn effect_at(node: TsNode<'_>) -> Option<Channels<'_>> {
++    effect(type_at(node)?)
++}
++
++pub(super) fn type_at(node: TsNode<'_>) -> Option<Type<'_>> {
++    match node.kind() {
++        Kind::ArrayLiteralExpression
++        | Kind::ArrowFunction
++        | Kind::FunctionExpression
++        | Kind::NumericLiteral
++        | Kind::BigIntLiteral
++        | Kind::TemplateExpression
++        | Kind::NoSubstitutionTemplateLiteral
++        | Kind::TrueKeyword
++        | Kind::FalseKeyword
++        | Kind::NullKeyword
++        | Kind::RegularExpressionLiteral
++        | Kind::PrefixUnaryExpression
++        | Kind::VoidExpression
++        | Kind::TypeOfExpression => return None,
++        Kind::StringLiteral if node.parent().is_none_or(|parent| parent.name() != Some(node)) => return None,
++        _ => {}
++    }
++    let ty = node.get_type_at_location();
++    (!ty.is_error() && !ty.is_unresolved()).then_some(ty)
++}
++
++/// This node's type is also checked when the rule visits its syntactic counterpart.
++pub(super) fn has_equivalent_node(node: TsNode<'_>) -> bool {
++    if matches!(node.kind(), Kind::ParenthesizedExpression | Kind::SatisfiesExpression) {
++        return true;
++    }
++    node.kind() == Kind::Identifier
++        && node.parent().is_some_and(|parent| {
++            parent.name() == Some(node)
++                && matches!(
++                    parent.kind(),
++                    Kind::PropertyAccessExpression
++                        | Kind::VariableDeclaration
++                        | Kind::Parameter
++                        | Kind::PropertyDeclaration
++                        | Kind::PropertyAssignment
++                        | Kind::ShorthandPropertyAssignment
++                )
++        })
++}
++
++pub(super) fn global_error(types: Types<'_>) -> Option<Type<'_>> {
++    // Scope the lookup to a standard-library declaration so a project's local Error
++    // binding does not take precedence over the global interface.
++    let library = types
++        .get_string_type()
++        .get_property(b"charAt")?
++        .declarations()
++        .find(|decl| decl.get_source_file().is_default_library())?
++        .get_source_file();
++    Some(
++        types
++            .get_symbol_in_scope(library.node(), SymbolFlags::TYPE, b"Error")?
++            .get_declared_type(),
++    )
++}
++
++pub(super) fn is_global_error<'a>(ty: Type<'a>, global: Type<'a>) -> bool {
++    !ty.has_flags(TypeFlags::ANY | TypeFlags::UNKNOWN) && ty.is_assignable_to(global) && global.is_assignable_to(ty)
++}
++
++fn reference_symbol(node: TsNode<'_>) -> Option<TsSymbol<'_>> {
++    let node = skip_parentheses(node);
++    match node.kind() {
++        Kind::Identifier | Kind::PropertyAccessExpression | Kind::ElementAccessExpression => {}
++        _ => return None,
++    }
++    let mut symbol = symbol_at(node)?;
++    if node.kind() != Kind::Identifier {
++        return Some(symbol);
++    }
++    let mut seen = HashSet::new();
++    while let Some(declaration) = symbol.value_declaration() {
++        if declaration.kind() != Kind::VariableDeclaration
++            || !declaration.parent().is_some_and(|list| {
++                list.kind() == Kind::VariableDeclarationList && list.flags().contains(NodeFlags::CONST)
++            })
++            || !seen.insert(symbol)
++        {
++            break;
++        }
++        let Some(initializer) = declaration.initializer() else {
++            break;
++        };
++        let Some(target) = symbol_at(skip_parentheses(initializer)) else {
++            break;
++        };
++        symbol = target;
++    }
++    Some(symbol)
++}
++
++fn skip_parentheses(mut node: TsNode<'_>) -> TsNode<'_> {
++    while node.kind() == Kind::ParenthesizedExpression {
++        let Some(inner) = node.expression() else { break };
++        node = inner;
++    }
++    node
++}
++
++fn symbol_at(node: TsNode<'_>) -> Option<TsSymbol<'_>> {
++    node.get_symbol_at_location()
++        .or_else(|| node.name()?.get_symbol_at_location())
++        .map(TsSymbol::get_aliased_symbol)
++        .map(TsSymbol::get_export_symbol)
++}
++
++/// Compare resolved export identity, including renamed imports and local const aliases.
++fn is_node_reference_to_effect_module_api(node: TsNode<'_>, names: &[&[u8]]) -> bool {
++    let Some(target) = reference_symbol(node) else {
++        return false;
++    };
++    target.declarations().any(|decl| {
++        let source = decl.get_source_file();
++        if !source
++            .package_name()
++            .is_some_and(|name| name.eq_ignore_ascii_case(b"effect"))
++        {
++            return false;
++        }
++        let Some(module) = source.symbol() else { return false };
++        let exports = module.get_exports_of_module();
++        exports.into_iter().any(|export| {
++            export.name() == b"Effect" && effect(export.get_aliased_symbol().get_declared_type()).is_some()
++        }) && exports
++            .into_iter()
++            .any(|export| names.contains(&export.name()) && export.get_aliased_symbol().get_export_symbol() == target)
++    })
++}
++
++pub(super) fn catch_return_types(call: TsNode<'_>) -> impl Iterator<Item = Type<'_>> {
++    const APIS: &[&[u8]] = &[b"tryPromise", b"try", b"tryMap", b"tryMapPromise"];
++    call.expression()
++        .filter(|&callee| is_node_reference_to_effect_module_api(callee, APIS))
++        .and_then(|_| call.get_resolved_signature()?.get_parameters().first())
++        .into_iter()
++        .flat_map(move |param| union_members(param.get_type_at_location(call)))
++        .filter_map(move |options| {
++            let catch = options.get_property(b"catch")?.get_type_at_location(call);
++            let output = catch.get_call_signatures().first()?.get_return_type();
++            (!output.is_error() && !output.is_unresolved()).then_some(output)
++        })
 +}
 diff --git a/test/cli/lint/effect.test.ts b/test/cli/lint/effect.test.ts
 new file mode 100644

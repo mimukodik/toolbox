@@ -4,15 +4,25 @@ import { type Diagnostic, type ParsedOutput, parityRules, parseTypeScript } from
 import type { Fixture } from "./fixtures";
 
 const linterModules = join(import.meta.dir, "linter/node_modules");
-const bunRules = new Map([
-  ["bun(floating-effect)", "floatingEffect"],
-  ["bun/floating-effect", "floatingEffect"],
+const gatedBunRules = new Set<string>([
+  "floatingEffect",
+  "globalErrorInEffectFailure",
+  "globalErrorInEffectCatch",
+  "unknownInEffectCatch",
+  "effectInFailure",
+  "anyUnknownInErrorContext",
+  "unsafeEffectTypeAssertion",
 ]);
-const gatedBunRules = new Set(["floatingEffect"]);
 const requestedRules = new Set<string>(parityRules);
 const oxlintRules = new Map(parityRules.map((name) => [
   name.replace(/([a-z0-9])([A-Z])/g, "$1-$2").toLowerCase(), name,
 ]));
+const bunRules = new Map<string, string>(
+  [...oxlintRules].filter(([, name]) => gatedBunRules.has(name)).flatMap(([slug, name]) => [
+    [`bun(${slug})`, name] as const,
+    [`bun/${slug}`, name] as const,
+  ]),
+);
 const effectTsgo = join(linterModules, ".bin/effect-tsgo");
 
 function lintCommand(command: string[], { tsconfig, directory }: Fixture): string[] {
@@ -259,7 +269,8 @@ export function candidateGate(compiler: Pass, oxlint: Pass, bun: Pass): { passed
     && expectedOmissions.every(([line, severity]) => direct.missing.some((diagnostic) =>
       diagnostic.rule === "floatingEffect" && diagnostic.fixture === fixture && diagnostic.file === `/.src/${fixture}`
       && diagnostic.col === 1 && diagnostic.line === line && diagnostic.severity === severity));
-  const passed = lint.missing.length === 0 && lint.extra.length === 0 && bun.failures.length === 0
+  const passed = lint.matched.length === 114 && lint.missing.length === 0
+    && lint.extra.length === 0 && bun.failures.length === 0
     && direct.extra.length === 0 && omissionsMatch && severityMismatches.length === 0;
   const location = ({ fixture, file, line, col, rule, severity }: Diagnostic) =>
     `\`${fixture}\` at \`${file}:${line}:${col}\` (${rule}, ${severity})`;
