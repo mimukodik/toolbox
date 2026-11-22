@@ -2,7 +2,7 @@
 
 Patched developer tools for CI and sandboxes. The workflow builds for Linux
 x86_64 on Blacksmith and publishes pinned runtime closures as GitHub Releases.
-[Codex](tools/codex/README.md) is the first tool.
+Toolbox ships [Codex](tools/codex/README.md) and [Bun](tools/bun/README.md).
 
 ## Install a release
 
@@ -36,4 +36,4 @@ into `/usr/local/bin`. It works without Nix.
 
 Licensed under either of Apache License 2.0 or MIT at your option.
 Patches to upstream tools under `tools/*/patches/` are also subject to the
-upstream tool's license (Codex: Apache-2.0).
+upstream tool's license (Codex Apache-2.0, Bun MIT).
