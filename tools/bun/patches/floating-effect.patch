@@ -275,7 +275,7 @@ index 49b2f56..cd047e7 100644
              return;
          };
 -        let (path, config) = (files[indices[at]].path, files[indices[at]].config);
-+        let target = &files[indices[at]];
++        let target = &files[indices[at]]; if target.path.ends_with(b".mts") { return; }
 +        let path = target.path;
 +        let effect_config = effect_configs.for_file(target, program.options.plugins.as_ref(), context);
 +        let config = effect_config.as_ref().unwrap_or(target.config);
