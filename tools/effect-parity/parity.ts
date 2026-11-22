@@ -1,8 +1,9 @@
 import { appendFileSync, existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { baselineTable, parseBaseline } from "./diagnostics";
 import { discoverFixtures, layOutFixture } from "./fixtures";
+import { exposeReferencePackages, isExact, passTable, runPass } from "./score";
 
 const [upstream, report, baselineReport] = process.argv.slice(2);
 if (!upstream || !report || !baselineReport) {
@@ -35,3 +36,16 @@ const table = baselineTable(diagnostics);
 console.log(table);
 if (process.env.GITHUB_STEP_SUMMARY) appendFileSync(process.env.GITHUB_STEP_SUMMARY, table + "\n");
 writeFileSync(baselineReport, JSON.stringify(diagnostics, null, 2) + "\n");
+
+exposeReferencePackages(root);
+const reference = await runPass("reference", fixtures, diagnostics);
+const referenceTable = passTable(reference);
+console.log(referenceTable);
+if (process.env.GITHUB_STEP_SUMMARY) appendFileSync(process.env.GITHUB_STEP_SUMMARY, "\n" + referenceTable);
+writeFileSync(join(dirname(baselineReport), "effect-reference-raw.json"), JSON.stringify(reference.raw));
+const { raw: referenceRaw, ...referenceReport } = reference;
+writeFileSync(join(dirname(baselineReport), "effect-reference-score.json"), JSON.stringify(referenceReport, null, 2) + "\n");
+if (!isExact(reference)) {
+  console.error(reference.failures.slice(0, 5).join("\n"));
+  process.exitCode = 1;
+}

@@ -67,7 +67,7 @@ jobs:
           sudo sh "$RUNNER_TEMP/toolbox-install.sh" "$url" "$BUN_RELEASE_SHA256"
           /usr/local/bin/bun --revision
 
-      - name: Lay out Effect fixtures and parse baselines
+      - name: Score the Effect reference linter
         run: '"$STOCK_BUN" tools/effect-parity/parity.ts .effect-tsgo "$RUNNER_TEMP/effect-layout.json" "$RUNNER_TEMP/effect-baselines.json"'
 
       - name: Upload parity evidence
@@ -78,4 +78,5 @@ jobs:
           path: |
             ${{ runner.temp }}/effect-layout.json
             ${{ runner.temp }}/effect-baselines.json
+            ${{ runner.temp }}/effect-reference-*.json
           if-no-files-found: warn
