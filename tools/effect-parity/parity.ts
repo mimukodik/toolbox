@@ -3,7 +3,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { baselineTable, parseTypeScript } from "./diagnostics";
 import { discoverFixtures, layOutFixture } from "./fixtures";
-import { exposeReferencePackages, floatingEffectTable, type Pass, passTable, referenceGateFailures, runPass } from "./score";
+import {
+  candidateGate, exposeReferencePackages, floatingEffectTable, type Pass, passTable, referenceGateFailures, runPass,
+} from "./score";
 
 const [upstream, artifactDirectory] = process.argv.slice(2);
 if (!upstream || !artifactDirectory) {
@@ -73,4 +75,12 @@ if (gateFailures.length) {
   publish(passTable(bun));
   publish(floatingEffectTable(bun));
   savePass("bun", bun);
+  if (process.env.EFFECT_PARITY_CANDIDATE_BUN) {
+    const gate = candidateGate(compiler, oxlint, bun);
+    publish(gate.evidence);
+    if (!gate.passed) {
+      if (bun.failures.length) console.error(bun.failures.slice(0, 5).join("\n"));
+      process.exitCode = 1;
+    }
+  }
 }
