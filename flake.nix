@@ -16,6 +16,7 @@
         rust-overlay.overlays.default
         (import ./tools/codex/overlay.nix)
         (import ./tools/bun/overlay.nix)
+        (import ./tools/sccache/overlay.nix)
       ];
       pkgs = import nixpkgs {
         inherit system;
@@ -24,6 +25,6 @@
     in
     {
       overlays.default = overlay;
-      packages.${system} = { inherit (pkgs) bun bun-unpatched codex; };
+      packages.${system} = { inherit (pkgs) bun bun-unpatched codex sccache; };
     };
 }

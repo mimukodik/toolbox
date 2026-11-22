@@ -1,0 +1,201 @@
+name: Build sccache
+
+on:
+  pull_request:
+    paths:
+      - 'flake.*'
+      - 'tools/sccache/**'
+      - 'install.sh'
+      - '.github/workflows/sccache.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'flake.*'
+      - 'tools/sccache/**'
+      - 'install.sh'
+      - '.github/workflows/sccache.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+
+      - name: Build and test patched sccache
+        shell: bash
+        run: |
+          start=$SECONDS
+          status=0
+          nix build .#sccache --print-build-logs --max-jobs 1 --cores 8 || status=$?
+          printf '### sccache build\n\nBuild time: %s seconds\n' "$((SECONDS - start))" \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+          (( status == 0 )) || exit "$status"
+
+          result/bin/sccache --version
+          nix log .#sccache > "$RUNNER_TEMP/sccache-build.log"
+          grep -F 'test compiler::rust::test::test_equal_hashes_out_dir_in_cargo_build_root ... ok' "$RUNNER_TEMP/sccache-build.log"
+          grep -F 'test compiler::rust::test::test_hash_key_basedirs_remap_paths ... ok' "$RUNNER_TEMP/sccache-build.log"
+
+      - name: Compare stock and patched Rust cache replay
+        shell: bash
+        run: |
+          asset=sccache-v0.19.0-x86_64-unknown-linux-musl.tar.gz
+          curl --fail --silent --show-error --location \
+            "https://github.com/mozilla/sccache/releases/download/v0.19.0/$asset" \
+            --output "$RUNNER_TEMP/$asset"
+          printf '%s  %s\n' aa73c7270c997894038c0d8f0d297865f57569e1687883322bc431713d4bb9dd \
+            "$RUNNER_TEMP/$asset" | sha256sum --check
+          mkdir "$RUNNER_TEMP/stock-sccache"
+          tar -xzf "$RUNNER_TEMP/$asset" --strip-components=1 -C "$RUNNER_TEMP/stock-sccache"
+
+          rustup toolchain install 1.100.0 --profile minimal --no-self-update
+          export RUSTUP_TOOLCHAIN=1.100.0
+          rustc --version
+          bash tools/sccache/test/prove.sh "$RUNNER_TEMP/stock-sccache/sccache" result/bin/sccache \
+            | tee "$RUNNER_TEMP/sccache-proof.log"
+          grep -E 'replay:|\[path_probe\]: compile result: cache hit|^Binary manifest|^Cached library manifest|^Source file|panicked at|^Fixture:' \
+            "$RUNNER_TEMP/sccache-proof.log" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Package and measure the runtime closure
+        shell: bash
+        run: |
+          out="$RUNNER_TEMP/sccache-release"
+          metadata="$RUNNER_TEMP/sccache-metadata"
+          mkdir -p "$out" "$metadata"
+          version=$(nix eval --raw .#sccache.version)
+          upstream_commit=$(nix eval --raw .#sccache.upstreamCommit)
+          patchlevel=$(cat tools/sccache/PATCHLEVEL)
+          tag="sccache-${version}-${upstream_commit:0:7}-${patchlevel}"
+          asset="$tag-x86_64-linux.tar.zst"
+          store_path=$(readlink -f result)
+          source_commit=$(git rev-parse HEAD)
+          nixpkgs_rev=$(jq -er '.nodes.nixpkgs.locked.rev' flake.lock)
+
+          jq -n --arg store_path "$store_path" \
+            '{store_path: $store_path, bins: ["sccache"]}' > "$metadata/manifest.json"
+          nix-store -qR "$store_path" | LC_ALL=C sort | sed 's|^/||' > "$RUNNER_TEMP/sccache-closure"
+          tar --create --zstd --file "$out/$asset" --format=gnu --sort=name \
+            --mtime=@0 --owner=0 --group=0 --numeric-owner --hard-dereference \
+            -C / --files-from "$RUNNER_TEMP/sccache-closure" -C "$metadata" manifest.json
+
+          (cd "$out" && sha256sum "$asset" > "$asset.sha256")
+          read -r sha256 _ < "$out/$asset.sha256"
+          jq --arg version "$version" --arg upstream_commit "$upstream_commit" \
+            --arg patchlevel "$patchlevel" --arg tag "$tag" --arg source_commit "$source_commit" \
+            --arg nixpkgs_rev "$nixpkgs_rev" --arg sha256 "$sha256" \
+            '. + {tool: "sccache", version: $version, upstream_commit: $upstream_commit,
+              patchlevel: $patchlevel, tag: $tag, source_commit: $source_commit,
+              nixpkgs_rev: $nixpkgs_rev, sha256: $sha256}' \
+            "$metadata/manifest.json" > "$out/manifest.json"
+
+          packed=$(stat -c %s "$out/$asset")
+          unpacked=$(zstd -dc "$out/$asset" | wc -c)
+          printf '\n### sccache runtime closure\n\n- Packed: %s bytes\n- Unpacked tar stream: %s bytes\n' \
+            "$packed" "$unpacked" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Install and run sccache in Ubuntu without Nix
+        shell: bash
+        run: |
+          out="$RUNNER_TEMP/sccache-release"
+          version=$(jq -er .version "$out/manifest.json")
+          asset="$(jq -er .tag "$out/manifest.json")-x86_64-linux.tar.zst"
+          read -r sha256 _ < "$out/$asset.sha256"
+          docker run --rm \
+            --mount "type=bind,source=$out,target=/release,readonly" \
+            --mount "type=bind,source=$PWD/install.sh,target=/install.sh,readonly" \
+            --mount "type=bind,source=/etc/ssl/certs/ca-certificates.crt,target=/runner-ca-certificates.crt,readonly" \
+            ubuntu:24.04 sh -eu -c '
+              if command -v nix; then exit 1; fi
+              sed -i "s|http://|https://|g" /etc/apt/sources.list.d/ubuntu.sources
+              printf "%s\n" "Acquire::https::CAInfo \"/runner-ca-certificates.crt\";" \
+                > /etc/apt/apt.conf.d/99runner-ca
+              apt-get update -qq
+              apt-get install -y -qq --no-install-recommends ca-certificates curl jq zstd
+              url="file:///release/$1"
+              if sh /install.sh "$url" "$(printf "%064d" 0)" >/tmp/bad-sha.log 2>&1; then
+                echo "Installer accepted a wrong SHA-256" >&2
+                exit 1
+              fi
+              grep -F "SHA-256 mismatch" /tmp/bad-sha.log
+              test ! -e /nix/store
+              sh /install.sh "$url" "$2"
+              store_path=$(jq -er .store_path /release/manifest.json)
+              test -s "$store_path/share/licenses/sccache/LICENSE"
+              printf "%s\n" "Upstream license installed"
+              version=$(sccache --version)
+              printf "%s\n" "$version"
+              test "$version" = "sccache $3"
+            ' sh "$asset" "$sha256" "$version"
+
+      - name: Save tested release files
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: sccache-release
+          path: ${{ runner.temp }}/sccache-release/
+          if-no-files-found: error
+          compression-level: 0
+
+  release:
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    needs: build
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    permissions:
+      contents: write
+    concurrency:
+      group: sccache-release
+      cancel-in-progress: false
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: sccache-release
+          path: release
+
+      - name: Publish the immutable release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        working-directory: release
+        run: |
+          tag=$(jq -er .tag manifest.json)
+          asset="$tag-x86_64-linux.tar.zst"
+          sha256sum --check "$asset.sha256"
+          read -r sha256 _ < "$asset.sha256"
+          test "$(jq -er .sha256 manifest.json)" = "$sha256"
+          test "$(jq -er .source_commit manifest.json)" = "$GITHUB_SHA"
+
+          releases=$(gh api --paginate "repos/$GH_REPO/releases" \
+            --jq ".[] | select(.tag_name == \"$tag\")")
+          if [[ -n "$releases" ]]; then
+            digest=$(jq -r --arg asset "$asset" \
+              'select(.draft == false) | .assets[] | select(.name == $asset) | .digest // ""' \
+              <<< "$releases")
+            if [[ "$digest" == "sha256:$sha256" ]]; then
+              printf 'Release %s already has SHA-256 %s. Skipping.\n' "$tag" "$sha256"
+              exit 0
+            fi
+            echo "::error::Release $tag exists without the matching published asset. Resolve the draft or bump PATCHLEVEL."
+            exit 1
+          fi
+
+          tags=$(gh api --paginate "repos/$GH_REPO/git/matching-refs/tags/$tag" \
+            --jq ".[] | select(.ref == \"refs/tags/$tag\") | .ref")
+          if [[ -n "$tags" ]]; then
+            echo "::error::Tag $tag already exists without a release. Bump PATCHLEVEL."
+            exit 1
+          fi
+
+          gh release create "$tag" "$asset" "$asset.sha256" manifest.json \
+            --target "$GITHUB_SHA" --title "$tag" \
+            --notes "sccache runtime closure for Linux x86_64. [Build and measurements](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID})."
