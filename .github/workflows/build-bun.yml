@@ -15,6 +15,11 @@ on:
       - 'install.sh'
       - '.github/workflows/build-bun.yml'
   workflow_dispatch:
+    inputs:
+      build_control:
+        description: Build the unpatched Bun control even if its inputs are unchanged
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -30,7 +35,43 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
           persist-credentials: false
+
+      - name: Decide whether to build the Bun control
+        id: control
+        shell: bash
+        env:
+          CONTROL_REQUESTED: ${{ inputs.build_control }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          build_control=true
+          matched='not evaluated (control required)'
+          if [[ "$GITHUB_REF" == refs/heads/main ]]; then
+            reason='running on main'
+          elif [[ "$GITHUB_EVENT_NAME" == workflow_dispatch && "$CONTROL_REQUESTED" == true ]]; then
+            reason='requested by workflow_dispatch'
+          else
+            # PRs use the event's base commit. Manual branch runs compare to main.
+            base=${PR_BASE:-origin/main}
+            matched=$(git diff --no-renames --name-only "$base...HEAD" -- \
+              flake.nix flake.lock tools/bun/package.nix tools/bun/prefetch.json \
+              tools/bun/vendor.nix tools/bun/overlay.nix tools/bun/build-proof.sh \
+              .github/workflows/build-bun.yml)
+            if [[ -n "$matched" ]]; then
+              reason='control input changed'
+            else
+              build_control=false
+              reason='control skipped: no control input changed'
+              matched='none'
+            fi
+          fi
+          printf 'build_control=%s\n' "$build_control" >> "$GITHUB_OUTPUT"
+          {
+            printf '### Bun control decision\n\n'
+            printf 'build_control=%s (%s)\n\n' "$build_control" "$reason"
+            printf 'Matched control inputs:\n\n~~~text\n%s\n~~~\n' "$matched"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Set up Nix
         uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
@@ -44,28 +85,53 @@ jobs:
 
       - name: Build unpatched Bun from source
         id: stock
+        if: steps.control.outputs.build_control == 'true'
         run: bash tools/bun/build-proof.sh bun-unpatched
 
       - name: Build patched Bun from source
         id: patched
         run: bash tools/bun/build-proof.sh bun
 
-      - name: Check diagnostics and time both binaries and the existing lint pass
-        if: ${{ !cancelled() && steps.stock.outcome == 'success' && steps.patched.outcome == 'success' }}
+      - name: Check diagnostics and time the lint passes
+        if: steps.control.outputs.build_control == 'false' || steps.stock.outcome == 'success'
+        env:
+          BUN_BUILD_CONTROL: ${{ steps.control.outputs.build_control }}
         run: bash tools/bun/slack-lint-proof.sh
 
-      - name: Test the Effect rule with Bun's type-service fixtures
+      - name: Run Bun lint test files touched by patches
         shell: bash
         run: |
           source=$(nix eval --raw .#bun.src.outPath)
           fixture="$RUNNER_TEMP/bun-type-services"
           mkdir -p "$fixture"
           tar -xzf "$source" -C "$fixture" --strip-components=1 --wildcards '*/test/*'
-          git -C "$fixture" apply --include=test/cli/lint/type-services.test.ts \
-            "$PWD/tools/bun/patches/floating-effect.patch"
+
+          export LC_ALL=C
+          shopt -s dotglob
+          changes="$RUNNER_TEMP/bun-patched-tests"
+          {
+            for patch in "$PWD"/tools/bun/patches/*.patch; do
+              # Match the regular files selected by package.nix.
+              [[ -f "$patch" && ! -L "$patch" ]] || continue
+              git -C "$fixture" apply --apply --numstat -z \
+                --exclude='test/cli/lint/*/*' --include='test/cli/lint/*.test.ts' "$patch"
+            done
+          } > "$changes"
+
+          tests=()
+          declare -A seen=()
+          while IFS=$'\t' read -r -d '' _added _removed path; do
+            if [[ -f "$fixture/$path" && ! ${seen[$path]+x} ]]; then
+              tests+=("./${path#test/}")
+              seen[$path]=1
+            fi
+          done < "$changes"
+          if (( ${#tests[@]} == 0 )); then
+            echo 'No patched Bun lint test files found.' >&2
+            exit 1
+          fi
           cd "$fixture/test"
-          "$RUNNER_TEMP/bun-result/bin/bun" test --test-name-pattern 'Effect v4 floating statements' \
-            ./cli/lint/type-services.test.ts
+          "$RUNNER_TEMP/bun-result/bin/bun" test "${tests[@]}"
 
       - name: Package and measure the runtime closure
         run: bash tools/bun/package-release.sh
