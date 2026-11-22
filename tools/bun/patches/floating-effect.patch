@@ -505,7 +505,7 @@ index 1516853..93a8caa 100644
      bun_no_array_just_to_count::NoArrayJustToCount,
 diff --git a/src/lint/plugins/rules/bun_floating_effect.rs b/src/lint/plugins/rules/bun_floating_effect.rs
 new file mode 100644
-index 0000000..160c0e8
+index 0000000..10ee56e
 --- /dev/null
 +++ b/src/lint/plugins/rules/bun_floating_effect.rs
 @@ -0,0 +1,106 @@
@@ -590,7 +590,7 @@ index 0000000..160c0e8
 +        let span = expr
 +            .as_satisfies()
 +            .and_then(|(operand, annotation)| {
-+                cx.tokens_between(operand.outer_span(), annotation)
++                cx.file().tokens_between(operand.outer_span(), annotation)
 +                    .find(|token| token.text() == b"satisfies")
 +            })
 +            .map_or(expr.outer_span(), |token| token.span());
