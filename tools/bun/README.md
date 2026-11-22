@@ -73,6 +73,7 @@ patches at the new commit and run the Blacksmith proof for both variants.
 Existing Bun files changed by `patches/01-effect-seams.patch`:
 
 - `docs/lint/rules/index.mdx`
+- `docs/lint/rules/reports.json`
 - `src/lint/context.rs`
 - `src/lint/driver/for_tests.rs`
 - `src/lint/driver/lib.rs`
@@ -86,7 +87,7 @@ Existing Bun files changed by `patches/01-effect-seams.patch`:
 
 New files added by `patches/02-effect-rules.patch`:
 
-- `docs/lint/rules/bun/floating-effect.mdx`
+- Seven rule pages under `docs/lint/rules/bun/`
 - `src/lint/driver/effect.rs`
 - `src/lint/plugins/effect/mod.rs`
 - `src/lint/plugins/effect/type_parser.rs`
