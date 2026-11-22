@@ -1,0 +1,81 @@
+name: Effect lint parity
+
+on:
+  pull_request:
+    paths:
+      - 'tools/effect-parity/**'
+      - '.github/workflows/effect-parity.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'tools/effect-parity/**'
+      - '.github/workflows/effect-parity.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  parity:
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 30
+    env:
+      EFFECT_REV: 0e722d359c969bdf1b1316f08e8637022cde3cce
+      BUN_RELEASE: bun-1.4.6-canary.1-b15f513-p1
+      BUN_RELEASE_SHA256: 4459084d6fec6be890aa2a9fa24d5f433eb5d48b5149d74bbe9b37a5965d72c5
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+
+      - name: Check out Effect fixtures and reference baselines
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          repository: Effect-TS/tsgo
+          ref: ${{ env.EFFECT_REV }}
+          path: .effect-tsgo
+          persist-credentials: false
+          sparse-checkout: |
+            testdata/tests/effect-v4
+            testdata/baselines/reference/effect-v4
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.4.5
+
+      - uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
+        with:
+          version: 10.34.5
+          package_json_file: tools/effect-parity/fixtures/package.json
+
+      - name: Install locked dependencies
+        shell: bash
+        run: |
+          printf 'STOCK_BUN=%s\n' "$(command -v bun)" >> "$GITHUB_ENV"
+          test "$(git -C .effect-tsgo rev-parse HEAD)" = "$EFFECT_REV"
+          diff -u --strip-trailing-cr .effect-tsgo/testdata/tests/effect-v4/package.json \
+            tools/effect-parity/fixtures/package.json
+          pnpm --dir tools/effect-parity/fixtures install --frozen-lockfile --ignore-scripts
+          (cd tools/effect-parity/linter && bun install --frozen-lockfile --ignore-scripts)
+
+      - name: Install the patched Bun release
+        shell: bash
+        run: |
+          url="https://github.com/mimukodik/toolbox/releases/download/$BUN_RELEASE/$BUN_RELEASE-x86_64-linux.tar.zst"
+          curl -fsSL "https://raw.githubusercontent.com/mimukodik/toolbox/$BUN_RELEASE/install.sh" \
+            -o "$RUNNER_TEMP/toolbox-install.sh"
+          sudo sh "$RUNNER_TEMP/toolbox-install.sh" "$url" "$BUN_RELEASE_SHA256"
+          /usr/local/bin/bun --revision
+
+      - name: Score both reference paths, then patched Bun
+        run: |
+          mkdir -p "$RUNNER_TEMP/effect-parity"
+          "$STOCK_BUN" tools/effect-parity/parity.ts .effect-tsgo "$RUNNER_TEMP/effect-parity"
+
+      - name: Upload parity evidence
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: effect-parity
+          path: ${{ runner.temp }}/effect-parity
+          if-no-files-found: warn
