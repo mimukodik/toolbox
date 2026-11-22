@@ -6,6 +6,7 @@ import type { Fixture } from "./fixtures";
 const linterModules = join(import.meta.dir, "linter/node_modules");
 const bunRules = new Map([
   ["bun(floating-effect)", "floatingEffect"],
+  ["bun/floating-effect", "floatingEffect"],
 ]);
 const requestedRules = new Set<string>(parityRules);
 const oxlintRules = new Map(parityRules.map((name) => [
