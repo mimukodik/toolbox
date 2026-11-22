@@ -1,10 +1,13 @@
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { baselineTable, parseBaseline } from "./diagnostics";
 import { discoverFixtures, layOutFixture } from "./fixtures";
 
-const [upstream, report] = process.argv.slice(2);
-if (!upstream || !report) throw new Error("Usage: bun parity.ts <Effect source checkout> <layout report>");
+const [upstream, report, baselineReport] = process.argv.slice(2);
+if (!upstream || !report || !baselineReport) {
+  throw new Error("Usage: bun parity.ts <Effect source checkout> <layout report> <baseline report>");
+}
 
 const fixtureDirectory = join(upstream, "testdata/tests/effect-v4");
 const names = discoverFixtures(fixtureDirectory);
@@ -22,3 +25,13 @@ const count = {
 };
 console.log(JSON.stringify(count));
 writeFileSync(report, JSON.stringify({ count, fixtures }, null, 2) + "\n");
+
+const baselineDirectory = join(upstream, "testdata/baselines/reference/effect-v4");
+const diagnostics = fixtures.flatMap(({ name }) => {
+  const path = join(baselineDirectory, name.replace(/\.ts$/, ".errors.txt"));
+  return existsSync(path) ? parseBaseline(name, readFileSync(path, "utf8")) : [];
+});
+const table = baselineTable(diagnostics);
+console.log(table);
+if (process.env.GITHUB_STEP_SUMMARY) appendFileSync(process.env.GITHUB_STEP_SUMMARY, table + "\n");
+writeFileSync(baselineReport, JSON.stringify(diagnostics, null, 2) + "\n");
