@@ -1620,10 +1620,10 @@ index 0000000..acd956c
 +}
 diff --git a/test/cli/lint/effect.test.ts b/test/cli/lint/effect.test.ts
 new file mode 100644
-index 0000000..38c8bf4
+index 0000000..955f41f
 --- /dev/null
 +++ b/test/cli/lint/effect.test.ts
-@@ -0,0 +1,206 @@
+@@ -0,0 +1,219 @@
 +import { describe, expect, test } from "bun:test";
 +import { bunEnv, bunExe, tempDir } from "harness";
 +
@@ -1812,6 +1812,15 @@ index 0000000..38c8bf4
 +      "declare function try_<A, E>(options: Options<A, E>): Effect<A, E>;",
 +      "export { try_ as try };",
 +    ].join("\n"),
++    "node_modules/bridge/package.json": '{ "name": "bridge", "types": "./index.d.ts" }',
++    "node_modules/bridge/index.d.ts": 'export { tryPromise } from "effect-v4/dist/Effect";',
++    "parenthesized.ts": [
++      'import { tryPromise } from "bridge";',
++      "export const directUnknown = tryPromise({ try: async () => 1, catch: error => error });",
++      "export const parenthesizedUnknown = (tryPromise)({ try: async () => 1, catch: error => error });",
++      'export const directError = tryPromise({ try: async () => 1, catch: () => new Error("failed") });',
++      'export const parenthesizedError = (tryPromise)({ try: async () => 1, catch: () => new Error("failed") });',
++    ].join("\n"),
 +    "a.ts": [
 +      'import { Effect } from "effect-v4";',
 +      "const attempt = Effect.try;",
@@ -1829,4 +1838,8 @@ index 0000000..38c8bf4
 +  expect(errors.map(line => line.split(" ", 1)[0])).toEqual(["3:25", "4:22", "8:32", "9:31"]);
 +  expect(stdout).toContain("[Error/bun(unknown-in-effect-catch)]");
 +  expect(stdout).toContain("[Error/bun(global-error-in-effect-catch)]");
++
++  const parenthesized = await lint(files, ["parenthesized.ts"]);
++  expect(parenthesized.exitCode).toBe(1);
++  expect(parenthesized.errors.map(line => line.split(" ", 1)[0])).toEqual(["2:30", "4:28"]);
 +});
