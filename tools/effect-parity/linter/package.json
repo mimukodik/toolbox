@@ -1,0 +1,9 @@
+{
+  "name": "effect-parity-linter",
+  "private": true,
+  "devDependencies": {
+    "@effect/tsgo": "0.70.0",
+    "oxlint": "1.94.0",
+    "tsrs": "0.25.0-ts7.1.0-beta"
+  }
+}
