@@ -11,7 +11,8 @@ your image or CI configuration. Get `install.sh` from the same tag. The
 installer needs root, curl, CA certificates, jq, GNU tar, zstd and coreutils.
 
 ```sh
-url=https://github.com/mimukodik/toolbox/releases/download/codex-0.170.0-p1/codex-0.170.0-p1-x86_64-linux.tar.zst
+tag=codex-0.170.0-p2
+url="https://github.com/mimukodik/toolbox/releases/download/$tag/$tag-x86_64-linux.tar.zst"
 sudo sh ./install.sh "$url" "$sha256"
 codex --version
 ```
