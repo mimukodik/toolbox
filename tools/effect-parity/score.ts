@@ -8,6 +8,7 @@ const bunRules = new Map([
   ["bun(floating-effect)", "floatingEffect"],
   ["bun/floating-effect", "floatingEffect"],
 ]);
+const gatedBunRules = new Set(["floatingEffect"]);
 const requestedRules = new Set<string>(parityRules);
 const oxlintRules = new Map(parityRules.map((name) => [
   name.replace(/([a-z0-9])([A-Z])/g, "$1-$2").toLowerCase(), name,
@@ -34,7 +35,9 @@ const subjects = {
   },
   bun: {
     label: "Patched Bun",
-    command: (fixture: Fixture) => lintCommand(["/usr/local/bin/bun", "lint", "--no-script"], fixture),
+    command: (fixture: Fixture) => lintCommand([
+      process.env.EFFECT_PARITY_CANDIDATE_BUN ?? "/usr/local/bin/bun", "lint", "--no-script",
+    ], fixture),
     parse: parseUnix,
     diagnosticExits: [1],
   },
@@ -117,10 +120,9 @@ function key({ fixture, file, line, col, rule }: Diagnostic): string {
   return JSON.stringify([fixture, file, line, col, rule]);
 }
 
-function compare(fixture: string, baseline: Diagnostic[], result: ParsedOutput): FixtureScore {
+function compareLocations(baseline: Diagnostic[], actual: Diagnostic[]) {
   const expected = new Map<string, Diagnostic[]>();
   for (const item of baseline) {
-    if (!requestedRules.has(item.rule)) continue;
     const location = key(item);
     const bucket = expected.get(location) ?? [];
     bucket.push(item);
@@ -128,13 +130,13 @@ function compare(fixture: string, baseline: Diagnostic[], result: ParsedOutput):
   }
   const matched: Match[] = [];
   const extra: Diagnostic[] = [];
-  for (const actual of result.effect) {
-    const bucket = expected.get(key(actual));
+  for (const item of actual) {
+    const bucket = expected.get(key(item));
     const match = bucket?.shift();
-    if (match) matched.push({ expected: match, actual });
-    else extra.push(actual);
+    if (match) matched.push({ expected: match, actual: item });
+    else extra.push(item);
   }
-  return { fixture, matched, extra, missing: [...expected.values()].flat(), nonEffect: result.nonEffect };
+  return { matched, extra, missing: [...expected.values()].flat() };
 }
 
 export async function runPass(
@@ -163,7 +165,8 @@ export async function runPass(
         ]);
         raw.push({ fixture: fixture.name, exitCode, stdout, stderr });
         const result = parse(fixture, stdout);
-        scores.push(compare(fixture.name, expected.get(fixture.name) ?? [], result));
+        const baseline = (expected.get(fixture.name) ?? []).filter(({ rule }) => requestedRules.has(rule));
+        scores.push({ fixture: fixture.name, ...compareLocations(baseline, result.effect), nonEffect: result.nonEffect });
         const reportedDiagnostics = result.effect.length + result.nonEffect > 0;
         if (exitCode !== 0 && !(diagnosticExits.includes(exitCode) && reportedDiagnostics)) {
           failures.push(`${fixture.name}: exit ${exitCode}: ${stderr || stdout}`);
@@ -237,6 +240,48 @@ export function referenceGateFailures(compiler: Pass, oxlint: Pass): string[] {
     failures.push("Oxlint gate failed. Expected 195 error/warning matches, zero scored extras, and 34 suggestions plus one message missing.");
   }
   return failures;
+}
+
+function gatedDiagnostics(pass: Pass): Diagnostic[] {
+  const { matched, extra } = totals(pass);
+  return [...matched.map(({ actual }) => actual), ...extra].filter(({ rule }) => gatedBunRules.has(rule));
+}
+
+export function candidateGate(compiler: Pass, oxlint: Pass, bun: Pass): { passed: boolean; evidence: string } {
+  const candidate = gatedDiagnostics(bun);
+  const lint = compareLocations(gatedDiagnostics(oxlint), candidate);
+  const direct = compareLocations(gatedDiagnostics(compiler), candidate);
+  // Oxlint reports the compiler's warnings as errors in its Unix output.
+  const severityMismatches = direct.matched.filter(({ expected, actual }) => expected.severity !== actual.severity);
+  const fixture = "floatingEffect_directivePrecedence.ts";
+  const expectedOmissions = [[23, "message"], [27, "suggestion"]] as const;
+  const omissionsMatch = direct.missing.length === expectedOmissions.length
+    && expectedOmissions.every(([line, severity]) => direct.missing.some((diagnostic) =>
+      diagnostic.rule === "floatingEffect" && diagnostic.fixture === fixture && diagnostic.file === `/.src/${fixture}`
+      && diagnostic.col === 1 && diagnostic.line === line && diagnostic.severity === severity));
+  const passed = lint.missing.length === 0 && lint.extra.length === 0 && bun.failures.length === 0
+    && direct.extra.length === 0 && omissionsMatch && severityMismatches.length === 0;
+  const location = ({ fixture, file, line, col, rule, severity }: Diagnostic) =>
+    `\`${fixture}\` at \`${file}:${line}:${col}\` (${rule}, ${severity})`;
+
+  return {
+    passed,
+    evidence: [
+      `### Candidate Bun gate ${passed ? "passed" : "failed"}`, "",
+      `Gated rules: ${[...gatedBunRules].join(", ")}`, "",
+      "| Reference | Matched locations | Missing locations | Extra locations |",
+      "| --- | ---: | ---: | ---: |",
+      `| Oxlint | ${lint.matched.length} | ${lint.missing.length} | ${lint.extra.length} |`,
+      `| Direct compiler | ${direct.matched.length} | ${direct.missing.length} | ${direct.extra.length} |`, "",
+      `- Fixture execution or parsing failures: ${bun.failures.length}`,
+      `- Direct compiler omissions match the expected message on line 23 and suggestion on line 27: ${omissionsMatch ? "yes" : "no"}`,
+      `- Direct compiler severity mismatches: ${severityMismatches.length}`,
+      ...lint.missing.map((item) => `- Missing Oxlint location: ${location(item)}`),
+      ...lint.extra.map((item) => `- Extra Bun location: ${location(item)}`),
+      ...direct.missing.map((item) => `- Missing direct compiler location: ${location(item)}`),
+      ...severityMismatches.map(({ expected, actual }) => `- Severity mismatch: ${location(actual)}, expected ${expected.severity}`),
+    ].join("\n"),
+  };
 }
 
 export function floatingEffectTable(pass: Pass): string {

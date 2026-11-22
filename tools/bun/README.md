@@ -8,12 +8,12 @@ Move the pin to the first Bun release that includes `bun lint`.
 
 ## Install
 
-Use the `bun-1.4.6-canary.1-b15f513-p1` release. Copy `sha256` from the
+Use the `bun-1.4.6-canary.1-b15f513-p2` release. Copy `sha256` from the
 release's `.tar.zst.sha256` file and run [the Toolbox installer](../../README.md)
 from the same tag.
 
 ```sh
-tag=bun-1.4.6-canary.1-b15f513-p1
+tag=bun-1.4.6-canary.1-b15f513-p2
 url="https://github.com/mimukodik/toolbox/releases/download/$tag/$tag-x86_64-linux.tar.zst"
 sudo sh ./install.sh "$url" "$sha256"
 bun --version
@@ -23,7 +23,7 @@ bun lint --help
 ## Build and use the rule
 
 Both packages use the same release build with LTO and AOT disabled. The
-patched package applies the patches in this directory at patch level `p1`.
+patched package applies the patches in this directory at patch level `p2`.
 The unpatched package is the control.
 
 ```sh
@@ -34,11 +34,17 @@ nix build .#bun-unpatched --out-link result-unpatched
 The patch reads the Effect language-service rule setting from the
 TypeScript project used by native lint. Set
 `compilerOptions.plugins[].diagnosticSeverity.floatingEffect` to `error`
-in the `@effect/language-service` entry and run `bun lint src` with Bun's
-built-in lint configuration. The checker selects the project for each
-file, including referenced projects.
+in the `@effect/language-service` entry and run `bun lint --type-aware src`
+with Bun's built-in lint configuration. You can also enable type-aware linting
+in the lint configuration, for example with `options.typeAware` in `.oxlintrc.json`.
+Plain `bun lint` does not activate `floatingEffect` from the Effect plugin.
+The checker selects the project for each file, including referenced projects.
+
 Bun reports `bun/floating-effect` when a statement leaves an Effect or Stream
 value unused. Oxlint's Unix formatter calls it `bun(floating-effect)`.
+Effect's `@effect-diagnostics` and `@effect-diagnostics-next-line` directives
+can change the severity or suppress reports. Bun displays Effect errors and
+warnings.
 
 The build reuses Bun's Ninja graph and URL-keyed prefetch cache. Nix
 pins the source archives, the prebuilt WebKit with JavaScriptCore, Node
@@ -61,19 +67,22 @@ patch at the new commit and run the Blacksmith proof for both variants.
 Existing Bun files changed by `patches/floating-effect.patch`:
 
 - `docs/lint/rules/index.mdx`
+- `src/lint/context.rs`
 - `src/lint/driver/for_tests.rs`
+- `src/lint/driver/lib.rs`
 - `src/lint/driver/run.rs`
 - `src/lint/driver/typed.rs`
 - `src/lint/linter/resolved.rs`
 - `src/lint/linter/schema/own.json`
 - `src/lint/plugins/lib.rs`
-- `src/sema/driver/lib.rs`
 - `src/sema/resolve.rs`
 - `test/cli/lint/type-services.test.ts`
 
 New files in the patch:
 
 - `docs/lint/rules/bun/floating-effect.mdx`
+- `src/lint/driver/effect.rs`
+- `src/lint/plugins/effect/mod.rs`
 - `src/lint/plugins/rules/bun_floating_effect.rs`
 
 The Nix build also edits the existing `scripts/build/flags.ts` to disable
@@ -97,4 +106,5 @@ zstd -dc closure.nix-export.zst | nix-store --import
 ```
 
 The source patch is subject to Bun's MIT license. Its rule behavior is
-adapted from [Effect's MIT-licensed floatingEffect rule](https://github.com/Effect-TS/tsgo/blob/a518dc78d9c7952672fcdb8e964a3fcb53327541/crates/ets_rules/src/floating_effect.rs).
+adapted from [Effect's MIT-licensed floatingEffect rule](https://github.com/Effect-TS/tsgo/blob/0e722d359c969bdf1b1316f08e8637022cde3cce/crates/ets_rules/src/floating_effect.rs)
+and its [directive parser](https://github.com/Effect-TS/tsgo/blob/0e722d359c969bdf1b1316f08e8637022cde3cce/crates/ets_directives/src/parser.rs).

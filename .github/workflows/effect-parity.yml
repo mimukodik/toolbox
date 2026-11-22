@@ -11,6 +11,11 @@ on:
       - 'tools/effect-parity/**'
       - '.github/workflows/effect-parity.yml'
   workflow_dispatch:
+    inputs:
+      bun_build_run:
+        description: Successful Bun build run ID for this commit. Leave blank to score the pinned release.
+        type: string
+        required: false
 
 permissions:
   contents: read
@@ -19,7 +24,11 @@ jobs:
   parity:
     runs-on: blacksmith-8vcpu-ubuntu-2404
     timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
     env:
+      BUN_BUILD_RUN: ${{ inputs.bun_build_run }}
       EFFECT_REV: 0e722d359c969bdf1b1316f08e8637022cde3cce
       BUN_RELEASE: bun-1.4.6-canary.1-b15f513-p1
       BUN_RELEASE_SHA256: 4459084d6fec6be890aa2a9fa24d5f433eb5d48b5149d74bbe9b37a5965d72c5
@@ -59,6 +68,7 @@ jobs:
           (cd tools/effect-parity/linter && bun install --frozen-lockfile --ignore-scripts)
 
       - name: Install the patched Bun release
+        if: env.BUN_BUILD_RUN == ''
         shell: bash
         run: |
           url="https://github.com/mimukodik/toolbox/releases/download/$BUN_RELEASE/$BUN_RELEASE-x86_64-linux.tar.zst"
@@ -66,6 +76,64 @@ jobs:
             -o "$RUNNER_TEMP/toolbox-install.sh"
           sudo sh "$RUNNER_TEMP/toolbox-install.sh" "$url" "$BUN_RELEASE_SHA256"
           /usr/local/bin/bun --revision
+
+      - name: Verify the candidate build run
+        if: env.BUN_BUILD_RUN != ''
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [[ ! "$BUN_BUILD_RUN" =~ ^[1-9][0-9]*$ ]]; then
+            echo '::error::bun_build_run must be a numeric GitHub Actions run ID.'
+            exit 1
+          fi
+          head=$(git rev-parse HEAD)
+          run=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$BUN_BUILD_RUN")
+          if ! jq -e --arg repo "$GITHUB_REPOSITORY" --arg head "$head" '
+            .head_repository.full_name == $repo and .head_sha == $head and
+            .path == ".github/workflows/build-bun.yml" and .conclusion == "success"
+          ' <<< "$run" > /dev/null; then
+            echo "::error::Run $BUN_BUILD_RUN must be a successful build-bun.yml run from $GITHUB_REPOSITORY at $head."
+            exit 1
+          fi
+
+      - name: Set up Nix for the candidate runtime
+        if: env.BUN_BUILD_RUN != ''
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+
+      - name: Download the candidate Bun closure
+        if: env.BUN_BUILD_RUN != ''
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: bun-patched-x86_64-linux
+          path: ${{ runner.temp }}/effect-bun-candidate
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.bun_build_run }}
+          github-token: ${{ github.token }}
+
+      - name: Import the candidate runtime closure
+        if: env.BUN_BUILD_RUN != ''
+        shell: bash
+        working-directory: ${{ runner.temp }}/effect-bun-candidate
+        run: |
+          read -r sha256 asset < closure.nix-export.zst.sha256
+          test "$asset" = closure.nix-export.zst
+          printf '%s  closure.nix-export.zst\n' "$sha256" | sha256sum --check --strict
+          read -r store_path < store-path.txt
+          if [[ ! "$store_path" =~ ^/nix/store/[0-9a-z]{32}-[A-Za-z0-9+._?=-]+$ ]]; then
+            echo '::error::Candidate closure does not name a valid Nix store path.'
+            exit 1
+          fi
+          zstd -dc closure.nix-export.zst | sudo "$(command -v nix-store)" --import
+          candidate="$store_path/bin/bun"
+          revision=$("$candidate" --revision)
+          printf 'EFFECT_PARITY_CANDIDATE_BUN=%s\n' "$candidate" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/effect-parity"
+          {
+            printf 'Build run: %s/%s/actions/runs/%s\n' "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$BUN_BUILD_RUN"
+            printf 'Toolbox commit: %s\n' "$GITHUB_SHA"
+            printf 'Closure SHA-256: %s\nBun revision: %s\n' "$sha256" "$revision"
+          } | tee "$RUNNER_TEMP/effect-parity/effect-bun-candidate.txt"
 
       - name: Score both reference paths, then patched Bun
         run: |

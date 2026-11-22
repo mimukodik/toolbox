@@ -9,7 +9,7 @@ stock Bun 1.4.5 as its TypeScript runtime.
 - The reference linter uses `@effect/tsgo` 0.70.0, `oxlint` 1.94.0, and
   `tsrs` 0.25.0-ts7.1.0-beta. Its lockfile uses the resolutions from
   slack-listener at `8132eccf4db7799dc3647e467ddc08f7384aa9a8`.
-- The subject is Toolbox's Linux x86-64 release
+- The default subject is Toolbox's Linux x86-64 release
   `bun-1.4.6-canary.1-b15f513-p1`. The workflow pins the SHA-256 published
   with the release and passes it to the installer from the release tag.
 
@@ -38,8 +38,23 @@ plugin for all passes. Two reference gates must pass before Bun runs.
    [Patch 180](https://github.com/Effect-TS/tsgo/blob/0e722d359c969bdf1b1316f08e8637022cde3cce/_patches/tsrs/180-lint-type-check-severity.patch)
    filters those categories before Oxlint receives type-check diagnostics.
 
-The Bun comparison uses the full `floatingEffect` baseline, including its
-suggestion and message. Its score is informational.
+The pinned Bun release score uses the full `floatingEffect` baseline, including
+its suggestion and message. This score is informational.
+
+To gate a candidate Bun build, run **Effect lint parity** on the candidate
+branch and supply `bun_build_run`, the successful **Build and prove Bun lint**
+run ID for that commit. The workflow checks the run's repository, workflow, and
+commit and verifies the closure checksum before importing the build artifact.
+The `effect-parity` artifact records the build run, commit, checksum, and Bun
+revision alongside the parity evidence.
+
+The candidate gate requires exactly the `floatingEffect` locations reported by
+Oxlint and zero fixture execution or parsing failures. The direct compiler
+comparison requires Bun's severity to match at each shared location. Oxlint
+formats all five of the compiler's `floatingEffect` warnings as errors. The two
+required compiler-only omissions are the message at line 23 and the suggestion
+at line 27 of `floatingEffect_directivePrecedence.ts`. Other rules remain
+informational for the candidate.
 
 ## Bun p1 findings
 
