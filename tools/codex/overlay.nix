@@ -2,6 +2,12 @@ _final: prev: {
   codex = prev.codex.overrideAttrs (old: {
     patches = (old.patches or [ ]) ++ [ ./patches/exec-wait.patch ];
 
+    # Nixpkgs removes these settings from upstream's Cargo release profile.
+    env = (old.env or { }) // {
+      CARGO_PROFILE_RELEASE_LTO = "thin";
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS = "4";
+    };
+
     postInstall = (old.postInstall or "") + ''
       install -Dm444 ../LICENSE "$out/share/licenses/codex/LICENSE"
       install -Dm444 ../NOTICE "$out/share/licenses/codex/NOTICE"
