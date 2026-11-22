@@ -162,10 +162,10 @@ index 0000000..e530899
 +}
 diff --git a/src/lint/plugins/effect/mod.rs b/src/lint/plugins/effect/mod.rs
 new file mode 100644
-index 0000000..61316c0
+index 0000000..8951e9c
 --- /dev/null
 +++ b/src/lint/plugins/effect/mod.rs
-@@ -0,0 +1,225 @@
+@@ -0,0 +1,224 @@
 +use bstr::ByteSlice;
 +use bun_lint::context::Severity;
 +
@@ -364,7 +364,6 @@ index 0000000..61316c0
 +        }
 +    };
 +}
-+use effect_rule;
 +
 +fn report<'a, R: bun_lint::rule::Rule<State<'a> = Directives>>(
 +    cx: &bun_lint::context::Cx<'a, R>,
@@ -393,11 +392,11 @@ index 0000000..61316c0
 +}
 diff --git a/src/lint/plugins/effect/rules/bun_any_unknown_in_error_context.rs b/src/lint/plugins/effect/rules/bun_any_unknown_in_error_context.rs
 new file mode 100644
-index 0000000..4b7eb72
+index 0000000..4730ff2
 --- /dev/null
 +++ b/src/lint/plugins/effect/rules/bun_any_unknown_in_error_context.rs
 @@ -0,0 +1,125 @@
-+use crate::effect::{effect_rule, report, type_parser};
++use crate::effect::{report, type_parser};
 +use bun_lint::prelude::*;
 +use bun_lint::types::{SyntaxKind as TsKind, TsNode, Type, TypeFlags};
 +
@@ -524,11 +523,11 @@ index 0000000..4b7eb72
 +);
 diff --git a/src/lint/plugins/effect/rules/bun_effect_in_failure.rs b/src/lint/plugins/effect/rules/bun_effect_in_failure.rs
 new file mode 100644
-index 0000000..85c14e8
+index 0000000..ead0512
 --- /dev/null
 +++ b/src/lint/plugins/effect/rules/bun_effect_in_failure.rs
 @@ -0,0 +1,55 @@
-+use crate::effect::{effect_rule, report, type_parser};
++use crate::effect::{report, type_parser};
 +use bun_lint::prelude::*;
 +use std::collections::HashSet;
 +
@@ -663,11 +662,11 @@ index 0000000..643c9cc
 +}
 diff --git a/src/lint/plugins/effect/rules/bun_global_error_in_effect_catch.rs b/src/lint/plugins/effect/rules/bun_global_error_in_effect_catch.rs
 new file mode 100644
-index 0000000..476eddf
+index 0000000..5fc4be8
 --- /dev/null
 +++ b/src/lint/plugins/effect/rules/bun_global_error_in_effect_catch.rs
 @@ -0,0 +1,35 @@
-+use crate::effect::{effect_rule, report, type_parser};
++use crate::effect::{report, type_parser};
 +use bun_lint::prelude::*;
 +
 +const MESSAGE: &Message = &Message::new(
@@ -704,11 +703,11 @@ index 0000000..476eddf
 +);
 diff --git a/src/lint/plugins/effect/rules/bun_global_error_in_effect_failure.rs b/src/lint/plugins/effect/rules/bun_global_error_in_effect_failure.rs
 new file mode 100644
-index 0000000..326d8f0
+index 0000000..533f9a9
 --- /dev/null
 +++ b/src/lint/plugins/effect/rules/bun_global_error_in_effect_failure.rs
 @@ -0,0 +1,32 @@
-+use crate::effect::{effect_rule, report, type_parser};
++use crate::effect::{report, type_parser};
 +use bun_lint::prelude::*;
 +
 +const MESSAGE: &Message = &Message::new(
@@ -742,11 +741,11 @@ index 0000000..326d8f0
 +);
 diff --git a/src/lint/plugins/effect/rules/bun_unknown_in_effect_catch.rs b/src/lint/plugins/effect/rules/bun_unknown_in_effect_catch.rs
 new file mode 100644
-index 0000000..be71bc8
+index 0000000..477c101
 --- /dev/null
 +++ b/src/lint/plugins/effect/rules/bun_unknown_in_effect_catch.rs
 @@ -0,0 +1,29 @@
-+use crate::effect::{effect_rule, report, type_parser};
++use crate::effect::{report, type_parser};
 +use bun_lint::prelude::*;
 +use bun_lint::types::TypeFlags;
 +
@@ -777,11 +776,11 @@ index 0000000..be71bc8
 +);
 diff --git a/src/lint/plugins/effect/rules/bun_unsafe_effect_type_assertion.rs b/src/lint/plugins/effect/rules/bun_unsafe_effect_type_assertion.rs
 new file mode 100644
-index 0000000..4ab7da6
+index 0000000..e944696
 --- /dev/null
 +++ b/src/lint/plugins/effect/rules/bun_unsafe_effect_type_assertion.rs
 @@ -0,0 +1,39 @@
-+use crate::effect::{effect_rule, report, type_parser};
++use crate::effect::{report, type_parser};
 +use bun_lint::prelude::*;
 +use bun_lint::types::{SyntaxKind as TsKind, TsNode, Type, TypeFlags};
 +
