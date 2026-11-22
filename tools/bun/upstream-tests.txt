@@ -8,4 +8,4 @@ cli/lint/rules.test.ts
 # The CPU-time ratio varies on shared runners and does not cover our patches.
 # Owner: lane:nix. Remove this exclusion if a patch touches module resolution.
 # https://linear.app/3px/issue/BER-2427/flaky-upstream-bun-test-in-toolbox-build-bun-looking-up-a-missing-file
-exclude cli/lint/rules.test.ts :: looking up a missing file doesn't get slower as the directory gets larger
+exclude cli/lint/rules.test.ts :: BER-2427 deliberately missing test
