@@ -16,6 +16,10 @@ on:
         description: Successful Bun build run ID for this commit. Leave blank to score the pinned release.
         type: string
         required: false
+      regenerate_rule_docs:
+        description: Regenerate Bun rule docs with the candidate and verify the checked-in output.
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -139,6 +143,23 @@ jobs:
         run: |
           mkdir -p "$RUNNER_TEMP/effect-parity"
           "$STOCK_BUN" tools/effect-parity/parity.ts .effect-tsgo "$RUNNER_TEMP/effect-parity"
+
+      - name: Regenerate candidate Bun rule docs
+        if: ${{ !cancelled() && env.EFFECT_PARITY_CANDIDATE_BUN != '' && inputs.regenerate_rule_docs }}
+        shell: bash
+        run: |
+          source=$(nix build --no-link --print-out-paths .#bun.src)
+          scratch=$(mktemp -d "$RUNNER_TEMP/bun-rule-docs.XXXXXX")
+          tar -xzf "$source" -C "$scratch" --strip-components=1 --wildcards \
+            '*/src/codegen/lint-rule-docs.ts' '*/src/codegen/lint-rule-options.ts' '*/docs/lint/rules/*'
+          for patch in "$GITHUB_WORKSPACE"/tools/bun/patches/*.patch; do
+            [[ -f "$patch" && ! -L "$patch" ]] || continue
+            git -C "$scratch" apply --include='docs/lint/rules/**' "$patch"
+          done
+          cd "$scratch"
+          cp -a docs/lint/rules checked-in
+          "$EFFECT_PARITY_CANDIDATE_BUN" src/codegen/lint-rule-docs.ts --write
+          diff -ru checked-in docs/lint/rules | tee "$RUNNER_TEMP/effect-parity/bun-rule-docs.diff"
 
       - name: Upload parity evidence
         if: ${{ !cancelled() }}
