@@ -19,13 +19,23 @@ test "$(git rev-parse HEAD)" = "$revision"
 
 stock="$RUNNER_TEMP/bun-unpatched-result/bin/bun"
 patched="$RUNNER_TEMP/bun-result/bin/bun"
-cmp "$RUNNER_TEMP/bun-proof/bun-unpatched/upstream-source.txt" "$RUNNER_TEMP/bun-proof/bun/upstream-source.txt"
+build_control=${BUN_BUILD_CONTROL:-true}
+stock_skip='skipped (no control input changed)'
+installer=$patched
+if [[ "$build_control" == true ]]; then
+  cmp "$RUNNER_TEMP/bun-proof/bun-unpatched/upstream-source.txt" "$RUNNER_TEMP/bun-proof/bun/upstream-source.txt"
+  installer=$stock
+fi
 printf 'Slack listener: %s @ %s\n' "$upstream" "$revision"
 printf 'Node version: %s\n' "$(node --version)"
-printf 'Unpatched Bun: %s\n' "$("$stock" --revision)"
+if [[ "$build_control" == true ]]; then
+  printf 'Unpatched Bun: %s\n' "$("$stock" --revision)"
+else
+  printf 'Unpatched Bun: %s\n' "$stock_skip"
+fi
 printf 'Patched Bun: %s\n' "$("$patched" --revision)"
 sha256sum package.json bun.lock tsconfig.json .oxlintrc.json
-"$stock" install --frozen-lockfile 2>&1 | tee "$evidence/install.log"
+"$installer" install --frozen-lockfile 2>&1 | tee "$evidence/install.log"
 git diff --exit-code HEAD
 
 # Reproduce the checked-in script after its formatter. Bun's --no-script
@@ -39,7 +49,7 @@ lint_flags=${baseline_lint#"$oxlint_prefix"}
 test "$baseline_lint" = "${oxlint_prefix}$lint_flags"
 test "$lint_flags" = '--type-aware --type-check --tsconfig tsconfig.json --format=unix --deny-warnings src'
 read -r -a lint_args <<< "$lint_flags"
-export PATH="$PWD/node_modules/.bin:${stock%/*}:$PATH"
+export PATH="$PWD/node_modules/.bin:${installer%/*}:$PATH"
 baseline=(bash -c "exec $baseline_lint")
 stock_lint=("$stock" lint --no-script "${lint_args[@]}")
 patched_lint=("$patched" lint --no-script "${lint_args[@]}")
@@ -59,6 +69,11 @@ failures=0
 run_case() {
   local fixture=$1 arm=$2 expected_exit=$3 rule=$4 line=$5
   shift 5
+  if [[ "$arm" == stock && "$build_control" == false ]]; then
+    printf '%s\t%s\t%s\t\t%s\t%s\n' "$fixture" "$arm" "$expected_exit" "$rule" "$stock_skip" \
+      | tee -a "$proof"
+    return
+  fi
   local status=0 result=pass log="$evidence/$fixture-$arm.log" diagnostics
   reset_build_cache
   "$@" > "$log" 2>&1 || status=$?
@@ -138,6 +153,11 @@ printf 'round\tarm\tfilesystem_cache\tloadavg\twall_seconds\tmax_rss_kib\texit\n
 timed_run() {
   local round=$1 arm=$2
   shift 2
+  if [[ "$arm" == stock && "$build_control" == false ]]; then
+    printf 'timing-%s\t%s\t\t\t\t%s\n' "$round" "$arm" "$stock_skip" >> "$proof"
+    printf '%s\t%s\t\t\t\t\t%s\n' "$round" "$arm" "$stock_skip" | tee -a "$timings"
+    return
+  fi
   local log="$evidence/timing-$round-$arm" load status=0 metric
   reset_build_cache
   if [[ "$cache_mode" == linux-drop-caches-3 ]]; then
@@ -174,6 +194,9 @@ done
   printf 'Diagnostic assertions: %s passed, %s failed.\n\n' \
     "$(awk -F '\t' '$6 == "pass" { n++ } END { print n+0 }' "$proof")" \
     "$(awk -F '\t' '$6 == "fail" { n++ } END { print n+0 }' "$proof")"
+  if [[ "$build_control" == false ]]; then
+    printf 'Stock diagnostic assertions and timings: %s.\n\n' "$stock_skip"
+  fi
   printf '| Round | Arm | Wall (s) | Max RSS (KiB) | 1-min load | Exit |\n'
   printf '| --- | --- | --- | --- | --- | --- |\n'
   awk -F '\t' 'NR > 1 { split($4, load, " "); printf "| %s | %s | %s | %s | %s | %s |\n", $1, $2, $5, $6, load[1], $7 }' "$timings"

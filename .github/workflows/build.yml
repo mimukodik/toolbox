@@ -2,11 +2,16 @@ name: Build Codex
 
 on:
   pull_request:
+    paths:
+      - 'flake.*'
+      - 'tools/codex/**'
+      - 'install.sh'
+      - '.github/workflows/build.yml'
   push:
     branches: [main]
     paths:
       - 'flake.*'
-      - 'tools/**'
+      - 'tools/codex/**'
       - 'install.sh'
       - '.github/workflows/build.yml'
   workflow_dispatch:
