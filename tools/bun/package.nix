@@ -71,6 +71,10 @@ let
       inherit version src;
 
       patches = lib.optionals patched effectPatches;
+      postPatch = ''
+        # This nixpkgs LLVM build has no zstd support for debug sections.
+        substituteInPlace scripts/build/flags.ts --replace-fail ', "-gz=zstd"' ""
+      '';
       strictDeps = true;
       dontUseCmakeConfigure = true;
       dontUseNinjaBuild = true;

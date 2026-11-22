@@ -24,6 +24,8 @@ headers and Bun's Ninja. Cargo's workspace and Rust standard library
 dependencies are vendored together. Bun's npm lockfile converter supplies
 the lockfiles used to prefetch the three JavaScript dependency trees.
 Only fixed-output fetch and vendor derivations use the network.
+Both variants omit zstd debug-section compression because the pinned
+nixpkgs LLVM build lacks that option.
 
 When changing the Bun pin, compare `scripts/build/ci-images/spec.ts`,
 `scripts/build/deps/`, `scripts/build/deps/webkit.sha256`, and
