@@ -66,18 +66,36 @@ index b45338f..d5f1098 100644
  | [`bun/format`](/lint/rules/bun/format) | Require code to be formatted the way `bun fmt` prints it |  | yes |  |
  | [`bun/jsx-no-forbidden-nesting`](/lint/rules/bun/jsx-no-forbidden-nesting) | Disallow a JSX element inside another element that cannot contain it |  |  |  |
  | [`bun/no-array-just-to-count`](/lint/rules/bun/no-array-just-to-count) | Disallow `.split(separator).length` with a one-character separator |  | yes |  |
+diff --git a/src/lint/driver/for_tests.rs b/src/lint/driver/for_tests.rs
+index 70b33df..3029e99 100644
+--- a/src/lint/driver/for_tests.rs
++++ b/src/lint/driver/for_tests.rs
+@@ -137,6 +137,8 @@ impl Host for Tester<'_> {
+                     path: case.path,
+                     config: &config,
+                     text: Some(case.code.to_vec()),
++                    effect_plugin: false,
++                    effect_plugin_only: false,
+                 };
+                 Some(
+                     typed::lint(&context, &environment, &[file], &|_| ())
 diff --git a/src/lint/driver/run.rs b/src/lint/driver/run.rs
-index dfd45cd..c37f53e 100644
+index dfd45cd..a017395 100644
 --- a/src/lint/driver/run.rs
 +++ b/src/lint/driver/run.rs
-@@ -763,14 +763,16 @@ impl Run<'_> {
+@@ -763,14 +763,21 @@ impl Run<'_> {
              inferred.files(vec![path.clone()]);
          }
          let has_rules_with_types = config.has_enabled(|it| it.triggers_type_check());
 +        let effect_plugin = typed::may_use_effect_plugin(loaded.flavor, &path);
++        let wants_types = loader.wants_types(&loaded, config);
++        let implicit_effect = effect_plugin
++            && loaded.flavor == Flavor::BuiltIn
++            && self.options.type_aware.is_none();
          let needs_types = name.is_some()
-             && loader.wants_types(&loaded, config)
+-            && loader.wants_types(&loaded, config)
 -            && (has_rules_with_types || context.checks_types);
++            && (wants_types || implicit_effect)
 +            && (has_rules_with_types || context.checks_types || effect_plugin);
          if needs_types {
              let file = Typed {
@@ -85,15 +103,22 @@ index dfd45cd..c37f53e 100644
                  config,
                  text: Some(text.clone()),
 +                effect_plugin,
++                effect_plugin_only: !wants_types,
              };
              if let Some(Some(result)) =
                  typed::lint(context, self.environment, &[file], &on_circular_fixes).pop()
-@@ -930,13 +932,18 @@ impl Run<'_> {
+@@ -929,14 +936,24 @@ impl Run<'_> {
+             let needing = config
                  .configured()
                  .filter(|it| it.severity != Severity::Off && it.entry.meta.requires_types);
-             if loader.wants_types(&target.loaded, config) {
+-            if loader.wants_types(&target.loaded, config) {
 -                match config.has_enabled(|it| it.triggers_type_check()) || context.checks_types {
-+                let effect_plugin = typed::may_use_effect_plugin(target.loaded.flavor, &target.path);
++            let effect_plugin = typed::may_use_effect_plugin(target.loaded.flavor, &target.path);
++            let wants_types = loader.wants_types(&target.loaded, config);
++            let implicit_effect = effect_plugin
++                && target.loaded.flavor == Flavor::BuiltIn
++                && self.options.type_aware.is_none();
++            if wants_types || implicit_effect {
 +                match config.has_enabled(|it| it.triggers_type_check())
 +                    || context.checks_types
 +                    || effect_plugin
@@ -105,11 +130,12 @@ index dfd45cd..c37f53e 100644
                              config,
                              text: None,
 +                            effect_plugin,
++                            effect_plugin_only: !wants_types,
                          },
                      )),
                      false => without_types.push(target),
 diff --git a/src/lint/driver/typed.rs b/src/lint/driver/typed.rs
-index 49b2f56..f56619b 100644
+index 49b2f56..7964e52 100644
 --- a/src/lint/driver/typed.rs
 +++ b/src/lint/driver/typed.rs
 @@ -12,6 +12,7 @@
@@ -129,11 +155,13 @@ index 49b2f56..f56619b 100644
  use bun_sema::util::{FxHashMap, FxHashSet};
  use bun_sema_driver::host::{AlreadyRead, Provided, as_read, from_native, is_bundled, to_native};
  use bun_sema_driver::{Category, Diagnostic, Libs, RejectedProgram, WithoutInclude};
-@@ -40,6 +41,30 @@ pub(crate) struct Typed<'t> {
+@@ -40,6 +41,32 @@ pub(crate) struct Typed<'t> {
      pub(crate) config: &'t Arc<ResolvedConfig>,
      /// Its text, if it comes from standard input instead of the disk.
      pub(crate) text: Option<Vec<u8>>,
 +    pub(crate) effect_plugin: bool,
++    /// This file only needs types if its project enables the Effect rule.
++    pub(crate) effect_plugin_only: bool,
 +}
 +
 +pub(crate) fn may_use_effect_plugin(flavor: Flavor, path: &[u8]) -> bool {
@@ -160,7 +188,7 @@ index 49b2f56..f56619b 100644
  }
 
  /// A file's lint result, and its text if that's needed.
-@@ -389,6 +414,7 @@ fn check_and_lint_in(
+@@ -389,6 +416,7 @@ fn check_and_lint_in(
      // Keyed by config file.
      let program_globals: Guarded<Vec<(Vec<u8>, Arc<LoadedProgramGlobals>)>> =
          Guarded::new(Vec::new());
@@ -168,7 +196,7 @@ index 49b2f56..f56619b 100644
      let mut program_kinds = Guarded::new(vec![ProgramKind::InAProject; indices.len()]);
      let after_file = |checker: &mut bun_sema::check::Checker<'_, '_>, file: FileId| {
          let program = checker.p.files;
-@@ -397,6 +423,21 @@ fn check_and_lint_in(
+@@ -397,6 +425,21 @@ fn check_and_lint_in(
              return;
          };
          let (path, config) = (files[indices[at]].path, files[indices[at]].config);
@@ -190,6 +218,58 @@ index 49b2f56..f56619b 100644
          let project_of_file = &program.options.config_path;
          let is_in_a_project = match project {
              Project::This(_) => false,
+@@ -529,6 +572,19 @@ fn check_and_lint_in(
+         keeps_byte_order_marks: true,
+         ..Default::default()
+     };
++    let include_file = |path: &[u8], options: Option<&bun_sema::resolve::Options>, is_case_sensitive| {
++        by_path.get(path, is_case_sensitive).is_none_or(|at| {
++            !files[indices[at]].effect_plugin_only
++                || options
++                    .and_then(|it| it.plugins.as_ref())
++                    .and_then(effect_severity)
++                    .is_some()
++        })
++    };
++    let include_file = indices
++        .iter()
++        .any(|&index| files[index].effect_plugin_only)
++        .then_some(&include_file as &bun_sema_driver::IncludeFile<'_>);
+     let (
+         is_case_sensitive,
+         unreadable,
+@@ -536,16 +592,21 @@ fn check_and_lint_in(
+         incomplete,
+         rejected_projects,
+         without_include,
+-    ) = bun_sema_driver::check_provided_then(&request, provided, |report| {
+-        (
+-            report.is_case_sensitive,
+-            report.unreadable,
+-            report.diagnostics,
+-            report.incomplete,
+-            report.rejected_programs,
+-            report.without_include,
+-        )
+-    });
++    ) = bun_sema_driver::check_provided_filtered_then(
++        &request,
++        provided,
++        include_file,
++        |report| {
++            (
++                report.is_case_sensitive,
++                report.unreadable,
++                report.diagnostics,
++                report.incomplete,
++                report.rejected_programs,
++                report.without_include,
++            )
++        },
++    );
+     // The later passes of `--fix` lint some of the same files again.
+     if is_first_pass {
+         let mut noted = context.without_include.lock();
 diff --git a/src/lint/linter/resolved.rs b/src/lint/linter/resolved.rs
 index fd487b6..d778739 100644
 --- a/src/lint/linter/resolved.rs
@@ -316,6 +396,101 @@ index 0000000..5c3c2fd
 +        }
 +    }
 +}
+diff --git a/src/sema/driver/lib.rs b/src/sema/driver/lib.rs
+index 5b5c60b..3cac667 100644
+--- a/src/sema/driver/lib.rs
++++ b/src/sema/driver/lib.rs
+@@ -1856,6 +1856,18 @@ pub fn check_provided_then<R>(
+     request: &Request,
+     provided: host::Provided,
+     then: impl FnOnce(Report) -> R,
++) -> R {
++    check_provided_filtered_then(request, provided, None, then)
++}
++
++/// A filter on requested files and the compiler options of their selected projects.
++pub type IncludeFile<'a> = dyn Fn(&[u8], Option<&Options>, bool) -> bool + 'a;
++
++pub fn check_provided_filtered_then<R>(
++    request: &Request,
++    provided: host::Provided,
++    include_file: Option<&IncludeFile<'_>>,
++    then: impl FnOnce(Report) -> R,
+ ) -> R {
+     // A no-op if `bun lint` or `bun fmt` already created a pool.
+     use_dedicated_pool("Bun Check");
+@@ -1888,7 +1900,7 @@ pub fn check_provided_then<R>(
+     disk.script_kinds_by_extension = request.script_kinds_by_extension.to_vec();
+     // Work outside a parallel region runs on this thread.
+     let lent = disk.caches.lend();
+-    let report = check_request(&disk, request);
++    let report = check_request(&disk, request, include_file);
+     let then = |mut report: Report| {
+         report.is_case_sensitive = disk.is_case_sensitive();
+         report.is_quiet = tristate(request.compiler_options, b"quiet") == Some(true);
+@@ -2299,7 +2311,11 @@ fn not_in_project(path: &[u8], config_path: &[u8]) -> Diagnostic {
+     ])
+ }
+
+-fn check_request(disk: &host::Disk, request: &Request) -> Report {
++fn check_request(
++    disk: &host::Disk,
++    request: &Request,
++    include_file: Option<&IncludeFile<'_>>,
++) -> Report {
+     // `ParseBuildCommandLine`: `Projects` is `fileNames`, or else `.`.
+     let request = &match (request.build, request.project, request.paths) {
+         (true, None, []) => Request {
+@@ -2313,7 +2329,7 @@ fn check_request(disk: &host::Disk, request: &Request) -> Report {
+         },
+         _ => *request,
+     };
+-    let mut report = check_paths(disk, request);
++    let mut report = check_paths(disk, request, include_file);
+     // Each script is checked once, in its own project, like a file passed as a path.
+     let mut seen: FxHashSet<Vec<u8>> = FxHashSet::default();
+     loop {
+@@ -2328,12 +2344,16 @@ fn check_request(disk: &host::Disk, request: &Request) -> Report {
+             are_entry_points: true,
+             ..*request
+         };
+-        report.merge(check_paths(disk, &page_scripts_request));
++        report.merge(check_paths(disk, &page_scripts_request, include_file));
+         sort_as_one_project(&mut report);
+     }
+ }
+
+-fn check_paths(disk: &host::Disk, request: &Request) -> Report {
++fn check_paths(
++    disk: &host::Disk,
++    request: &Request,
++    include_file: Option<&IncludeFile<'_>>,
++) -> Report {
+     let started = Instant::now();
+     let cwd = host::from_native(request.cwd);
+     let mut report = Report::default();
+@@ -2591,6 +2611,21 @@ fn check_paths(disk: &host::Disk, request: &Request) -> Report {
+         ]));
+         return report;
+     }
++    // Toolbox-only seam for Effect lint on the checker's selected projects.
++    if let Some(include_file) = include_file {
++        by_project.retain_mut(|(owner, _, files)| {
++            let project = match owner {
++                Some(config) => projects.load(disk, request, config),
++                None => None,
++            };
++            let options = project.map(|it| &it.options);
++            files.retain(|file| include_file(file, options, is_case_sensitive));
++            !files.is_empty()
++        });
++        if by_project.is_empty() {
++            return report;
++        }
++    }
+     let is_single_project = by_project.len() == 1;
+     let paths_of = |files: &'_ [Vec<u8>]| -> Vec<Vec<u8>> {
+         let paths = files.iter().map(|it| to_path(it, is_case_sensitive));
 diff --git a/src/sema/resolve.rs b/src/sema/resolve.rs
 index a98898f..9b0a954 100644
 --- a/src/sema/resolve.rs
@@ -338,7 +513,7 @@ index a98898f..9b0a954 100644
          };
          let specified = |name: &[u8]| compiler.get(name).and_then(Json::as_bool);
 diff --git a/test/cli/lint/type-services.test.ts b/test/cli/lint/type-services.test.ts
-index 5041488..fe3442e 100644
+index 5041488..dc345ae 100644
 --- a/test/cli/lint/type-services.test.ts
 +++ b/test/cli/lint/type-services.test.ts
 @@ -14,7 +14,7 @@ async function lint(files: Record<string, string>, args: string[]) {
@@ -350,12 +525,19 @@ index 5041488..fe3442e 100644
  }
 
  const rule = (...names: string[]) => names.flatMap(name => ["--rule", `@typescript-eslint/${name}: error`]);
-@@ -133,3 +133,91 @@ describe("`export *` from a package that the file also requires, and that has ot
+@@ -133,3 +133,109 @@ describe("`export *` from a package that the file also requires, and that has ot
      expect([0, names.length]).toContain(errors.length);
    });
  });
 +
 +describe("Effect v4 floating statements", () => {
++  const floating = [
++    'interface Variance { _A: () => number; _E: () => never; _R: () => never; }',
++    'interface Effect { readonly "~effect/Effect": Variance; }',
++    'declare function make(): Effect;',
++    'make();',
++  ].join("\n");
++
 +  function project(severity: string) {
 +    return {
 +      ".oxlintrc.json": JSON.stringify({ options: { typeAware: true }, categories: { correctness: "off" } }),
@@ -415,6 +597,22 @@ index 5041488..fe3442e 100644
 +    expect(disabled.exitCode).toBe(0);
 +  });
 +
++  test.concurrent("enables the checker with only the Effect plugin and the built-in lint config", async () => {
++    const files = {
++      "tsconfig.json": JSON.stringify({
++        compilerOptions: {
++          ...options,
++          plugins: [{ name: "@effect/language-service" }],
++        },
++      }),
++      "src/a.ts": floating,
++    };
++    const { errors, stdout, exitCode } = await lint(files, ["src"]);
++    expect(stdout).toMatch(/a\.ts:4:1: .*floating-effect/);
++    expect(errors).toEqual(["4:1 This Effect value is neither yielded nor used in an assignment."]);
++    expect(exitCode).toBe(1);
++  });
++
 +  test.concurrent("reads the plugin from the referenced project for a directory or file", async () => {
 +    const files = {
 +      ".oxlintrc.json": JSON.stringify({ options: { typeAware: true }, categories: { correctness: "off" } }),
@@ -427,12 +625,7 @@ index 5041488..fe3442e 100644
 +        },
 +        include: ["src"],
 +      }),
-+      "src/a.ts": [
-+        'interface Variance { _A: () => number; _E: () => never; _R: () => never; }',
-+        'interface Effect { readonly "~effect/Effect": Variance; }',
-+        'declare function make(): Effect;',
-+        'make();',
-+      ].join("\n"),
++      "src/a.ts": floating,
 +    };
 +    for (const target of ["src", "src/a.ts"]) {
 +      const { errors, stdout, exitCode } = await lint(files, [target]);

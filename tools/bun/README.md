@@ -34,10 +34,11 @@ nix build .#bun-unpatched --out-link result-unpatched
 The patch reads the Effect language-service rule setting from the
 TypeScript project used by native lint. Set
 `compilerOptions.plugins[].diagnosticSeverity.floatingEffect` to `error`
-in the `@effect/language-service` entry and run
-`bun lint --no-script --type-aware --type-check --tsconfig tsconfig.json src`.
+in the `@effect/language-service` entry and run `bun lint src` with Bun's
+built-in lint configuration. The checker selects the project for each
+file, including referenced projects.
 Bun reports `bun/floating-effect` when a statement leaves an Effect or Stream
-value unused. The Unix formatter calls it `bun(floating-effect)`.
+value unused. Oxlint's Unix formatter calls it `bun(floating-effect)`.
 
 The build reuses Bun's Ninja graph and URL-keyed prefetch cache. Nix
 pins the source archives, the prebuilt WebKit with JavaScriptCore, Node
@@ -60,11 +61,13 @@ patch at the new commit and run the Blacksmith proof for both variants.
 Existing Bun files changed by `patches/floating-effect.patch`:
 
 - `docs/lint/rules/index.mdx`
+- `src/lint/driver/for_tests.rs`
 - `src/lint/driver/run.rs`
 - `src/lint/driver/typed.rs`
 - `src/lint/linter/resolved.rs`
 - `src/lint/linter/schema/own.json`
 - `src/lint/plugins/lib.rs`
+- `src/sema/driver/lib.rs`
 - `src/sema/resolve.rs`
 - `test/cli/lint/type-services.test.ts`
 
