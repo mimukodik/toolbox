@@ -122,8 +122,13 @@ jobs:
           docker run --rm \
             --mount "type=bind,source=$out,target=/release,readonly" \
             --mount "type=bind,source=$PWD/install.sh,target=/install.sh,readonly" \
+            --mount "type=bind,source=/etc/ssl/certs/ca-certificates.crt,target=/runner-ca-certificates.crt,readonly" \
             ubuntu:24.04 sh -eu -c '
               if command -v nix; then exit 1; fi
+              # Use the runner CA bundle before the container installs its own.
+              sed -i "s|http://|https://|g" /etc/apt/sources.list.d/ubuntu.sources
+              printf "%s\n" "Acquire::https::CAInfo \"/runner-ca-certificates.crt\";" \
+                > /etc/apt/apt.conf.d/99runner-ca
               apt-get update -qq
               apt-get install -y -qq --no-install-recommends ca-certificates curl jq zstd
               url="file:///release/$1"

@@ -2,6 +2,9 @@ _final: prev: {
   codex = prev.codex.overrideAttrs (old: {
     patches = (old.patches or [ ]) ++ [ ./patches/exec-wait.patch ];
 
+    # The pinned nixpkgs hook only removes thin LTO and the four codegen units.
+    postPatch = "";
+
     postInstall = (old.postInstall or "") + ''
       install -Dm444 ../LICENSE "$out/share/licenses/codex/LICENSE"
       install -Dm444 ../NOTICE "$out/share/licenses/codex/NOTICE"
