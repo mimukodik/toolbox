@@ -9,6 +9,7 @@
       system = "x86_64-linux";
       overlay = nixpkgs.lib.composeManyExtensions [
         (import ./tools/codex/overlay.nix)
+        (import ./tools/sccache/overlay.nix)
       ];
       pkgs = import nixpkgs {
         inherit system;
@@ -17,6 +18,6 @@
     in
     {
       overlays.default = overlay;
-      packages.${system} = { inherit (pkgs) codex; };
+      packages.${system} = { inherit (pkgs) codex sccache; };
     };
 }
