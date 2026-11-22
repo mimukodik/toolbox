@@ -26,7 +26,10 @@ let
     cd bun-*
     export HOME="$TMPDIR/home"
     mkdir -p "$HOME"
-    export SSL_CERT_FILE="''${NIX_SSL_CERT_FILE:-$SSL_CERT_FILE}"
+    export SSL_CERT_FILE="${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
+    if [[ -r "''${NIX_SSL_CERT_FILE:-}" ]]; then
+      export SSL_CERT_FILE="$NIX_SSL_CERT_FILE"
+    fi
   '';
 
   fixed = hash: {
@@ -34,7 +37,6 @@ let
     outputHashAlgo = "sha256";
     outputHashMode = "recursive";
     impureEnvVars = pkgs.lib.fetchers.proxyImpureEnvVars ++ [ "NIX_SSL_CERT_FILE" ];
-    SSL_CERT_FILE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
   };
 
   lolhtml = archives."https://github.com/oven-sh/lol-html/archive/725ce499aa9b71e38b7a2d0a9fbb6d7294a4079e.tar.gz";
