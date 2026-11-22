@@ -4,3 +4,8 @@ cli/lint/glob.test.ts
 # Parked 2026-11-22 (BER-2393). Owner: bun-patch lane. Ends with the next Bun patch release that regenerates docs/lint/rules (bun src/codegen/lint-rule-docs.ts --write) and fixes the example. The current floating-effect.patch hand-edits index.mdx and its example produces no diagnostic.
 cli/lint/rule-docs.test.ts
 cli/lint/rules.test.ts
+# Exclude format: exclude <listed file> :: <exact test name> (one per file).
+# The CPU-time ratio varies on shared runners and does not cover our patches.
+# Owner: lane:nix. Remove this exclusion if a patch touches module resolution.
+# https://linear.app/3px/issue/BER-2427/flaky-upstream-bun-test-in-toolbox-build-bun-looking-up-a-missing-file
+exclude cli/lint/rules.test.ts :: looking up a missing file doesn't get slower as the directory gets larger
