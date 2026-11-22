@@ -1,0 +1,209 @@
+name: Build and prove Bun lint
+
+on:
+  pull_request:
+    paths:
+      - 'flake.*'
+      - 'tools/bun/**'
+      - 'install.sh'
+      - '.github/workflows/build-bun.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'flake.*'
+      - 'tools/bun/**'
+      - 'install.sh'
+      - '.github/workflows/build-bun.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bun-lint-proof:
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 150
+    env:
+      BUN_PROOF_RUNNER: blacksmith-8vcpu-ubuntu-2404
+      SLACK_LISTENER_REV: 8132eccf4db7799dc3647e467ddc08f7384aa9a8
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Set up Nix
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+
+      - name: Ensure GNU time and zstd are available
+        run: |
+          if ! type -P time >/dev/null || ! command -v zstd >/dev/null; then
+            sudo apt-get update
+            sudo apt-get install --yes --no-install-recommends time zstd
+          fi
+
+      - name: Build unpatched Bun from source
+        id: stock
+        run: bash tools/bun/build-proof.sh bun-unpatched
+
+      - name: Build patched Bun from source
+        id: patched
+        run: bash tools/bun/build-proof.sh bun
+
+      - name: Check diagnostics and time both binaries and the existing lint pass
+        if: ${{ !cancelled() && steps.stock.outcome == 'success' && steps.patched.outcome == 'success' }}
+        run: bash tools/bun/slack-lint-proof.sh
+
+      - name: Test the Effect rule with Bun's type-service fixtures
+        shell: bash
+        run: |
+          source=$(nix eval --raw .#bun.src.outPath)
+          fixture="$RUNNER_TEMP/bun-type-services"
+          mkdir -p "$fixture"
+          tar -xzf "$source" -C "$fixture" --strip-components=1 --wildcards '*/test/*'
+          git -C "$fixture" apply --include=test/cli/lint/type-services.test.ts \
+            "$PWD/tools/bun/patches/floating-effect.patch"
+          cd "$fixture/test"
+          "$RUNNER_TEMP/bun-result/bin/bun" test --test-name-pattern 'Effect v4 floating statements' \
+            ./cli/lint/type-services.test.ts
+
+      - name: Package and measure the runtime closure
+        run: bash tools/bun/package-release.sh
+
+      - name: Install Bun and run slack-listener tests in Ubuntu without Nix
+        shell: bash
+        run: |
+          out="$RUNNER_TEMP/bun-release"
+          sha_file=("$out"/*.tar.zst.sha256)
+          read -r sha256 asset < "${sha_file[0]}"
+          version=$(jq -er .version "$out/manifest.json")
+          bun_commit=$(jq -er .bun_commit "$out/manifest.json")
+          smoke_log="$RUNNER_TEMP/bun-install.log"
+          status=0
+
+          docker run --rm \
+            --mount "type=bind,source=$out,target=/release,readonly" \
+            --mount "type=bind,source=$PWD/install.sh,target=/install.sh,readonly" \
+            --mount "type=bind,source=/etc/ssl/certs/ca-certificates.crt,target=/runner-ca-certificates.crt,readonly" \
+            ubuntu:24.04 sh -eu -c '
+              if command -v nix; then exit 1; fi
+              test ! -e /nix/store
+              sed -i "s|http://|https://|g" /etc/apt/sources.list.d/ubuntu.sources
+              printf "%s\n" "Acquire::https::CAInfo \"/runner-ca-certificates.crt\";" \
+                > /etc/apt/apt.conf.d/99runner-ca
+              apt-get update -qq
+              apt-get install -y -qq --no-install-recommends ca-certificates curl git jq zstd
+
+              sh /install.sh "file:///release/$1" "$2"
+              actual_version=$(bun --version)
+              actual_revision=$(bun --revision)
+              printf "bun --version: %s\nbun --revision: %s\n" "$actual_version" "$actual_revision"
+              test "$actual_version" = "${3%%-*}"
+              test "$actual_revision" = "$3+$4"
+              bun lint --help
+
+              git init --quiet /tmp/slack-listener
+              cd /tmp/slack-listener
+              git fetch --no-tags --depth=1 https://github.com/mimukodik/slack-listener.git "$5"
+              git checkout --quiet --detach FETCH_HEAD
+              test "$(git rev-parse HEAD)" = "$5"
+              bun install --frozen-lockfile
+              bun test
+            ' sh "$asset" "$sha256" "$version" "${bun_commit:0:9}" "$SLACK_LISTENER_REV" \
+            2>&1 | tee "$smoke_log" || status=$?
+
+          {
+            printf '\n### Ubuntu install smoke test\n\n'
+            sed -n '/^bun --version: /p; /^bun --revision: /p' "$smoke_log" | sed 's/^/- /'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
+
+      - name: Save tested release files
+        if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: bun-release
+          path: ${{ runner.temp }}/bun-release/
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: Upload unpatched Bun and its Nix closure
+        if: ${{ !cancelled() && steps.stock.outcome == 'success' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: bun-unpatched-x86_64-linux
+          path: ${{ runner.temp }}/bun-closures/bun-unpatched/
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: Upload patched Bun and its Nix closure
+        if: ${{ !cancelled() && steps.patched.outcome == 'success' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: bun-patched-x86_64-linux
+          path: ${{ runner.temp }}/bun-closures/bun/
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: Upload build and lint evidence
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: bun-lint-proof
+          path: ${{ runner.temp }}/bun-proof/
+          if-no-files-found: warn
+
+  release:
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    needs: bun-lint-proof
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    permissions:
+      contents: write
+    concurrency:
+      group: bun-release
+      cancel-in-progress: false
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: bun-release
+          path: release
+
+      - name: Publish the immutable release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        working-directory: release
+        run: |
+          tag=$(jq -er '"bun-" + .version + "-" + .bun_commit[:7] + "-" + .patchlevel' manifest.json)
+          asset="$tag-x86_64-linux.tar.zst"
+          read -r sha256 checksummed_asset < "$asset.sha256"
+          test "$checksummed_asset" = "$asset"
+          sha256sum --check "$asset.sha256"
+          test "$(jq -er .sha256 manifest.json)" = "$sha256"
+          test "$(jq -er .source_commit manifest.json)" = "$GITHUB_SHA"
+
+          releases=$(gh api --paginate "repos/$GH_REPO/releases" \
+            --jq ".[] | select(.tag_name == \"$tag\")")
+          if [[ -n "$releases" ]]; then
+            digest=$(jq -r --arg asset "$asset" \
+              'select(.draft == false) | .assets[] | select(.name == $asset) | .digest // ""' \
+              <<< "$releases")
+            if [[ "$digest" == "sha256:$sha256" ]]; then
+              printf 'Release %s already has SHA-256 %s. Skipping.\n' "$tag" "$sha256"
+              exit 0
+            fi
+            echo "::error::Release $tag exists without the matching published asset. Resolve the draft or bump PATCHLEVEL."
+            exit 1
+          fi
+
+          tags=$(gh api --paginate "repos/$GH_REPO/git/matching-refs/tags/$tag" \
+            --jq ".[] | select(.ref == \"refs/tags/$tag\") | .ref")
+          if [[ -n "$tags" ]]; then
+            echo "::error::Tag $tag already exists without a release. Bump PATCHLEVEL."
+            exit 1
+          fi
+
+          gh release create "$tag" "$asset" "$asset.sha256" manifest.json \
+            --target "$GITHUB_SHA" --title "$tag" \
+            --notes "Bun runtime closure for Linux x86_64. [Build and measurements](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID})."
