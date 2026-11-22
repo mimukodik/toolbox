@@ -1231,10 +1231,10 @@ index 0000000..643c9cc
 +}
 diff --git a/src/lint/plugins/effect/rules/bun_global_error_in_effect_catch.rs b/src/lint/plugins/effect/rules/bun_global_error_in_effect_catch.rs
 new file mode 100644
-index 0000000..5fc4be8
+index 0000000..70b5e0e
 --- /dev/null
 +++ b/src/lint/plugins/effect/rules/bun_global_error_in_effect_catch.rs
-@@ -0,0 +1,35 @@
+@@ -0,0 +1,30 @@
 +use crate::effect::{report, type_parser};
 +use bun_lint::prelude::*;
 +
@@ -1247,7 +1247,7 @@ index 0000000..5fc4be8
 +    GlobalErrorInEffectCatch,
 +    b"globalErrorInEffectCatch",
 +    "global-error-in-effect-catch",
-+    On::new().exprs(&[ExprTag::Call]).optional_chains(),
++    On::new().exprs(&[ExprTag::Call]),
 +    fn expr<'a>(&self, expr: Expr<'a>, cx: &mut Cx<'a, Self>) {
 +        let call = expr.ts_node();
 +        let mut output = type_parser::catch_return_types(call);
@@ -1262,11 +1262,6 @@ index 0000000..5fc4be8
 +            && let Some(report) = report(cx, self.hidden_by_default, callee.span(), MESSAGE)
 +        {
 +            report.data("callee", callee.get_source_text());
-+        }
-+    },
-+    fn optional_chain<'a>(&self, expr: Expr<'a>, cx: &mut Cx<'a, Self>) {
-+        if expr.tag() == ExprTag::Call {
-+            self.expr(expr, cx);
 +        }
 +    }
 +);
@@ -1310,10 +1305,10 @@ index 0000000..533f9a9
 +);
 diff --git a/src/lint/plugins/effect/rules/bun_unknown_in_effect_catch.rs b/src/lint/plugins/effect/rules/bun_unknown_in_effect_catch.rs
 new file mode 100644
-index 0000000..477c101
+index 0000000..4968be8
 --- /dev/null
 +++ b/src/lint/plugins/effect/rules/bun_unknown_in_effect_catch.rs
-@@ -0,0 +1,29 @@
+@@ -0,0 +1,24 @@
 +use crate::effect::{report, type_parser};
 +use bun_lint::prelude::*;
 +use bun_lint::types::TypeFlags;
@@ -1327,7 +1322,7 @@ index 0000000..477c101
 +    UnknownInEffectCatch,
 +    b"unknownInEffectCatch",
 +    "unknown-in-effect-catch",
-+    On::new().exprs(&[ExprTag::Call]).optional_chains(),
++    On::new().exprs(&[ExprTag::Call]),
 +    fn expr<'a>(&self, expr: Expr<'a>, cx: &mut Cx<'a, Self>) {
 +        let call = expr.ts_node();
 +        if type_parser::catch_return_types(call).any(|ty| ty.has_flags(TypeFlags::ANY | TypeFlags::UNKNOWN))
@@ -1335,11 +1330,6 @@ index 0000000..477c101
 +            && let Some(report) = report(cx, self.hidden_by_default, callee.span(), MESSAGE)
 +        {
 +            report.data("callee", callee.get_source_text());
-+        }
-+    },
-+    fn optional_chain<'a>(&self, expr: Expr<'a>, cx: &mut Cx<'a, Self>) {
-+        if expr.tag() == ExprTag::Call {
-+            self.expr(expr, cx);
 +        }
 +    }
 +);
@@ -1619,10 +1609,10 @@ index 0000000..c308023
 +}
 diff --git a/test/cli/lint/effect.test.ts b/test/cli/lint/effect.test.ts
 new file mode 100644
-index 0000000..745c302
+index 0000000..e32ef10
 --- /dev/null
 +++ b/test/cli/lint/effect.test.ts
-@@ -0,0 +1,204 @@
+@@ -0,0 +1,206 @@
 +import { describe, expect, test } from "bun:test";
 +import { bunEnv, bunExe, tempDir } from "harness";
 +
@@ -1819,11 +1809,13 @@ index 0000000..745c302
 +      "const local = { tryPromise: <A, E>(options: { try: () => A; catch: (error: unknown) => E }) => options };",
 +      "export const ordinary = local.tryPromise({ try: async () => 1, catch: error => error });",
 +      "export const tagged = Effect.tryPromise({ try: async () => 1, catch: error => ({ _tag: 'Failed', error }) });",
++      "export const optionalUnknown = Effect.tryPromise?.({ try: async () => 1, catch: error => error });",
++      'export const optionalGlobal = Effect.try?.({ try: () => 1, catch: () => new Error("failed") });',
 +    ].join("\n"),
 +  };
 +  const { errors, stdout, exitCode } = await lint(files, ["a.ts"]);
 +  expect(exitCode).toBe(1);
-+  expect(errors.map(line => line.split(" ", 1)[0])).toEqual(["3:25", "4:22"]);
++  expect(errors.map(line => line.split(" ", 1)[0])).toEqual(["3:25", "4:22", "8:32", "9:31"]);
 +  expect(stdout).toContain("[Error/bun(unknown-in-effect-catch)]");
 +  expect(stdout).toContain("[Error/bun(global-error-in-effect-catch)]");
 +});
