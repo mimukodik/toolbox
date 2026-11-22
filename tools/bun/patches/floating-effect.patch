@@ -67,7 +67,7 @@ index b45338f..d5f1098 100644
  | [`bun/jsx-no-forbidden-nesting`](/lint/rules/bun/jsx-no-forbidden-nesting) | Disallow a JSX element inside another element that cannot contain it |  |  |  |
  | [`bun/no-array-just-to-count`](/lint/rules/bun/no-array-just-to-count) | Disallow `.split(separator).length` with a one-character separator |  | yes |  |
 diff --git a/src/lint/driver/configs.rs b/src/lint/driver/configs.rs
-index 0cb48ed..de0cd90 100644
+index 0cb48ed..b6c128e 100644
 --- a/src/lint/driver/configs.rs
 +++ b/src/lint/driver/configs.rs
 @@ -38,7 +38,12 @@ use bun_lint::linter::{
@@ -105,34 +105,45 @@ index 0cb48ed..de0cd90 100644
          }
      }
 
-@@ -2880,8 +2893,64 @@ impl<'l> Loader<'l> {
-     /// Resolves the config for one file. Use this instead of `loaded.config.get()`, which doesn't know which frameworks
+@@ -2881,7 +2894,76 @@ impl<'l> Loader<'l> {
      /// the project uses.
      pub(crate) fn config_of(&self, loaded: &Loaded, path: &[u8]) -> FileConfig {
--        let detected = self.detect_frameworks(loaded, paths::dirname(path));
+         let detected = self.detect_frameworks(loaded, paths::dirname(path));
 -        (loaded.config).get_with_frameworks(self.linter.registry(), path, detected)
-+        let directory = paths::dirname(path);
-+        let detected = self.detect_frameworks(loaded, directory);
 +        let registry = self.linter.registry();
-+        let result = (loaded.config).get_with_frameworks(registry, path, detected);
-+        if let FileConfig::Matched(config) = &result
-+            && matches!(loaded.flavor, Flavor::BuiltIn | Flavor::Oxlint)
++        match (loaded.config).get_with_frameworks(registry, path, detected) {
++            FileConfig::Matched(config) => {
++                FileConfig::Matched(self.with_effect_rule(loaded, path, config))
++            }
++            result => result,
++        }
++    }
++
++    /// Applies TypeScript project settings after either explicit or walked discovery.
++    pub(crate) fn with_effect_rule(
++        &self,
++        loaded: &Loaded,
++        path: &[u8],
++        config: Arc<ResolvedConfig>,
++    ) -> Arc<ResolvedConfig> {
++        if matches!(loaded.flavor, Flavor::BuiltIn | Flavor::Oxlint)
 +            && matches!(
 +                ScriptKind::from_file_name(path),
 +                Some(ScriptKind::Ts | ScriptKind::Tsx)
 +            )
-+            && let Some(rule) = config.find_rule(registry, b"bun/floating-effect")
++            && let Some(rule) = config.find_rule(self.linter.registry(), b"bun/floating-effect")
 +            && config.rule(rule).is_none()
-+            && let Some(severity) = self.effect_severity(directory, config.language.is_oxlint)
++            && let Some(severity) =
++                self.effect_severity(paths::dirname(path), config.language.is_oxlint)
 +        {
-+            let key = (Arc::as_ptr(config) as usize, severity == Severity::Error);
++            let key = (Arc::as_ptr(&config) as usize, severity == Severity::Error);
 +            let mut with_effect = self.with_effect.lock();
 +            let config = with_effect
 +                .entry(key)
 +                .or_insert_with(|| Arc::new(config.with_added_rule(rule, severity)));
-+            return FileConfig::Matched(Arc::clone(config));
++            return Arc::clone(config);
 +        }
-+        result
++        config
 +    }
 +
 +    fn effect_severity(&self, directory: &[u8], is_oxlint: bool) -> Option<Severity> {
@@ -172,6 +183,18 @@ index 0cb48ed..de0cd90 100644
      }
 
      /// True if the type-aware rules run on a file whose configuration is `config`, which comes from `loaded`.
+diff --git a/src/lint/driver/discover.rs b/src/lint/driver/discover.rs
+index 8a3197e..f7bf92c 100644
+--- a/src/lint/driver/discover.rs
++++ b/src/lint/driver/discover.rs
+@@ -464,6 +464,7 @@ fn search(
+             if let Some(FileConfig::Matched(config)) = selected.or(config)
+                 && let Some(size) = listing.size_of(&entry.name)
+             {
++                let config = loader.with_effect_rule(&own, &path, config);
+                 files.push(Target {
+                     path,
+                     size,
 diff --git a/src/lint/linter/resolved.rs b/src/lint/linter/resolved.rs
 index fd487b6..d778739 100644
 --- a/src/lint/linter/resolved.rs
@@ -319,7 +342,7 @@ index a2beca5..50c0666 100644
  /// after everything in the configuration file and may depend on whether the file has `references`. Returns `Err` if the
  /// file can't be read, so there's no project. A file that the parser gives up on counts as empty, with the error. The
 diff --git a/test/cli/lint/type-services.test.ts b/test/cli/lint/type-services.test.ts
-index 5041488..3f07ea5 100644
+index 5041488..b8f58cf 100644
 --- a/test/cli/lint/type-services.test.ts
 +++ b/test/cli/lint/type-services.test.ts
 @@ -14,7 +14,7 @@ async function lint(files: Record<string, string>, args: string[]) {
@@ -331,7 +354,7 @@ index 5041488..3f07ea5 100644
  }
 
  const rule = (...names: string[]) => names.flatMap(name => ["--rule", `@typescript-eslint/${name}: error`]);
-@@ -133,3 +133,62 @@ describe("`export *` from a package that the file also requires, and that has ot
+@@ -133,3 +133,64 @@ describe("`export *` from a package that the file also requires, and that has ot
      expect([0, names.length]).toContain(errors.length);
    });
  });
@@ -350,7 +373,7 @@ index 5041488..3f07ea5 100644
 +          "plugins": [{ "name": "@effect/language-service", "diagnosticSeverity": { "floatingEffect": "${severity}" } }],
 +        },
 +      }`,
-+      "a.ts": [
++      "src/a.ts": [
 +        'interface Variance { _A: () => number; _E: () => never; _R: () => never; }',
 +        'interface Effect { readonly "~effect/Effect": Variance; }',
 +        'interface Stream { readonly "~effect/Stream": Variance; }',
@@ -376,20 +399,22 @@ index 5041488..3f07ea5 100644
 +    };
 +  }
 +
-+  test.concurrent("recognizes Effect and Stream through the types in an oxlint project", async () => {
-+    const { errors, exitCode } = await lint(project("error"), ["a.ts"]);
-+    expect(errors).toEqual([
-+      "11:1 This Effect value is neither yielded nor used in an assignment.",
-+      "12:1 This Effect-able `Stream` value is neither yielded nor assigned to a variable.",
-+    ]);
-+    expect(exitCode).toBe(1);
++  test.concurrent("recognizes Effect and Stream for explicit files, directories and glob matches", async () => {
++    for (const target of ["src/a.ts", "src", "src/**/*.ts"]) {
++      const { errors, exitCode } = await lint(project("error"), [target]);
++      expect(errors).toEqual([
++        "11:1 This Effect value is neither yielded nor used in an assignment.",
++        "12:1 This Effect-able `Stream` value is neither yielded nor assigned to a variable.",
++      ]);
++      expect(exitCode).toBe(1);
++    }
 +  });
 +
 +  test.concurrent("uses project severity and respects off", async () => {
-+    const warned = await lint(project("warning"), ["a.ts"]);
++    const warned = await lint(project("warning"), ["src"]);
 +    expect(warned.stdout).toContain("[Warning/bun(floating-effect)]");
 +    expect(warned.exitCode).toBe(0);
-+    const disabled = await lint(project("off"), ["a.ts"]);
++    const disabled = await lint(project("off"), ["src"]);
 +    expect(disabled.stdout).not.toContain("bun(floating-effect)");
 +    expect(disabled.exitCode).toBe(0);
 +  });
