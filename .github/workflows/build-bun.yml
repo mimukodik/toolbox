@@ -1,0 +1,72 @@
+name: Build and prove Bun lint
+
+on:
+  pull_request:
+    paths:
+      - 'flake.*'
+      - 'tools/bun/**'
+      - '.github/workflows/build-bun.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bun-lint-proof:
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 150
+    env:
+      BUN_PROOF_RUNNER: blacksmith-8vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Set up Nix
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+
+      - name: Ensure GNU time and zstd are available
+        run: |
+          if ! type -P time >/dev/null || ! command -v zstd >/dev/null; then
+            sudo apt-get update
+            sudo apt-get install --yes --no-install-recommends time zstd
+          fi
+
+      - name: Build unpatched Bun from source
+        id: stock
+        run: bash tools/bun/build-proof.sh bun-unpatched
+
+      - name: Build patched Bun from source
+        id: patched
+        run: bash tools/bun/build-proof.sh bun
+
+      - name: Check diagnostics and time both binaries and the existing lint pass
+        if: ${{ !cancelled() && steps.stock.outcome == 'success' && steps.patched.outcome == 'success' }}
+        run: bash tools/bun/slack-lint-proof.sh
+
+      - name: Upload unpatched Bun and its Nix closure
+        if: ${{ !cancelled() && steps.stock.outcome == 'success' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: bun-unpatched-x86_64-linux
+          path: ${{ runner.temp }}/bun-closures/bun-unpatched/
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: Upload patched Bun and its Nix closure
+        if: ${{ !cancelled() && steps.patched.outcome == 'success' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: bun-patched-x86_64-linux
+          path: ${{ runner.temp }}/bun-closures/bun/
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: Upload build and lint evidence
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: bun-lint-proof
+          path: ${{ runner.temp }}/bun-proof/
+          if-no-files-found: warn
