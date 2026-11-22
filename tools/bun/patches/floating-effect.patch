@@ -86,10 +86,10 @@ index b9b5c8f..c78fe92 100644
      pub fn data(mut self, name: &'static str, value: impl IntoText<'a>) -> Self {
 diff --git a/src/lint/driver/effect.rs b/src/lint/driver/effect.rs
 new file mode 100644
-index 0000000..fb018cf
+index 0000000..1dcc399
 --- /dev/null
 +++ b/src/lint/driver/effect.rs
-@@ -0,0 +1,78 @@
+@@ -0,0 +1,80 @@
 +use crate::configs::Flavor;
 +use crate::lint::Context;
 +use crate::typed::Typed;
@@ -104,8 +104,10 @@ index 0000000..fb018cf
 +
 +const RULES: &[(&[u8], &[u8])] = &[(b"floatingEffect", b"bun/floating-effect")];
 +
-+pub(crate) fn may_use_effect_plugin(flavor: Flavor, path: &[u8]) -> bool {
-+    matches!(flavor, Flavor::BuiltIn | Flavor::Oxlint)
++pub(crate) fn may_use_effect_plugin(flavor: Flavor, type_aware: Option<bool>, path: &[u8]) -> bool {
++    // With built-in lint, a native rule can request types independently of the Effect plugin.
++    // The caller still checks the effective lint config, including Oxlint's typeAware setting.
++    matches!((flavor, type_aware), (Flavor::BuiltIn, Some(true)) | (Flavor::Oxlint, _))
 +        && matches!(ScriptKind::from_file_name(path), Some(ScriptKind::Ts | ScriptKind::Tsx))
 +}
 +
@@ -193,14 +195,15 @@ index eb5d36b..7321248 100644
  mod eslintrc;
  mod evaluate;
 diff --git a/src/lint/driver/run.rs b/src/lint/driver/run.rs
-index dfd45cd..55f4f3d 100644
+index dfd45cd..4823a5f 100644
 --- a/src/lint/driver/run.rs
 +++ b/src/lint/driver/run.rs
-@@ -763,14 +763,16 @@ impl Run<'_> {
+@@ -763,14 +763,17 @@ impl Run<'_> {
              inferred.files(vec![path.clone()]);
          }
          let has_rules_with_types = config.has_enabled(|it| it.triggers_type_check());
-+        let effect_plugin = crate::effect::may_use_effect_plugin(loaded.flavor, &path);
++        let effect_plugin =
++            crate::effect::may_use_effect_plugin(loaded.flavor, self.options.type_aware, &path);
          let needs_types = name.is_some()
              && loader.wants_types(&loaded, config)
 -            && (has_rules_with_types || context.checks_types);
@@ -214,11 +217,15 @@ index dfd45cd..55f4f3d 100644
              };
              if let Some(Some(result)) =
                  typed::lint(context, self.environment, &[file], &on_circular_fixes).pop()
-@@ -929,14 +931,19 @@ impl Run<'_> {
+@@ -929,14 +932,23 @@ impl Run<'_> {
              let needing = config
                  .configured()
                  .filter(|it| it.severity != Severity::Off && it.entry.meta.requires_types);
-+            let effect_plugin = crate::effect::may_use_effect_plugin(target.loaded.flavor, &target.path);
++            let effect_plugin = crate::effect::may_use_effect_plugin(
++                target.loaded.flavor,
++                self.options.type_aware,
++                &target.path,
++            );
              if loader.wants_types(&target.loaded, config) {
 -                match config.has_enabled(|it| it.triggers_type_check()) || context.checks_types {
 +                match config.has_enabled(|it| it.triggers_type_check())
@@ -637,7 +644,7 @@ index a98898f..9b0a954 100644
          };
          let specified = |name: &[u8]| compiler.get(name).and_then(Json::as_bool);
 diff --git a/test/cli/lint/type-services.test.ts b/test/cli/lint/type-services.test.ts
-index 5041488..fc4f715 100644
+index 5041488..eaf7bbc 100644
 --- a/test/cli/lint/type-services.test.ts
 +++ b/test/cli/lint/type-services.test.ts
 @@ -14,7 +14,7 @@ async function lint(files: Record<string, string>, args: string[]) {
@@ -649,7 +656,7 @@ index 5041488..fc4f715 100644
  }
  
  const rule = (...names: string[]) => names.flatMap(name => ["--rule", `@typescript-eslint/${name}: error`]);
-@@ -133,3 +133,128 @@ describe("`export *` from a package that the file also requires, and that has ot
+@@ -133,3 +133,144 @@ describe("`export *` from a package that the file also requires, and that has ot
      expect([0, names.length]).toContain(errors.length);
    });
  });
@@ -710,6 +717,22 @@ index 5041488..fc4f715 100644
 +      ]);
 +      expect(exitCode).toBe(1);
 +    }
++  });
++
++  test.concurrent("an explicitly enabled native typed rule does not activate the Effect plugin", async () => {
++    const files = {
++      "tsconfig.json": JSON.stringify({
++        compilerOptions: { ...options, strict: true, plugins: [{ name: "@effect/language-service" }] },
++      }),
++      "a.ts": floating + '\nexport const shown = (value: { a: string }) => `${value}`;',
++    };
++    const args = [...rule("restrict-template-expressions"), "a.ts"];
++    const implicit = await lint(files, args);
++    expect(implicit.stdout).toContain("Invalid type");
++    expect(implicit.stdout).not.toContain("bun(floating-effect)");
++
++    const enabled = await lint(files, ["--type-aware", ...args]);
++    expect(enabled.stdout).toContain("[Error/bun(floating-effect)]");
 +  });
 +
 +  test.concurrent("uses project severity and respects off", async () => {
