@@ -59,12 +59,12 @@ When changing the Bun pin, compare `scripts/build/ci-images/spec.ts`,
 `scripts/build/deps/`, `scripts/build/deps/webkit.sha256`, and
 `rust-toolchain.toml` in the new source. Update the prefetch URLs and
 hashes. Build `.#bun-unpatched.cargoDeps` and `.#bun-unpatched.npmDeps`
-to refresh the vendor hashes when their inputs change. Apply the rule
-patch at the new commit and run the Blacksmith proof for both variants.
+to refresh the vendor hashes when their inputs change. Apply the Effect
+patches at the new commit and run the Blacksmith proof for both variants.
 
 ## Upstream patch files
 
-Existing Bun files changed by `patches/floating-effect.patch`:
+Existing Bun files changed by `patches/01-effect-seams.patch`:
 
 - `docs/lint/rules/index.mdx`
 - `src/lint/context.rs`
@@ -76,14 +76,14 @@ Existing Bun files changed by `patches/floating-effect.patch`:
 - `src/lint/linter/schema/own.json`
 - `src/lint/plugins/lib.rs`
 - `src/sema/resolve.rs`
-- `test/cli/lint/type-services.test.ts`
 
-New files in the patch:
+New files added by `patches/02-effect-rules.patch`:
 
 - `docs/lint/rules/bun/floating-effect.mdx`
 - `src/lint/driver/effect.rs`
 - `src/lint/plugins/effect/mod.rs`
 - `src/lint/plugins/rules/bun_floating_effect.rs`
+- `test/cli/lint/effect.test.ts`
 
 The Nix build also edits the existing `scripts/build/flags.ts` to disable
 debug-section compression for both variants.
@@ -95,6 +95,11 @@ variants, runs the diagnostic cases and timing at the pinned slack-listener
 commit, and uploads its output as `bun-lint-proof`. It measures the patched
 runtime archive and installs it with `install.sh` in a clean Ubuntu 24.04
 container. The installed Bun runs the slack-listener tests at `8132ecc`.
+
+The Bun lint test step reads every regular `tools/bun/patches/*.patch` file
+in lexical order, applies its changes to top-level `test/cli/lint/*.test.ts`
+files, and runs each test file those patches touch.
+
 The `main` workflow publishes the tested archive, its SHA-256 file, and
 `manifest.json` in the matching GitHub Release. Download the
 `bun-patched-x86_64-linux` or `bun-unpatched-x86_64-linux` Actions artifact

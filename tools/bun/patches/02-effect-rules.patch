@@ -56,34 +56,6 @@ index 0000000..7545689
 +  yield* Effect.log("ready");
 +});
 +```
-diff --git a/docs/lint/rules/index.mdx b/docs/lint/rules/index.mdx
-index b45338f..d5f1098 100644
---- a/docs/lint/rules/index.mdx
-+++ b/docs/lint/rules/index.mdx
-@@ -886,6 +886,7 @@ description: "Every rule built into bun lint"
- | [`bun/axios-no-unbounded-requests`](/lint/rules/bun/axios-no-unbounded-requests) | Require an axios request to have a `timeout` or a `signal` |  |  |  |
- | [`bun/consistent-directive-prefix`](/lint/rules/bun/consistent-directive-prefix) | Require comments that turn rules off to start with the same word, `eslint` or `oxlint` |  | yes |  |
- | [`bun/fast-check-no-unseeded-random`](/lint/rules/bun/fast-check-no-unseeded-random) | Disallow `Math.random()` and `fc.sample()` inside a fast-check property |  |  |  |
-+| [`bun/floating-effect`](/lint/rules/bun/floating-effect) | Report Effect v4 values discarded by expression statements |  |  | yes |
- | [`bun/format`](/lint/rules/bun/format) | Require code to be formatted the way `bun fmt` prints it |  | yes |  |
- | [`bun/jsx-no-forbidden-nesting`](/lint/rules/bun/jsx-no-forbidden-nesting) | Disallow a JSX element inside another element that cannot contain it |  |  |  |
- | [`bun/no-array-just-to-count`](/lint/rules/bun/no-array-just-to-count) | Disallow `.split(separator).length` with a one-character separator |  | yes |  |
-diff --git a/src/lint/context.rs b/src/lint/context.rs
-index b9b5c8f..c78fe92 100644
---- a/src/lint/context.rs
-+++ b/src/lint/context.rs
-@@ -418,6 +418,11 @@ impl<'a> std::ops::DerefMut for Report<'a> {
- }
- 
- impl<'a> Report<'a> {
-+    pub fn with_severity(mut self, severity: Severity) -> Self {
-+        self.diagnostic.iter_mut().for_each(|it| it.severity = severity);
-+        self
-+    }
-+
-     /// Sets the value for `{{name}}` in the message.
-     #[inline]
-     pub fn data(mut self, name: &'static str, value: impl IntoText<'a>) -> Self {
 diff --git a/src/lint/driver/effect.rs b/src/lint/driver/effect.rs
 new file mode 100644
 index 0000000..1dcc399
@@ -170,152 +142,6 @@ index 0000000..1dcc399
 +        Some(augmented)
 +    }
 +}
-diff --git a/src/lint/driver/for_tests.rs b/src/lint/driver/for_tests.rs
-index 70b33df..a836c76 100644
---- a/src/lint/driver/for_tests.rs
-+++ b/src/lint/driver/for_tests.rs
-@@ -137,6 +137,7 @@ impl Host for Tester<'_> {
-                     path: case.path,
-                     config: &config,
-                     text: Some(case.code.to_vec()),
-+                    effect_plugin: false,
-                 };
-                 Some(
-                     typed::lint(&context, &environment, &[file], &|_| ())
-diff --git a/src/lint/driver/lib.rs b/src/lint/driver/lib.rs
-index eb5d36b..7321248 100644
---- a/src/lint/driver/lib.rs
-+++ b/src/lint/driver/lib.rs
-@@ -18,6 +18,7 @@ mod configs;
- mod deprecated;
- mod discover;
- mod doctor;
-+mod effect;
- mod embedded;
- mod eslintrc;
- mod evaluate;
-diff --git a/src/lint/driver/run.rs b/src/lint/driver/run.rs
-index dfd45cd..4823a5f 100644
---- a/src/lint/driver/run.rs
-+++ b/src/lint/driver/run.rs
-@@ -763,14 +763,17 @@ impl Run<'_> {
-             inferred.files(vec![path.clone()]);
-         }
-         let has_rules_with_types = config.has_enabled(|it| it.triggers_type_check());
-+        let effect_plugin =
-+            crate::effect::may_use_effect_plugin(loaded.flavor, self.options.type_aware, &path);
-         let needs_types = name.is_some()
-             && loader.wants_types(&loaded, config)
--            && (has_rules_with_types || context.checks_types);
-+            && (has_rules_with_types || context.checks_types || effect_plugin);
-         if needs_types {
-             let file = Typed {
-                 path: &path,
-                 config,
-                 text: Some(text.clone()),
-+                effect_plugin,
-             };
-             if let Some(Some(result)) =
-                 typed::lint(context, self.environment, &[file], &on_circular_fixes).pop()
-@@ -929,14 +932,23 @@ impl Run<'_> {
-             let needing = config
-                 .configured()
-                 .filter(|it| it.severity != Severity::Off && it.entry.meta.requires_types);
-+            let effect_plugin = crate::effect::may_use_effect_plugin(
-+                target.loaded.flavor,
-+                self.options.type_aware,
-+                &target.path,
-+            );
-             if loader.wants_types(&target.loaded, config) {
--                match config.has_enabled(|it| it.triggers_type_check()) || context.checks_types {
-+                match config.has_enabled(|it| it.triggers_type_check())
-+                    || context.checks_types
-+                    || effect_plugin
-+                {
-                     true => with_types.push((
-                         target,
-                         Typed {
-                             path: &target.path,
-                             config,
-                             text: None,
-+                            effect_plugin,
-                         },
-                     )),
-                     false => without_types.push(target),
-diff --git a/src/lint/driver/typed.rs b/src/lint/driver/typed.rs
-index 49b2f56..cd047e7 100644
---- a/src/lint/driver/typed.rs
-+++ b/src/lint/driver/typed.rs
-@@ -12,6 +12,7 @@
- //! are checked again, with their new text instead of what's on disk, until nothing changes. Files that import them
- //! aren't linted again.
- 
-+use crate::effect::EffectConfigs;
- use crate::lint::Context;
- use crate::results::{Counts, FileResult};
- use crate::run::Environment;
-@@ -40,6 +41,7 @@ pub(crate) struct Typed<'t> {
-     pub(crate) config: &'t Arc<ResolvedConfig>,
-     /// Its text, if it comes from standard input instead of the disk.
-     pub(crate) text: Option<Vec<u8>>,
-+    pub(crate) effect_plugin: bool,
- }
- 
- /// A file's lint result, and its text if that's needed.
-@@ -389,6 +391,7 @@ fn check_and_lint_in(
-     // Keyed by config file.
-     let program_globals: Guarded<Vec<(Vec<u8>, Arc<LoadedProgramGlobals>)>> =
-         Guarded::new(Vec::new());
-+    let effect_configs = EffectConfigs::default();
-     let mut program_kinds = Guarded::new(vec![ProgramKind::InAProject; indices.len()]);
-     let after_file = |checker: &mut bun_sema::check::Checker<'_, '_>, file: FileId| {
-         let program = checker.p.files;
-@@ -396,7 +399,10 @@ fn check_and_lint_in(
-         let Some(at) = by_path.get(name, program.is_case_sensitive) else {
-             return;
-         };
--        let (path, config) = (files[indices[at]].path, files[indices[at]].config);
-+        let target = &files[indices[at]];
-+        let path = target.path;
-+        let effect_config = effect_configs.for_file(target, program.options.plugins.as_ref(), context);
-+        let config = effect_config.as_ref().unwrap_or(target.config);
-         let project_of_file = &program.options.config_path;
-         let is_in_a_project = match project {
-             Project::This(_) => false,
-diff --git a/src/lint/linter/resolved.rs b/src/lint/linter/resolved.rs
-index fd487b6..60dae3d 100644
---- a/src/lint/linter/resolved.rs
-+++ b/src/lint/linter/resolved.rs
-@@ -315,6 +315,17 @@ pub struct ResolvedConfig {
- }
- 
- impl ResolvedConfig {
-+    /// Returns a variant with extra rules that the lint config does not already set.
-+    pub fn with_added_rules(&self, rules: impl IntoIterator<Item = ConfiguredRule>) -> Self {
-+        let mut config = self.clone();
-+        config.prepared = OnceLock::new();
-+        for rule in rules {
-+            config.language.has_rule_that_requires_types |= rule.entry.meta.requires_types;
-+            config.rules.push(rule);
-+        }
-+        config
-+    }
-+
-     pub fn rule(&self, entry: &RuleEntry) -> Option<&ConfiguredRule> {
-         let (plugin, name) = (entry.meta.plugin, entry.meta.name);
-         let is_match = |it: &&ConfiguredRule| {
-diff --git a/src/lint/linter/schema/own.json b/src/lint/linter/schema/own.json
-index 7da903c..005a88b 100644
---- a/src/lint/linter/schema/own.json
-+++ b/src/lint/linter/schema/own.json
-@@ -39,6 +39,7 @@
-     }
-   ],
-   "bun/fast-check-no-unseeded-random": [],
-+  "bun/floating-effect": [],
-   "bun/format": [
-     {
-       "type": "object",
 diff --git a/src/lint/plugins/effect/mod.rs b/src/lint/plugins/effect/mod.rs
 new file mode 100644
 index 0000000..ddb22ec
@@ -492,24 +318,6 @@ index 0000000..ddb22ec
 +    let end = text.iter().position(|&byte| !word(byte)).unwrap_or(text.len());
 +    text.split_at(end)
 +}
-diff --git a/src/lint/plugins/lib.rs b/src/lint/plugins/lib.rs
-index 1516853..93a8caa 100644
---- a/src/lint/plugins/lib.rs
-+++ b/src/lint/plugins/lib.rs
-@@ -24,11 +24,13 @@ mod import_type;
- mod module_visitor;
- mod n;
- mod oxlint;
-+pub mod effect;
- mod prettier;
- 
- bun_lint::rules! {
-     bun_axios_no_unbounded_requests::AxiosNoUnboundedRequests,
-     bun_consistent_directive_prefix::ConsistentDirectivePrefix,
-+    bun_floating_effect::FloatingEffect,
-     bun_fast_check_no_unseeded_random::FastCheckNoUnseededRandom,
-     bun_jsx_no_forbidden_nesting::JsxNoForbiddenNesting,
-     bun_no_array_just_to_count::NoArrayJustToCount,
 diff --git a/src/lint/plugins/rules/bun_floating_effect.rs b/src/lint/plugins/rules/bun_floating_effect.rs
 new file mode 100644
 index 0000000..10ee56e
@@ -622,44 +430,33 @@ index 0000000..10ee56e
 +        }
 +    }
 +}
-diff --git a/src/sema/resolve.rs b/src/sema/resolve.rs
-index a98898f..9b0a954 100644
---- a/src/sema/resolve.rs
-+++ b/src/sema/resolve.rs
-@@ -655,6 +655,8 @@ pub struct Options {
-     pub builds_executable: bool,
-     /// The directory of `tsconfig.json`. Absolute, no trailing slash.
-     pub base_dir: Vec<u8>,
-+    /// The selected project's merged `compilerOptions.plugins`.
-+    pub plugins: Option<Json>,
-     /// `compilerOptions.paths`: a pattern with at most one `*`, and the substitutions to try for
-     /// it. There can be thousands, and a build copies the options of each project.
-     pub paths: std::sync::Arc<Paths>,
-@@ -1032,6 +1034,7 @@ impl Options {
-     pub fn from_compiler_options(base_dir: &[u8], compiler: &Json) -> Options {
-         let mut options = Options {
-             base_dir: base_dir.to_vec(),
-+            plugins: compiler.get(b"plugins").cloned(),
-             ..Default::default()
-         };
-         let specified = |name: &[u8]| compiler.get(name).and_then(Json::as_bool);
-diff --git a/test/cli/lint/type-services.test.ts b/test/cli/lint/type-services.test.ts
-index 5041488..d35cfdf 100644
---- a/test/cli/lint/type-services.test.ts
-+++ b/test/cli/lint/type-services.test.ts
-@@ -14,7 +14,7 @@ async function lint(files: Record<string, string>, args: string[]) {
-   });
-   const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
-   const errors = [...stdout.matchAll(/^.*?:(\d+:\d+): (.*) \[Error\/.*\]$/gm)].map(it => `${it[1]} ${it[2]}`);
--  return { errors, stderr, exitCode };
+diff --git a/test/cli/lint/effect.test.ts b/test/cli/lint/effect.test.ts
+new file mode 100644
+index 0000000..ce53d38
+--- /dev/null
++++ b/test/cli/lint/effect.test.ts
+@@ -0,0 +1,162 @@
++import { describe, expect, test } from "bun:test";
++import { bunEnv, bunExe, tempDir } from "harness";
++
++const env = { ...bunEnv, AGENT: "0", CLAUDECODE: undefined, GITHUB_ACTIONS: undefined, NO_COLOR: "1" };
++
++async function lint(files: Record<string, string>, args: string[]) {
++  using dir = tempDir("bun-lint-type-services", files);
++  await using proc = Bun.spawn({
++    cmd: [bunExe(), "lint", "-f", "unix", ...args],
++    env,
++    cwd: String(dir),
++    stdout: "pipe",
++    stderr: "pipe",
++  });
++  const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
++  const errors = [...stdout.matchAll(/^.*?:(\d+:\d+): (.*) \[Error\/.*\]$/gm)].map(it => `${it[1]} ${it[2]}`);
 +  return { errors, stdout, stderr, exitCode };
- }
- 
- const rule = (...names: string[]) => names.flatMap(name => ["--rule", `@typescript-eslint/${name}: error`]);
-@@ -133,3 +133,144 @@ describe("`export *` from a package that the file also requires, and that has ot
-     expect([0, names.length]).toContain(errors.length);
-   });
- });
++}
++
++const rule = (...names: string[]) => names.flatMap(name => ["--rule", `@typescript-eslint/${name}: error`]);
++const options = { types: [], lib: ["es2022"] };
 +
 +describe("Effect v4 floating statements", () => {
 +  const floating = [
