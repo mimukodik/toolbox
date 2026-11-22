@@ -22,8 +22,12 @@ const defaultConfig = {
 };
 
 type Unit = { virtualFile: string; content: string };
+type CompilerOptions = Record<string, unknown> & {
+  plugins?: Array<Record<string, unknown>>;
+};
+
 type FixtureConfig = {
-  compilerOptions?: Record<string, unknown>;
+  compilerOptions?: CompilerOptions;
   files?: string[];
   include?: string[];
   exclude?: string[];
@@ -117,6 +121,8 @@ export function layOutFixture(name: string, source: string, root: string): Fixtu
   const directory = dirname(tsconfig);
   const config = configUnit ? Bun.JSONC.parse(configUnit.content) as FixtureConfig : defaultConfig;
   const { compilerOptions, include, exclude, files: originalFiles, ...rest } = config;
+  const plugins = compilerOptions?.plugins?.map((plugin) =>
+    plugin.name === "@effect/language-service" ? { ...plugin, includeSuggestionsInTsc: true } : plugin);
   const effectiveConfig = {
     ...rest,
     compilerOptions: {
@@ -124,6 +130,7 @@ export function layOutFixture(name: string, source: string, root: string): Fixtu
       module: "NodeNext",
       moduleResolution: "NodeNext",
       ...compilerOptions,
+      plugins,
       newLine: "lf",
       skipLibCheck: true,
       skipDefaultLibCheck: true,

@@ -23,7 +23,7 @@ type FixtureScore = {
   extra: Diagnostic[];
   nonEffect: number;
 };
-type Pass = {
+export type Pass = {
   label: string;
   wallSeconds: number;
   fixtures: FixtureScore[];
@@ -61,8 +61,7 @@ function parseUnix(fixture: Fixture, output: string): { effect: Diagnostic[]; no
     const oxlintTag = /^effecttsgo\(([^)]+)\)$/.exec(code);
     const rule = bunRules.get(code)
       ?? effectTag?.[1]
-      ?? (oxlintTag && (oxlintRules.get(oxlintTag[1]) ?? oxlintTag[1]))
-      ?? (code.startsWith("bun(") ? code : undefined);
+      ?? (oxlintTag && (oxlintRules.get(oxlintTag[1]) ?? oxlintTag[1]));
 
     if (!rule) {
       nonEffect++;
@@ -191,4 +190,25 @@ export function isExact(pass: Pass): boolean {
   const { matched, missing, extra } = totals(pass);
   return pass.failures.length === 0 && matched.length === 230 && missing.length === 0
     && extra.every((item) => !requestedRules.has(item.rule));
+}
+
+export function floatingEffectTable(pass: Pass): string {
+  const rule = "floatingEffect";
+  const rows = pass.fixtures.flatMap(({ fixture, matched, missing, extra }) => {
+    const matches = matched.filter(({ expected }) => expected.rule === rule).length;
+    const misses = missing.filter((diagnostic) => diagnostic.rule === rule).length;
+    const extras = extra.filter((diagnostic) => diagnostic.rule === rule).length;
+    return matches + misses + extras > 0 ? [`| ${fixture} | ${matches} | ${misses} | ${extras} |`] : [];
+  });
+  const extras = totals(pass).extra.filter((diagnostic) => diagnostic.rule === rule);
+  return [
+    "### Patched Bun floatingEffect by fixture", "",
+    "| Fixture | Matched | Missing | Extra |",
+    "| --- | ---: | ---: | ---: |",
+    ...rows, "",
+    "#### False positives", "",
+    ...(extras.length ? extras.map(({ fixture, file, line, col, severity }) =>
+      `- \`${fixture}\` at \`${file}:${line}:${col}\` (${severity})`) : ["None."]),
+    "",
+  ].join("\n");
 }

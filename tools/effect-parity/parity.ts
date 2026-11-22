@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { baselineTable, parseBaseline } from "./diagnostics";
 import { discoverFixtures, layOutFixture } from "./fixtures";
-import { exposeReferencePackages, isExact, passTable, runPass } from "./score";
+import { exposeReferencePackages, floatingEffectTable, isExact, type Pass, passTable, runPass } from "./score";
 
 const [upstream, report, baselineReport] = process.argv.slice(2);
 if (!upstream || !report || !baselineReport) {
@@ -37,15 +37,32 @@ console.log(table);
 if (process.env.GITHUB_STEP_SUMMARY) appendFileSync(process.env.GITHUB_STEP_SUMMARY, table + "\n");
 writeFileSync(baselineReport, JSON.stringify(diagnostics, null, 2) + "\n");
 
+function publish(text: string): void {
+  console.log(text);
+  if (process.env.GITHUB_STEP_SUMMARY) appendFileSync(process.env.GITHUB_STEP_SUMMARY, "\n" + text + "\n");
+}
+
+function savePass(subject: string, { raw, ...report }: Pass): void {
+  const directory = dirname(baselineReport);
+  writeFileSync(join(directory, `effect-${subject}-raw.json`), JSON.stringify(raw));
+  writeFileSync(join(directory, `effect-${subject}-score.json`), JSON.stringify(report, null, 2) + "\n");
+}
+
 exposeReferencePackages(root);
 const reference = await runPass("reference", fixtures, diagnostics);
-const referenceTable = passTable(reference);
-console.log(referenceTable);
-if (process.env.GITHUB_STEP_SUMMARY) appendFileSync(process.env.GITHUB_STEP_SUMMARY, "\n" + referenceTable);
-writeFileSync(join(dirname(baselineReport), "effect-reference-raw.json"), JSON.stringify(reference.raw));
-const { raw: referenceRaw, ...referenceReport } = reference;
-writeFileSync(join(dirname(baselineReport), "effect-reference-score.json"), JSON.stringify(referenceReport, null, 2) + "\n");
+publish(passTable(reference));
+savePass("reference", reference);
+
 if (!isExact(reference)) {
-  console.error(reference.failures.slice(0, 5).join("\n"));
+  publish("Reference self-test failed. Patched Bun was not scored.");
+  if (reference.failures.length) console.error(reference.failures.slice(0, 5).join("\n"));
   process.exitCode = 1;
+} else {
+  const bun = await runPass("bun", fixtures, diagnostics);
+  if (bun.failures.length) {
+    publish("Some Bun fixtures failed to execute or parse. The table covers completed fixtures.");
+  }
+  publish(passTable(bun));
+  publish(floatingEffectTable(bun));
+  savePass("bun", bun);
 }
