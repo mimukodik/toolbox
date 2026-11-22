@@ -65,13 +65,14 @@ run_case() {
   if (( status != expected_exit )); then
     result=fail
   fi
-  if [[ -n "$rule" ]] && (( line > 0 )); then
-    diagnostics=$(rg '\[(Error|Warning)(/[^]]+)?\]$' "$log" || true)
-    if ! [[ "$diagnostics" != *$'\n'* && "$diagnostics" == *" [Error/$rule]" ]] ||
-      ! rg -q "(^|/)src/core\.ts:$line:[0-9]+:" <<< "$diagnostics"; then
+  diagnostics=$(rg '\[(Error|Warning)(/[^]]+)?\]$|^::(error|warning) file=' "$log" || true)
+  if [[ -n "$rule" ]]; then
+    if ! [[ "$diagnostics" != *$'\n'* ]] ||
+      ! [[ "$diagnostics" == *" [Error/$rule]" || "$diagnostics" == "::error file="*",title=$rule::"* ]] ||
+      ! rg -q "(^|/|::)src/core\.ts:$line:[0-9]+:" <<< "$diagnostics"; then
       result=fail
     fi
-  elif [[ -n "$rule" ]] && ! rg -Fq -- "$rule" "$log"; then
+  elif [[ -n "$diagnostics" ]]; then
     result=fail
   fi
   printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$fixture" "$arm" "$expected_exit" "$status" "$rule" "$result" \
@@ -98,8 +99,10 @@ plant floating-effect 'Effect.succeed(1);'
 run_case floating-effect stock 0 '' "$planted_line" "${stock_lint[@]}"
 run_case floating-effect patched 1 'bun(floating-effect)' "$planted_line" "${patched_lint[@]}"
 directory_args=(lint --no-script --type-aware --type-check --tsconfig tsconfig.json src)
-run_case floating-effect-default stock 0 'No problems in ' 0 "$stock" "${directory_args[@]}"
-run_case floating-effect-default patched 1 'bun/floating-effect' 0 "$patched" "${directory_args[@]}"
+run_case floating-effect-default stock 0 '' "$planted_line" \
+  env AGENT=0 GITHUB_ACTIONS=true "$stock" "${directory_args[@]}"
+run_case floating-effect-default patched 1 'bun(floating-effect)' "$planted_line" \
+  env AGENT=0 GITHUB_ACTIONS=true "$patched" "${directory_args[@]}"
 git restore --source=HEAD -- src/core.ts
 
 # Each fixture is checked against stock and patched on a freshly restored core.

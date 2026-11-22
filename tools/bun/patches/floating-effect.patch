@@ -66,135 +66,130 @@ index b45338f..d5f1098 100644
  | [`bun/format`](/lint/rules/bun/format) | Require code to be formatted the way `bun fmt` prints it |  | yes |  |
  | [`bun/jsx-no-forbidden-nesting`](/lint/rules/bun/jsx-no-forbidden-nesting) | Disallow a JSX element inside another element that cannot contain it |  |  |  |
  | [`bun/no-array-just-to-count`](/lint/rules/bun/no-array-just-to-count) | Disallow `.split(separator).length` with a one-character separator |  | yes |  |
-diff --git a/src/lint/driver/configs.rs b/src/lint/driver/configs.rs
-index 0cb48ed..b6c128e 100644
---- a/src/lint/driver/configs.rs
-+++ b/src/lint/driver/configs.rs
-@@ -38,7 +38,12 @@ use bun_lint::linter::{
+diff --git a/src/lint/driver/run.rs b/src/lint/driver/run.rs
+index dfd45cd..c37f53e 100644
+--- a/src/lint/driver/run.rs
++++ b/src/lint/driver/run.rs
+@@ -763,14 +763,16 @@ impl Run<'_> {
+             inferred.files(vec![path.clone()]);
+         }
+         let has_rules_with_types = config.has_enabled(|it| it.triggers_type_check());
++        let effect_plugin = typed::may_use_effect_plugin(loaded.flavor, &path);
+         let needs_types = name.is_some()
+             && loader.wants_types(&loaded, config)
+-            && (has_rules_with_types || context.checks_types);
++            && (has_rules_with_types || context.checks_types || effect_plugin);
+         if needs_types {
+             let file = Typed {
+                 path: &path,
+                 config,
+                 text: Some(text.clone()),
++                effect_plugin,
+             };
+             if let Some(Some(result)) =
+                 typed::lint(context, self.environment, &[file], &on_circular_fixes).pop()
+@@ -930,13 +932,18 @@ impl Run<'_> {
+                 .configured()
+                 .filter(|it| it.severity != Severity::Off && it.entry.meta.requires_types);
+             if loader.wants_types(&target.loaded, config) {
+-                match config.has_enabled(|it| it.triggers_type_check()) || context.checks_types {
++                let effect_plugin = typed::may_use_effect_plugin(target.loaded.flavor, &target.path);
++                match config.has_enabled(|it| it.triggers_type_check())
++                    || context.checks_types
++                    || effect_plugin
++                {
+                     true => with_types.push((
+                         target,
+                         Typed {
+                             path: &target.path,
+                             config,
+                             text: None,
++                            effect_plugin,
+                         },
+                     )),
+                     false => without_types.push(target),
+diff --git a/src/lint/driver/typed.rs b/src/lint/driver/typed.rs
+index 49b2f56..f56619b 100644
+--- a/src/lint/driver/typed.rs
++++ b/src/lint/driver/typed.rs
+@@ -12,6 +12,7 @@
+ //! are checked again, with their new text instead of what's on disk, until nothing changes. Files that import them
+ //! aren't linted again.
+
++use crate::configs::Flavor;
+ use crate::lint::Context;
+ use crate::results::{Counts, FileResult};
+ use crate::run::Environment;
+@@ -27,7 +28,7 @@ use bun_lint::linter::{
  };
- use bun_lint::options::Json;
- use bun_lint::rule::{Frameworks, Plugin, minor_of};
-+use bun_sema::config::{
-+    find_config, read_compiler_option, resolve_config_file_name_of_project_reference,
-+};
-+use bun_sema::resolve::ScriptKind;
+ use bun_sema::json::Json;
+ use bun_sema::program::{FileId, Files};
+-use bun_sema::resolve::{inside, is_same_path, to_file_name_lower_case};
++use bun_sema::resolve::{ScriptKind, inside, is_same_path, to_file_name_lower_case};
  use bun_sema::util::{FxHashMap, FxHashSet};
-+use bun_sema_driver::host::{Disk, from_argument, from_native};
- use bun_threading::Guarded;
- use std::borrow::Cow;
- use std::sync::{Arc, OnceLock};
-@@ -506,6 +511,10 @@ pub(crate) struct Loader<'l> {
-     pub(crate) tsconfigs: Guarded<Vec<Vec<u8>>>,
-     /// Cache for [`Loader::detect_frameworks`], keyed by directory.
-     frameworks: Guarded<FxHashMap<Vec<u8>, Frameworks>>,
-+    effect_config_host: OnceLock<Disk>,
-+    effect_by_directory: Guarded<FxHashMap<Vec<u8>, Option<Severity>>>,
-+    effect_by_project: Guarded<FxHashMap<Vec<u8>, Option<Severity>>>,
-+    with_effect: Guarded<FxHashMap<(usize, bool), Arc<ResolvedConfig>>>,
+ use bun_sema_driver::host::{AlreadyRead, Provided, as_read, from_native, is_bundled, to_native};
+ use bun_sema_driver::{Category, Diagnostic, Libs, RejectedProgram, WithoutInclude};
+@@ -40,6 +41,30 @@ pub(crate) struct Typed<'t> {
+     pub(crate) config: &'t Arc<ResolvedConfig>,
+     /// Its text, if it comes from standard input instead of the disk.
+     pub(crate) text: Option<Vec<u8>>,
++    pub(crate) effect_plugin: bool,
++}
++
++pub(crate) fn may_use_effect_plugin(flavor: Flavor, path: &[u8]) -> bool {
++    matches!(flavor, Flavor::BuiltIn | Flavor::Oxlint)
++        && matches!(ScriptKind::from_file_name(path), Some(ScriptKind::Ts | ScriptKind::Tsx))
++}
++
++fn effect_severity(plugins: &Json) -> Option<Severity> {
++    let plugin = plugins.as_array()?.iter().find(|plugin| {
++        plugin.get(b"name").and_then(Json::as_str) == Some(b"@effect/language-service")
++    })?;
++    if matches!(plugin.get(b"diagnostics"), Some(Json::Bool(false))) {
++        return None;
++    }
++    match plugin
++        .get(b"diagnosticSeverity")
++        .and_then(|rules| rules.get(b"floatingEffect"))
++        .and_then(Json::as_str)
++    {
++        Some(b"error") | None => Some(Severity::Error),
++        Some(b"warning") => Some(Severity::Warn),
++        _ => None,
++    }
  }
 
- fn strings_of(items: &[Vec<u8>]) -> Json {
-@@ -842,6 +851,10 @@ impl<'l> Loader<'l> {
-             searched_from: Default::default(),
-             tsconfigs: Default::default(),
-             frameworks: Default::default(),
-+            effect_config_host: OnceLock::new(),
-+            effect_by_directory: Default::default(),
-+            effect_by_project: Default::default(),
-+            with_effect: Default::default(),
-         }
-     }
-
-@@ -2881,7 +2894,76 @@ impl<'l> Loader<'l> {
-     /// the project uses.
-     pub(crate) fn config_of(&self, loaded: &Loaded, path: &[u8]) -> FileConfig {
-         let detected = self.detect_frameworks(loaded, paths::dirname(path));
--        (loaded.config).get_with_frameworks(self.linter.registry(), path, detected)
-+        let registry = self.linter.registry();
-+        match (loaded.config).get_with_frameworks(registry, path, detected) {
-+            FileConfig::Matched(config) => {
-+                FileConfig::Matched(self.with_effect_rule(loaded, path, config))
-+            }
-+            result => result,
-+        }
-+    }
-+
-+    /// Applies TypeScript project settings after either explicit or walked discovery.
-+    pub(crate) fn with_effect_rule(
-+        &self,
-+        loaded: &Loaded,
-+        path: &[u8],
-+        config: Arc<ResolvedConfig>,
-+    ) -> Arc<ResolvedConfig> {
-+        if matches!(loaded.flavor, Flavor::BuiltIn | Flavor::Oxlint)
-+            && matches!(
-+                ScriptKind::from_file_name(path),
-+                Some(ScriptKind::Ts | ScriptKind::Tsx)
-+            )
-+            && let Some(rule) = config.find_rule(self.linter.registry(), b"bun/floating-effect")
+ /// A file's lint result, and its text if that's needed.
+@@ -389,6 +414,7 @@ fn check_and_lint_in(
+     // Keyed by config file.
+     let program_globals: Guarded<Vec<(Vec<u8>, Arc<LoadedProgramGlobals>)>> =
+         Guarded::new(Vec::new());
++    let effect_configs = Guarded::new(FxHashMap::default());
+     let mut program_kinds = Guarded::new(vec![ProgramKind::InAProject; indices.len()]);
+     let after_file = |checker: &mut bun_sema::check::Checker<'_, '_>, file: FileId| {
+         let program = checker.p.files;
+@@ -397,6 +423,21 @@ fn check_and_lint_in(
+             return;
+         };
+         let (path, config) = (files[indices[at]].path, files[indices[at]].config);
++        let effect_config = if files[indices[at]].effect_plugin
++            && let Some(severity) = program.options.plugins.as_ref().and_then(effect_severity)
++            && let Some(rule) = config.find_rule(context.linter.registry(), b"bun/floating-effect")
 +            && config.rule(rule).is_none()
-+            && let Some(severity) =
-+                self.effect_severity(paths::dirname(path), config.language.is_oxlint)
 +        {
-+            let key = (Arc::as_ptr(&config) as usize, severity == Severity::Error);
-+            let mut with_effect = self.with_effect.lock();
-+            let config = with_effect
++            let key = (Arc::as_ptr(config) as usize, severity == Severity::Error);
++            let mut configs = effect_configs.lock();
++            let config = configs
 +                .entry(key)
 +                .or_insert_with(|| Arc::new(config.with_added_rule(rule, severity)));
-+            return Arc::clone(config);
-+        }
-+        config
-+    }
-+
-+    fn effect_severity(&self, directory: &[u8], is_oxlint: bool) -> Option<Severity> {
-+        let mut by_directory = self.effect_by_directory.lock();
-+        *by_directory.entry(directory.to_vec()).or_insert_with(|| {
-+            let cwd = from_native(self.cwd());
-+            let host = self.effect_config_host.get_or_init(|| {
-+                Disk::with_already_read(1, Default::default(), &cwd).started_in(&cwd)
-+            });
-+            let config = match &self.options.tsconfig {
-+                // The oxlint checker picks the file's own TypeScript project.
-+                Some(path) if !is_oxlint => {
-+                    resolve_config_file_name_of_project_reference(&from_argument(&cwd, path))
-+                }
-+                _ => find_config(host, &from_native(directory))?,
-+            };
-+            let mut by_project = self.effect_by_project.lock();
-+            *by_project.entry(config.clone()).or_insert_with(|| {
-+                let plugins = read_compiler_option(host, &config, b"plugins")?;
-+                let plugin = plugins.as_array()?.iter().find(|plugin| {
-+                    plugin.get(b"name").and_then(Json::as_str) == Some(b"@effect/language-service")
-+                })?;
-+                if matches!(plugin.get(b"diagnostics"), Some(Json::Bool(false))) {
-+                    return None;
-+                }
-+                match plugin
-+                    .get(b"diagnosticSeverity")
-+                    .and_then(|rules| rules.get(b"floatingEffect"))
-+                    .and_then(Json::as_str)
-+                {
-+                    Some(b"error") | None => Some(Severity::Error),
-+                    Some(b"warning") => Some(Severity::Warn),
-+                    _ => None,
-+                }
-+            })
-+        })
-     }
-
-     /// True if the type-aware rules run on a file whose configuration is `config`, which comes from `loaded`.
-diff --git a/src/lint/driver/discover.rs b/src/lint/driver/discover.rs
-index 8a3197e..f7bf92c 100644
---- a/src/lint/driver/discover.rs
-+++ b/src/lint/driver/discover.rs
-@@ -464,6 +464,7 @@ fn search(
-             if let Some(FileConfig::Matched(config)) = selected.or(config)
-                 && let Some(size) = listing.size_of(&entry.name)
-             {
-+                let config = loader.with_effect_rule(&own, &path, config);
-                 files.push(Target {
-                     path,
-                     size,
++            Some(Arc::clone(config))
++        } else {
++            None
++        };
++        let config = effect_config.as_deref().unwrap_or(config);
+         let project_of_file = &program.options.config_path;
+         let is_in_a_project = match project {
+             Project::This(_) => false,
 diff --git a/src/lint/linter/resolved.rs b/src/lint/linter/resolved.rs
 index fd487b6..d778739 100644
 --- a/src/lint/linter/resolved.rs
@@ -321,28 +316,29 @@ index 0000000..5c3c2fd
 +        }
 +    }
 +}
-diff --git a/src/sema/config.rs b/src/sema/config.rs
-index a2beca5..50c0666 100644
---- a/src/sema/config.rs
-+++ b/src/sema/config.rs
-@@ -984,6 +984,15 @@ fn validate_specs(
-         .collect()
- }
-
-+/// Reads a merged compiler option without enumerating the files in the project.
-+pub fn read_compiler_option(host: &dyn Host, path: &[u8], name: &[u8]) -> Option<Json> {
-+    let session = Session::new();
-+    let raw = parse_config(host, &session, path, &mut Vec::new())?;
-+    raw.compiler
-+        .into_iter()
-+        .find_map(|(key, value)| (key == name).then_some(value))
-+}
-+
- /// `GetParsedCommandLineOfConfigFilePath`. `overrides` returns the options that a command line adds, which are applied
- /// after everything in the configuration file and may depend on whether the file has `references`. Returns `Err` if the
- /// file can't be read, so there's no project. A file that the parser gives up on counts as empty, with the error. The
+diff --git a/src/sema/resolve.rs b/src/sema/resolve.rs
+index a98898f..9b0a954 100644
+--- a/src/sema/resolve.rs
++++ b/src/sema/resolve.rs
+@@ -655,6 +655,8 @@ pub struct Options {
+     pub builds_executable: bool,
+     /// The directory of `tsconfig.json`. Absolute, no trailing slash.
+     pub base_dir: Vec<u8>,
++    /// The selected project's merged `compilerOptions.plugins`.
++    pub plugins: Option<Json>,
+     /// `compilerOptions.paths`: a pattern with at most one `*`, and the substitutions to try for
+     /// it. There can be thousands, and a build copies the options of each project.
+     pub paths: std::sync::Arc<Paths>,
+@@ -1032,6 +1034,7 @@ impl Options {
+     pub fn from_compiler_options(base_dir: &[u8], compiler: &Json) -> Options {
+         let mut options = Options {
+             base_dir: base_dir.to_vec(),
++            plugins: compiler.get(b"plugins").cloned(),
+             ..Default::default()
+         };
+         let specified = |name: &[u8]| compiler.get(name).and_then(Json::as_bool);
 diff --git a/test/cli/lint/type-services.test.ts b/test/cli/lint/type-services.test.ts
-index 5041488..b8f58cf 100644
+index 5041488..fe3442e 100644
 --- a/test/cli/lint/type-services.test.ts
 +++ b/test/cli/lint/type-services.test.ts
 @@ -14,7 +14,7 @@ async function lint(files: Record<string, string>, args: string[]) {
@@ -354,7 +350,7 @@ index 5041488..b8f58cf 100644
  }
 
  const rule = (...names: string[]) => names.flatMap(name => ["--rule", `@typescript-eslint/${name}: error`]);
-@@ -133,3 +133,64 @@ describe("`export *` from a package that the file also requires, and that has ot
+@@ -133,3 +133,91 @@ describe("`export *` from a package that the file also requires, and that has ot
      expect([0, names.length]).toContain(errors.length);
    });
  });
@@ -417,5 +413,32 @@ index 5041488..b8f58cf 100644
 +    const disabled = await lint(project("off"), ["src"]);
 +    expect(disabled.stdout).not.toContain("bun(floating-effect)");
 +    expect(disabled.exitCode).toBe(0);
++  });
++
++  test.concurrent("reads the plugin from the referenced project for a directory or file", async () => {
++    const files = {
++      ".oxlintrc.json": JSON.stringify({ options: { typeAware: true }, categories: { correctness: "off" } }),
++      "tsconfig.json": JSON.stringify({ files: [], references: [{ path: "./tsconfig.app.json" }] }),
++      "tsconfig.app.json": JSON.stringify({
++        compilerOptions: {
++          ...options,
++          composite: true,
++          plugins: [{ name: "@effect/language-service", diagnosticSeverity: { floatingEffect: "error" } }],
++        },
++        include: ["src"],
++      }),
++      "src/a.ts": [
++        'interface Variance { _A: () => number; _E: () => never; _R: () => never; }',
++        'interface Effect { readonly "~effect/Effect": Variance; }',
++        'declare function make(): Effect;',
++        'make();',
++      ].join("\n"),
++    };
++    for (const target of ["src", "src/a.ts"]) {
++      const { errors, stdout, exitCode } = await lint(files, [target]);
++      expect(stdout).toContain("[Error/bun(floating-effect)]");
++      expect(errors).toEqual(["4:1 This Effect value is neither yielded nor used in an assignment."]);
++      expect(exitCode).toBe(1);
++    }
 +  });
 +});

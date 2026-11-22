@@ -54,6 +54,19 @@ jobs:
         if: ${{ !cancelled() && steps.stock.outcome == 'success' && steps.patched.outcome == 'success' }}
         run: bash tools/bun/slack-lint-proof.sh
 
+      - name: Test the Effect rule with Bun's type-service fixtures
+        shell: bash
+        run: |
+          source=$(nix eval --raw .#bun.src.outPath)
+          fixture="$RUNNER_TEMP/bun-type-services"
+          mkdir -p "$fixture"
+          tar -xzf "$source" -C "$fixture" --strip-components=1 --wildcards '*/test/*'
+          git -C "$fixture" apply --include=test/cli/lint/type-services.test.ts \
+            "$PWD/tools/bun/patches/floating-effect.patch"
+          cd "$fixture/test"
+          "$RUNNER_TEMP/bun-result/bin/bun" test --test-name-pattern 'Effect v4 floating statements' \
+            ./cli/lint/type-services.test.ts
+
       - name: Package and measure the runtime closure
         run: bash tools/bun/package-release.sh
 
@@ -64,6 +77,9 @@ jobs:
           sha_file=("$out"/*.tar.zst.sha256)
           read -r sha256 asset < "${sha_file[0]}"
           version=$(jq -er .version "$out/manifest.json")
+          bun_commit=$(jq -er .bun_commit "$out/manifest.json")
+          smoke_log="$RUNNER_TEMP/bun-install.log"
+          status=0
 
           docker run --rm \
             --mount "type=bind,source=$out,target=/release,readonly" \
@@ -80,18 +96,27 @@ jobs:
 
               sh /install.sh "file:///release/$1" "$2"
               actual_version=$(bun --version)
-              printf "Bun version: %s\n" "$actual_version"
-              test "$actual_version" = "$3"
+              actual_revision=$(bun --revision)
+              printf "bun --version: %s\nbun --revision: %s\n" "$actual_version" "$actual_revision"
+              test "$actual_version" = "${3%%-*}"
+              test "$actual_revision" = "$3+$4"
               bun lint --help
 
               git init --quiet /tmp/slack-listener
               cd /tmp/slack-listener
-              git fetch --no-tags --depth=1 https://github.com/mimukodik/slack-listener.git "$4"
+              git fetch --no-tags --depth=1 https://github.com/mimukodik/slack-listener.git "$5"
               git checkout --quiet --detach FETCH_HEAD
-              test "$(git rev-parse HEAD)" = "$4"
+              test "$(git rev-parse HEAD)" = "$5"
               bun install --frozen-lockfile
               bun test
-            ' sh "$asset" "$sha256" "$version" "$SLACK_LISTENER_REV"
+            ' sh "$asset" "$sha256" "$version" "${bun_commit:0:9}" "$SLACK_LISTENER_REV" \
+            2>&1 | tee "$smoke_log" || status=$?
+
+          {
+            printf '\n### Ubuntu install smoke test\n\n'
+            sed -n '/^bun --version: /p; /^bun --revision: /p' "$smoke_log" | sed 's/^/- /'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
 
       - name: Save tested release files
         if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')

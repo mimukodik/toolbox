@@ -60,12 +60,12 @@ patch at the new commit and run the Blacksmith proof for both variants.
 Existing Bun files changed by `patches/floating-effect.patch`:
 
 - `docs/lint/rules/index.mdx`
-- `src/lint/driver/configs.rs`
-- `src/lint/driver/discover.rs`
+- `src/lint/driver/run.rs`
+- `src/lint/driver/typed.rs`
 - `src/lint/linter/resolved.rs`
 - `src/lint/linter/schema/own.json`
 - `src/lint/plugins/lib.rs`
-- `src/sema/config.rs`
+- `src/sema/resolve.rs`
 - `test/cli/lint/type-services.test.ts`
 
 New files in the patch:
