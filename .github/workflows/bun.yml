@@ -1,0 +1,56 @@
+name: Build and verify Bun
+
+on:
+  pull_request:
+    paths:
+      - 'flake.*'
+      - 'tools/bun/**'
+      - '.github/workflows/bun.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bun:
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 140
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+        with:
+          extra_nix_config: sandbox = true
+      - name: Build the unpatched control
+        run: bash tools/bun/measure-build.sh bun-unpatched
+      - name: Build patched Bun
+        run: bash tools/bun/measure-build.sh bun
+      - name: Save the patched binary and its runtime closure
+        run: |
+          store_path=$(readlink -f "$RUNNER_TEMP/bun")
+          nix-store -qR "$store_path" | sed 's|^/||' > "$RUNNER_TEMP/bun-closure-paths"
+          tar --create --zstd --file "$RUNNER_TEMP/bun-closure.tar.zst" \
+            -C / --files-from "$RUNNER_TEMP/bun-closure-paths"
+          echo "Bun executable in archive: $store_path/bin/bun" | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: bun-linux-x64
+          path: ${{ runner.temp }}/bun-closure.tar.zst
+          if-no-files-found: error
+          compression-level: 0
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          repository: mimukodik/slack-listener
+          ref: 8132eccf4db7799dc3647e467ddc08f7384aa9a8
+          path: slack-listener
+          persist-credentials: false
+      - name: Compare rule behavior and cold lint performance
+        run: bash tools/bun/prove.sh slack-listener
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: bun-experiment-evidence
+          path: ${{ runner.temp }}/bun-evidence/
+          if-no-files-found: error

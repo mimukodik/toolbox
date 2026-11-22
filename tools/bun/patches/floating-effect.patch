@@ -1,0 +1,185 @@
+diff --git a/src/lint/driver/typed.rs b/src/lint/driver/typed.rs
+index 49b2f565c2..9e5fa8f8d1 100644
+--- a/src/lint/driver/typed.rs
++++ b/src/lint/driver/typed.rs
+@@ -344,6 +344,18 @@ impl InferredGlobals for FileGlobals<'_> {
+     }
+ }
+
++fn floating_effect_severity(plugins: &[Json]) -> Option<Severity> {
++    let plugin = plugins.iter().find(|plugin| {
++        plugin.get(b"name").and_then(Json::as_str) == Some(b"@effect/language-service")
++    })?;
++    match plugin.get(b"diagnosticSeverity")?.get(b"floatingEffect")?.as_str()? {
++        b"error" => Some(Severity::Error),
++        b"warning" => Some(Severity::Warn),
++        b"off" => Some(Severity::Off),
++        _ => None,
++    }
++}
++
+ fn check_and_lint_in(
+     context: &Context,
+     environment: &Environment,
+@@ -389,6 +401,9 @@ fn check_and_lint_in(
+     // Keyed by config file.
+     let program_globals: Guarded<Vec<(Vec<u8>, Arc<LoadedProgramGlobals>)>> =
+         Guarded::new(Vec::new());
++    let rule = context.linter.registry().find_by_any_name(b"bun/floating-effect");
++    let effect_configs: Guarded<Vec<(Arc<ResolvedConfig>, Severity, Arc<ResolvedConfig>)>> =
++        Guarded::new(Vec::new());
+     let mut program_kinds = Guarded::new(vec![ProgramKind::InAProject; indices.len()]);
+     let after_file = |checker: &mut bun_sema::check::Checker<'_, '_>, file: FileId| {
+         let program = checker.p.files;
+@@ -397,6 +412,21 @@ fn check_and_lint_in(
+             return;
+         };
+         let (path, config) = (files[indices[at]].path, files[indices[at]].config);
++        let effect_config = rule
++            .zip(floating_effect_severity(&program.options.plugins))
++            .map(|(entry, severity)| {
++                let mut known = effect_configs.lock();
++                if let Some((_, _, found)) = known.iter().find(|(base, level, _)| {
++                    Arc::ptr_eq(base, config) && *level == severity
++                }) {
++                    return Arc::clone(found);
++                }
++                let made = Arc::new(config.with_project_rule(entry, severity));
++                known.push((Arc::clone(config), severity, Arc::clone(&made)));
++                made
++            });
++        let config = effect_config.as_ref().unwrap_or(config);
++
+         let project_of_file = &program.options.config_path;
+         let is_in_a_project = match project {
+             Project::This(_) => false,
+diff --git a/src/lint/linter/resolved.rs b/src/lint/linter/resolved.rs
+index fd487b6c0c..0f2561e287 100644
+--- a/src/lint/linter/resolved.rs
++++ b/src/lint/linter/resolved.rs
+@@ -315,6 +315,14 @@ pub struct ResolvedConfig {
+ }
+
+ impl ResolvedConfig {
++    pub fn with_project_rule(&self, entry: &'static RuleEntry, severity: Severity) -> Self {
++        let mut config = self.clone();
++        config.rules.retain(|rule| !std::ptr::eq(rule.entry, entry));
++        config.rules.push(ConfiguredRule::new(entry, severity, Arc::from([])));
++        config.prepared = OnceLock::new();
++        config
++    }
++
+     pub fn rule(&self, entry: &RuleEntry) -> Option<&ConfiguredRule> {
+         let (plugin, name) = (entry.meta.plugin, entry.meta.name);
+         let is_match = |it: &&ConfiguredRule| {
+diff --git a/src/lint/plugins/lib.rs b/src/lint/plugins/lib.rs
+index 1516853e5f..cec46f8f1d 100644
+--- a/src/lint/plugins/lib.rs
++++ b/src/lint/plugins/lib.rs
+@@ -30,6 +30,7 @@ bun_lint::rules! {
+     bun_axios_no_unbounded_requests::AxiosNoUnboundedRequests,
+     bun_consistent_directive_prefix::ConsistentDirectivePrefix,
+     bun_fast_check_no_unseeded_random::FastCheckNoUnseededRandom,
++    bun_floating_effect::FloatingEffect,
+     bun_jsx_no_forbidden_nesting::JsxNoForbiddenNesting,
+     bun_no_array_just_to_count::NoArrayJustToCount,
+     bun_no_cast_to_brand::NoCastToBrand,
+diff --git a/src/lint/plugins/rules/bun_floating_effect.rs b/src/lint/plugins/rules/bun_floating_effect.rs
+new file mode 100644
+index 0000000000..b0aff93776
+--- /dev/null
++++ b/src/lint/plugins/rules/bun_floating_effect.rs
+@@ -0,0 +1,70 @@
++// Adapted from Effect-TS/tsgo's floatingEffect and Effect v4 type parser (MIT).
++use bun_lint::prelude::*;
++use bun_lint::rule::Plugin;
++use bun_lint::types::Type;
++
++pub struct FloatingEffect;
++
++const EFFECT_TYPE_ID: &[u8] = b"~effect/Effect";
++const STREAM_TYPE_ID: &[u8] = b"~effect/Stream";
++
++const FLOATING: &Message = &Message::new(
++    "floatingEffect",
++    "This Effect value is neither yielded nor used in an assignment.",
++);
++const FLOATING_EFFECT_ABLE: &Message = &Message::new(
++    "floatingEffectAble",
++    "This Effect-able '{{type}}' value is neither yielded nor assigned to a variable.",
++);
++
++fn has_variance(ty: Type<'_>, key: &[u8]) -> bool {
++    let Some(variance) = ty.get_type_of_property(key) else {
++        return false;
++    };
++    [b"_A", b"_E", b"_R"].iter().all(|name| {
++        variance.get_type_of_property(&name[..]).is_some_and(|parameter| {
++            let signatures = parameter.get_call_signatures();
++            signatures.len() == 1
++                && signatures.first().is_some_and(|sig| sig.type_parameters().is_empty())
++        })
++    })
++}
++
++impl Rule for FloatingEffect {
++    const META: Meta = Meta::plugin(Plugin::Bun, "floating-effect", Kind::Problem).requires_types();
++    const ON: On = On::new().stmts(&[StmtTag::Expr]);
++    no_state!();
++
++    fn new(_: &Options) -> Self {
++        Self
++    }
++
++    fn stmt<'a>(&self, stmt: Stmt<'a>, cx: &mut Cx<'a, Self>) {
++        let StmtKind::Expr(expression) = stmt.kind() else {
++            return;
++        };
++        if matches!(
++            expression.assign_op(),
++            Some(None | Some(BinOp::And | BinOp::Or | BinOp::Nullish))
++        ) {
++            return;
++        }
++
++        let ty = expression.ty();
++        if ty.get_property(EFFECT_TYPE_ID).is_some() {
++            let is_fiber = ty.get_property(b"await").is_some() && ty.get_property(b"poll").is_some();
++            let is_subtype = ty.get_property(b"_tag").is_some() || ty.get_property(b"get").is_some();
++            if is_fiber || is_subtype || !has_variance(ty, EFFECT_TYPE_ID) {
++                return;
++            }
++        } else if !has_variance(ty, STREAM_TYPE_ID) {
++            return;
++        }
++
++        if ty.symbol().is_some_and(|symbol| symbol.name() == b"Effect") {
++            cx.report(expression, FLOATING);
++        } else {
++            cx.report(expression, FLOATING_EFFECT_ABLE).data("type", ty.to_text());
++        }
++    }
++}
+diff --git a/src/sema/resolve.rs b/src/sema/resolve.rs
+index a98898f52e..2061872c80 100644
+--- a/src/sema/resolve.rs
++++ b/src/sema/resolve.rs
+@@ -655,6 +655,8 @@ pub struct Options {
+     pub builds_executable: bool,
+     /// The directory of `tsconfig.json`. Absolute, no trailing slash.
+     pub base_dir: Vec<u8>,
++    /// The merged `compilerOptions.plugins`, for consumers of the checked project.
++    pub plugins: std::sync::Arc<[Json]>,
+     /// `compilerOptions.paths`: a pattern with at most one `*`, and the substitutions to try for
+     /// it. There can be thousands, and a build copies the options of each project.
+     pub paths: std::sync::Arc<Paths>,
+@@ -1034,6 +1036,9 @@ impl Options {
+             base_dir: base_dir.to_vec(),
+             ..Default::default()
+         };
++        if let Some(plugins) = compiler.get(b"plugins").and_then(Json::as_array) {
++            options.plugins = std::sync::Arc::from(&plugins[..]);
++        }
+         let specified = |name: &[u8]| compiler.get(name).and_then(Json::as_bool);
+         let flag = |name: &[u8]| specified(name).unwrap_or(false);
+         let word = |name: &[u8]| compiler.get(name).and_then(Json::as_str);
