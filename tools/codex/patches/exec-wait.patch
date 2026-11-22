@@ -1,0 +1,204 @@
+diff --git a/core/src/tools/handlers/shell_spec.rs b/core/src/tools/handlers/shell_spec.rs
+index 264a214..ed3c0e2 100644
+--- a/core/src/tools/handlers/shell_spec.rs
++++ b/core/src/tools/handlers/shell_spec.rs
+@@ -25,9 +25,9 @@ pub(crate) fn create_exec_command_tool_with_environment_id(
+     include_windows_shell_guidance: bool,
+ ) -> ToolSpec {
+     let yield_time_ms_description = if cfg!(windows) {
+-        "Maximum time to wait before returning a session ID for a still-running command. Commands that finish sooner return immediately. For ordinary commands, omit this parameter to use the 10000 ms default. Effective range on Windows is 10000-30000 ms."
++        "Maximum time to wait before returning a session ID for a still-running command. Commands that finish sooner return immediately. For ordinary commands, omit this parameter to use the 900000 ms default. Effective range on Windows is 10000-1200000 ms."
+     } else {
+-        "Wait before yielding output. Defaults to 10000 ms; effective range is 250-30000 ms."
++        "Maximum time to wait before returning a session ID. Commands that finish sooner return immediately. Defaults to 900000 ms; effective range is 250-1200000 ms."
+     };
+     let mut properties = BTreeMap::from([
+         (
+@@ -124,7 +124,7 @@ pub fn create_write_stdin_tool() -> ToolSpec {
+         (
+             "yield_time_ms".to_string(),
+             JsonSchema::number(Some(
+-                "Wait before yielding output. Non-empty writes default to 250 ms and cap at 30000 ms; empty polls wait 5000-300000 ms by default.".to_string(),
++                "Wait before yielding output. Non-empty writes default to 250 ms and cap at 30000 ms; empty polls default to the configured background terminal timeout (1200000 ms in the sandbox), with a 5000 ms minimum.".to_string(),
+             )),
+         ),
+         (
+diff --git a/core/src/tools/handlers/unified_exec.rs b/core/src/tools/handlers/unified_exec.rs
+index ec7a7d2..1d2031b 100644
+--- a/core/src/tools/handlers/unified_exec.rs
++++ b/core/src/tools/handlers/unified_exec.rs
+@@ -111,11 +111,7 @@ impl ExecCommandWorkdirArgs {
+ }
+
+ fn default_exec_yield_time_ms() -> u64 {
+-    10_000
+-}
+-
+-fn default_write_stdin_yield_time_ms() -> u64 {
+-    250
++    900_000
+ }
+
+ fn default_tty() -> bool {
+diff --git a/core/src/tools/handlers/unified_exec/write_stdin.rs b/core/src/tools/handlers/unified_exec/write_stdin.rs
+index ce64c7c..92d7669 100644
+--- a/core/src/tools/handlers/unified_exec/write_stdin.rs
++++ b/core/src/tools/handlers/unified_exec/write_stdin.rs
+@@ -25,8 +25,8 @@ use super::post_unified_exec_tool_use_payload;
+ struct WriteStdinArgs {
+     #[serde(default)]
+     chars: String,
+-    #[serde(default = "super::default_write_stdin_yield_time_ms")]
+-    yield_time_ms: u64,
++    #[serde(default)]
++    yield_time_ms: Option<u64>,
+     #[serde(default)]
+     max_output_tokens: Option<usize>,
+ }
+diff --git a/core/src/unified_exec/mod.rs b/core/src/unified_exec/mod.rs
+index 466af4b..2ccace4 100644
+--- a/core/src/unified_exec/mod.rs
++++ b/core/src/unified_exec/mod.rs
+@@ -70,6 +70,7 @@ pub(crate) const WINDOWS_INITIAL_EXEC_YIELD_TIME_FLOOR_MS: u64 = 10_000;
+ // Minimum yield time for an empty `write_stdin`.
+ pub(crate) const MIN_EMPTY_YIELD_TIME_MS: u64 = 5_000;
+ pub(crate) const MAX_YIELD_TIME_MS: u64 = 30_000;
++pub(crate) const MAX_EXEC_YIELD_TIME_MS: u64 = 1_200_000;
+ pub(crate) const DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS: u64 = 300_000;
+ pub(crate) const DEFAULT_MAX_OUTPUT_TOKENS: usize = 10_000;
+ pub(crate) const UNIFIED_EXEC_OUTPUT_MAX_BYTES: usize = 1024 * 1024; // 1 MiB
+@@ -125,7 +126,7 @@ pub(crate) struct TerminalSession {
+ pub(crate) struct WriteStdinRequest<'a> {
+     pub terminal: &'a TerminalSession,
+     pub input: &'a str,
+-    pub yield_time_ms: u64,
++    pub yield_time_ms: Option<u64>,
+     pub max_output_tokens: Option<usize>,
+     pub truncation_policy: TruncationPolicy,
+     pub interaction_event: Option<WriteStdinInteractionEvent<'a>>,
+@@ -211,7 +212,7 @@ pub(crate) fn clamp_yield_time(yield_time_ms: u64) -> u64 {
+     } else {
+         yield_time_ms
+     };
+-    yield_time_ms.clamp(MIN_YIELD_TIME_MS, MAX_YIELD_TIME_MS)
++    yield_time_ms.clamp(MIN_YIELD_TIME_MS, MAX_EXEC_YIELD_TIME_MS)
+ }
+
+ pub(crate) fn resolve_max_tokens(max_tokens: Option<usize>) -> usize {
+diff --git a/core/src/unified_exec/mod_tests.rs b/core/src/unified_exec/mod_tests.rs
+index 78099dd..420725d 100644
+--- a/core/src/unified_exec/mod_tests.rs
++++ b/core/src/unified_exec/mod_tests.rs
+@@ -328,7 +328,7 @@ async fn write_stdin(
+             WriteStdinRequest {
+                 terminal: &terminal,
+                 input,
+-                yield_time_ms,
++                yield_time_ms: Some(yield_time_ms),
+                 max_output_tokens: None,
+                 truncation_policy: TruncationPolicy::Tokens(10_000),
+                 interaction_event: None,
+@@ -1034,7 +1034,7 @@ async fn stdin_approval_preserves_the_reviewed_terminal() -> anyhow::Result<()>
+             WriteStdinRequest {
+                 terminal: &original,
+                 input: "",
+-                yield_time_ms: 250,
++                yield_time_ms: Some(250),
+                 max_output_tokens: None,
+                 truncation_policy: TruncationPolicy::Tokens(10_000),
+                 interaction_event: None,
+@@ -1087,7 +1087,7 @@ async fn stdin_approval_observes_strict_review_enabled_while_queued() -> anyhow:
+             terminal: &terminal,
+             // NUL input must be rejected when strict review becomes required.
+             input: "\0",
+-            yield_time_ms: 250,
++            yield_time_ms: Some(250),
+             max_output_tokens: None,
+             truncation_policy: TruncationPolicy::Tokens(10_000),
+             interaction_event: None,
+diff --git a/core/src/unified_exec/process_manager.rs b/core/src/unified_exec/process_manager.rs
+index 315dbee..e2a57d0 100644
+--- a/core/src/unified_exec/process_manager.rs
++++ b/core/src/unified_exec/process_manager.rs
+@@ -871,6 +871,18 @@ impl UnifiedExecProcessManager {
+         Ok(response)
+     }
+
++    fn write_stdin_yield_time_ms(&self, input: &str, requested: Option<u64>) -> u64 {
++        if input.is_empty() {
++            requested
++                .unwrap_or(self.max_write_stdin_yield_time_ms)
++                .clamp(MIN_EMPTY_YIELD_TIME_MS, self.max_write_stdin_yield_time_ms)
++        } else {
++            requested
++                .unwrap_or(MIN_YIELD_TIME_MS)
++                .clamp(MIN_YIELD_TIME_MS, MAX_YIELD_TIME_MS)
++        }
++    }
++
+     #[tracing::instrument(
+         name = "unified_exec.write_stdin",
+         level = "info",
+@@ -1041,16 +1053,7 @@ impl UnifiedExecProcessManager {
+             }
+         }
+
+-        let yield_time_ms = {
+-            // Empty polls use configurable background timeout bounds. Non-empty
+-            // writes keep a fixed max cap so interactive stdin remains responsive.
+-            let time_ms = request.yield_time_ms.max(MIN_YIELD_TIME_MS);
+-            if request.input.is_empty() {
+-                time_ms.clamp(MIN_EMPTY_YIELD_TIME_MS, self.max_write_stdin_yield_time_ms)
+-            } else {
+-                time_ms.min(MAX_YIELD_TIME_MS)
+-            }
+-        };
++        let yield_time_ms = self.write_stdin_yield_time_ms(request.input, request.yield_time_ms);
+         let start = Instant::now();
+         let deadline = start + Duration::from_millis(yield_time_ms);
+         let collected_output =
+diff --git a/core/src/unified_exec/process_manager_tests.rs b/core/src/unified_exec/process_manager_tests.rs
+index 602894f..495ad10 100644
+--- a/core/src/unified_exec/process_manager_tests.rs
++++ b/core/src/unified_exec/process_manager_tests.rs
+@@ -310,7 +310,7 @@ fn exec_server_params_use_path_uri_and_env_policy_overlay_contract() {
+ #[cfg(windows)]
+ #[test]
+ fn initial_exec_yield_time_uses_windows_floor() {
+-    let above_max_yield_time_ms = crate::unified_exec::MAX_YIELD_TIME_MS + 1;
++    let above_max_yield_time_ms = crate::unified_exec::MAX_EXEC_YIELD_TIME_MS + 1;
+
+     assert_eq!(
+         clamp_yield_time(/*yield_time_ms*/ 1_000),
+@@ -327,7 +327,7 @@ fn initial_exec_yield_time_uses_windows_floor() {
+     assert_eq!(clamp_yield_time(/*yield_time_ms*/ 10_000), 10_000);
+     assert_eq!(
+         clamp_yield_time(/*yield_time_ms*/ above_max_yield_time_ms),
+-        crate::unified_exec::MAX_YIELD_TIME_MS
++        crate::unified_exec::MAX_EXEC_YIELD_TIME_MS
+     );
+ }
+
+@@ -341,6 +341,22 @@ fn initial_exec_yield_time_has_no_platform_floor() {
+     );
+ }
+
++#[test]
++fn stdin_poll_defaults_to_the_configured_timeout() {
++    let manager = UnifiedExecProcessManager::new(1_200_000);
++    assert_eq!(manager.write_stdin_yield_time_ms("", None), 1_200_000);
++    assert_eq!(manager.write_stdin_yield_time_ms("", Some(250)), 5_000);
++    assert_eq!(
++        manager.write_stdin_yield_time_ms("", Some(1_300_000)),
++        1_200_000
++    );
++    assert_eq!(manager.write_stdin_yield_time_ms("input", None), 250);
++    assert_eq!(
++        manager.write_stdin_yield_time_ms("input", Some(1_300_000)),
++        30_000
++    );
++}
++
+ #[tokio::test]
+ async fn output_collection_stays_bounded_across_repeated_drains() {
+     let chunks: [&[u8]; 4] = [b"01234567", b"89ABCDEF", b"ghijklmnopq", b"rs"];

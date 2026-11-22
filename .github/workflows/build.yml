@@ -1,0 +1,205 @@
+name: Build Codex
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    paths:
+      - 'flake.*'
+      - 'tools/**'
+      - 'install.sh'
+      - '.github/workflows/build.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 100
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+
+      - name: Build patched Codex and record resource use
+        shell: bash
+        run: |
+          samples="$RUNNER_TEMP/codex-memory-mib"
+          sample_memory() { LC_ALL=C free -m | awk '/^Mem:/ { print $3 }'; }
+          sample_memory > "$samples"
+          (while sleep 1; do sample_memory; done) >> "$samples" &
+          sampler=$!
+          trap 'kill "$sampler" 2>/dev/null || true' EXIT
+
+          printf 'Source commit: %s\n' "$(git rev-parse HEAD)"
+          start=$SECONDS
+          status=0
+          nix build .#codex --print-build-logs --max-jobs 1 --cores 8 || status=$?
+          wall=$((SECONDS - start))
+          kill "$sampler" 2>/dev/null || true
+          wait "$sampler" 2>/dev/null || true
+          trap - EXIT
+          peak=$(sort -nr "$samples" | sed -n '1p')
+
+          {
+            printf '### Codex build\n\n'
+            printf -- '- Build time: %s seconds\n' "$wall"
+            printf -- '- Peak runner memory used during build: %s MiB (free -m sampled every second)\n' "$peak"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          exit "$status"
+
+      - name: Check the binaries and patched Rust tests
+        shell: bash
+        run: |
+          version=$(result/bin/codex --version)
+          printf '%s\n' "$version"
+          test "$version" = 'codex-cli 0.170.0'
+          test -x result/bin/codex-code-mode-host
+          printf 'codex-code-mode-host is executable\n'
+
+          nix log .#codex > "$RUNNER_TEMP/codex-build.log"
+          grep -E '^test unified_exec::.* \.\.\. ok$' "$RUNNER_TEMP/codex-build.log"
+          grep -E '^test result: ok\. 4 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/codex-build.log"
+
+      - name: Package and measure the runtime closure
+        shell: bash
+        run: |
+          out="$RUNNER_TEMP/codex-release"
+          metadata="$RUNNER_TEMP/codex-metadata"
+          mkdir -p "$out" "$metadata"
+          version=$(nix eval --raw .#codex.version)
+          patchlevel=$(cat tools/codex/PATCHLEVEL)
+          tag="codex-${version}-${patchlevel}"
+          asset="$tag-x86_64-linux.tar.zst"
+          store_path=$(readlink -f result)
+          nixpkgs_rev=$(jq -er '.nodes.nixpkgs.locked.rev' flake.lock)
+          source_commit=$(git rev-parse HEAD)
+
+          jq -n --arg store_path "$store_path" \
+            '{store_path: $store_path, bins: ["codex", "codex-code-mode-host"]}' \
+            > "$metadata/manifest.json"
+          nix-store -qR "$store_path" | LC_ALL=C sort | sed 's|^/||' \
+            > "$RUNNER_TEMP/codex-closure"
+          # Normalize archive metadata and ignore incidental store hard links.
+          tar --create --zstd --file "$out/$asset" --format=gnu --sort=name \
+            --mtime=@0 --owner=0 --group=0 --numeric-owner --hard-dereference \
+            -C / --files-from "$RUNNER_TEMP/codex-closure" -C "$metadata" manifest.json
+
+          (cd "$out" && sha256sum "$asset" > "$asset.sha256")
+          read -r sha256 _ < "$out/$asset.sha256"
+          jq --arg version "$version" --arg patchlevel "$patchlevel" \
+            --arg nixpkgs_rev "$nixpkgs_rev" --arg source_commit "$source_commit" \
+            --arg sha256 "$sha256" \
+            '. + {tool: "codex", version: $version, patchlevel: $patchlevel,
+              nixpkgs_rev: $nixpkgs_rev, source_commit: $source_commit, sha256: $sha256}' \
+            "$metadata/manifest.json" > "$out/manifest.json"
+
+          packed=$(stat -c %s "$out/$asset")
+          unpacked=$(zstd -dc "$out/$asset" | wc -c)
+          delta=$((unpacked - 408000000))
+          {
+            printf '\n### Runtime closure\n\n'
+            printf -- '- Packed: %s bytes\n' "$packed"
+            printf -- '- Unpacked tar stream: %s bytes\n' "$unpacked"
+            printf -- '- Difference from the 408 MB npm Codex footprint: %+d bytes\n' "$delta"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          if (( delta > 250000000 )); then
+            echo '::warning::The unpacked closure is over 250 MB larger than the npm Codex footprint.'
+          fi
+
+      - name: Install and run both binaries in Ubuntu without Nix
+        shell: bash
+        run: |
+          out="$RUNNER_TEMP/codex-release"
+          sha_file=("$out"/*.tar.zst.sha256)
+          read -r sha256 asset < "${sha_file[0]}"
+
+          docker run --rm \
+            --mount "type=bind,source=$out,target=/release,readonly" \
+            --mount "type=bind,source=$PWD/install.sh,target=/install.sh,readonly" \
+            ubuntu:24.04 sh -eu -c '
+              if command -v nix; then exit 1; fi
+              apt-get update -qq
+              apt-get install -y -qq --no-install-recommends ca-certificates curl jq zstd
+              url="file:///release/$1"
+              if sh /install.sh "$url" "$(printf "%064d" 0)" >/tmp/bad-sha.log 2>&1; then
+                echo "Installer accepted a wrong SHA-256" >&2
+                exit 1
+              fi
+              grep -F "SHA-256 mismatch" /tmp/bad-sha.log
+              test ! -e /nix/store
+              sh /install.sh "$url" "$2"
+              version=$(codex --version)
+              printf "%s\n" "$version"
+              test "$version" = "codex-cli 0.170.0"
+              codex-code-mode-host --help
+            ' sh "$asset" "$sha256"
+
+      - name: Save tested release files
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: codex-release
+          path: ${{ runner.temp }}/codex-release/
+          if-no-files-found: error
+          compression-level: 0
+
+  release:
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    needs: build
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    permissions:
+      contents: write
+    concurrency:
+      group: codex-release
+      cancel-in-progress: false
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: codex-release
+          path: release
+
+      - name: Publish the immutable release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        working-directory: release
+        run: |
+          tag=$(jq -er '"codex-" + .version + "-" + .patchlevel' manifest.json)
+          asset="$tag-x86_64-linux.tar.zst"
+          sha256sum --check "$asset.sha256"
+          read -r sha256 _ < "$asset.sha256"
+          test "$(jq -er .sha256 manifest.json)" = "$sha256"
+          test "$(jq -er .source_commit manifest.json)" = "$GITHUB_SHA"
+
+          # Query all releases, including drafts. API errors fail the step.
+          releases=$(gh api --paginate "repos/$GH_REPO/releases" \
+            --jq ".[] | select(.tag_name == \"$tag\")")
+          if [[ -n "$releases" ]]; then
+            digest=$(jq -r --arg asset "$asset" \
+              'select(.draft == false) | .assets[] | select(.name == $asset) | .digest // ""' \
+              <<< "$releases")
+            if [[ "$digest" == "sha256:$sha256" ]]; then
+              printf 'Release %s already has SHA-256 %s. Skipping.\n' "$tag" "$sha256"
+              exit 0
+            fi
+            echo "::error::Release $tag exists without the matching published asset. Resolve the draft or bump PATCHLEVEL."
+            exit 1
+          fi
+
+          tags=$(gh api --paginate "repos/$GH_REPO/git/matching-refs/tags/$tag" \
+            --jq ".[] | select(.ref == \"refs/tags/$tag\") | .ref")
+          if [[ -n "$tags" ]]; then
+            echo "::error::Tag $tag already exists without a release. Bump PATCHLEVEL."
+            exit 1
+          fi
+
+          gh release create "$tag" "$asset" "$asset.sha256" manifest.json \
+            --target "$GITHUB_SHA" --title "$tag" \
+            --notes "Codex runtime closure for Linux x86_64. [Build and measurements](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID})."
