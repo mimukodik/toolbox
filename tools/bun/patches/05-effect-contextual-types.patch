@@ -617,10 +617,10 @@ index 0000000..2dda03e
 +}
 diff --git a/src/lint/plugins/effect/rules/bun_effect_in_void_success.rs b/src/lint/plugins/effect/rules/bun_effect_in_void_success.rs
 new file mode 100644
-index 0000000..18c50bc
+index 0000000..f1e16ed
 --- /dev/null
 +++ b/src/lint/plugins/effect/rules/bun_effect_in_void_success.rs
-@@ -0,0 +1,82 @@
+@@ -0,0 +1,83 @@
 +use crate::effect::{
 +    expected_and_real_type::{self, ExpectedTypes},
 +    report, type_parser,
@@ -645,6 +645,7 @@ index 0000000..18c50bc
 +        }
 +        ExpectedTypes::OverloadReturns(returns) => {
 +            // In the union's success channel, never contributes no members.
++            // An all-nullish return list in loose mode cannot have Effect success.
 +            let mut distinct = false;
 +            let mut has_void = false;
 +            for ty in returns.into_iter().filter(|ty| !ty.has_flags(ignored_returns)) {
@@ -673,7 +674,7 @@ index 0000000..18c50bc
 +        let ignored_returns = if checker.compiler_options().strict_null_checks {
 +            TypeFlags::NEVER
 +        } else {
-+            TypeFlags::NEVER | TypeFlags::UNDEFINED
++            TypeFlags::NEVER | TypeFlags::NULL | TypeFlags::UNDEFINED
 +        };
 +        let root = checker.ts_node(file);
 +        expected_and_real_type::visit(root, |pair| {
@@ -891,10 +892,10 @@ index 6637e63..ee7f98b 100644
  
  pub(super) fn catch_return_types<'a>(
 diff --git a/test/cli/lint/effect.test.ts b/test/cli/lint/effect.test.ts
-index 4214510..47f91dd 100644
+index 4214510..9a1b0b1 100644
 --- a/test/cli/lint/effect.test.ts
 +++ b/test/cli/lint/effect.test.ts
-@@ -491,3 +491,135 @@ declare const object: { readonly a: number };
+@@ -491,3 +491,137 @@ declare const object: { readonly a: number };
      ]);
    });
  });
@@ -979,21 +980,23 @@ index 4214510..47f91dd 100644
 +    expect(exitCode).toBe(1);
 +  });
 +
-+  test.concurrent("drops bare undefined overload returns only without strict null checks", async () => {
-+    const source = [
-+      'import { Effect } from "effect";',
-+      'function job(mode: "run"): Effect.Effect<void>;',
-+      'function job(mode: "skip"): undefined;',
-+      'function job(mode: "run" | "skip"): Effect.Effect<void> | undefined {',
-+      '  if (mode === "skip") return undefined;',
-+      "  return Effect.succeed(Effect.succeed(42));",
-+      "}",
-+    ].join("\n");
++  test.concurrent("drops bare nullish overload returns only without strict null checks", async () => {
 +    const severity = { effectInVoidSuccess: "error" };
-+    const strict = await lint(project(source, severity), ["a.ts"]);
-+    expect(expectedLocations(strict.stdout, "effect-in-void-success")).toEqual([]);
-+    const loose = await lint(project(source, severity, false), ["a.ts"]);
-+    expect(expectedLocations(loose.stdout, "effect-in-void-success")).toEqual(["6:3"]);
++    for (const skipped of ["null", "undefined"]) {
++      const source = [
++        'import { Effect } from "effect";',
++        'function job(mode: "run"): Effect.Effect<void>;',
++        `function job(mode: "skip"): ${skipped};`,
++        `function job(mode: "run" | "skip"): Effect.Effect<void> | ${skipped} {`,
++        `  if (mode === "skip") return ${skipped};`,
++        "  return Effect.succeed(Effect.succeed(42));",
++        "}",
++      ].join("\n");
++      const strict = await lint(project(source, severity), ["a.ts"]);
++      expect(expectedLocations(strict.stdout, "effect-in-void-success")).toEqual([]);
++      const loose = await lint(project(source, severity, false), ["a.ts"]);
++      expect(expectedLocations(loose.stdout, "effect-in-void-success")).toEqual(["6:3"]);
++    }
 +  });
 +
 +  test.concurrent("reports run APIs in Effect generators and platform runMain in thunks", async () => {
