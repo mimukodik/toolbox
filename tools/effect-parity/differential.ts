@@ -12,7 +12,7 @@ import {
 const relationMode = "relation-positions";
 const overloadRecovery = "relation-overload-recovery";
 const earlierPipeStage = "earlier-pipe-stage";
-const duplicateReference = "duplicate-reference";
+const extraReferenceSubset = "extra-reference-subset";
 const modes = ["single-config", "extends-plugin", "global-error", "rule-configuration", optionalPipeReceiverKind, relationMode] as const;
 type Mode = typeof modes[number];
 type Case = Mutation & { file: string; fixture: string; expectedRule?: string; expectedReports?: number };
@@ -498,22 +498,29 @@ function diagnosticSite({ fixture, file, line, col, rule }: Diagnostic): string 
   return JSON.stringify([fixture, file, line, col, rule]);
 }
 
-function diagnosticKey(diagnostic: Diagnostic): string {
-  return JSON.stringify([diagnosticSite(diagnostic), diagnostic.severity, diagnostic.message]);
+function missingErrorMembers(message: string): Set<string> | undefined {
+  const errors = /^Missing errors (.+) in the expected Effect type\.$/.exec(message)?.[1];
+  // The rule joins its formatted members with this delimiter.
+  return errors ? new Set(errors.split(" | ")) : undefined;
 }
 
-function duplicateReferenceReports(reference: Diagnostic[], candidate: Diagnostic[]): Map<string, number> {
+function referenceSubsetSites(reference: Diagnostic[], candidate: Diagnostic[]): Set<string> {
   const candidateBySite = Map.groupBy(candidate, diagnosticSite);
-  const duplicates = new Map<string, number>();
+  const sites = new Set<string>();
   for (const [site, expected] of Map.groupBy(reference, diagnosticSite)) {
     const actual = candidateBySite.get(site);
     if (expected.length !== 2 || actual?.length !== 1) continue;
-    const key = diagnosticKey(actual[0]);
-    if (expected.every((report) => diagnosticKey(report) === key)) {
-      duplicates.set(key, expected.length - actual.length);
+    const [report] = actual;
+    if (report.rule !== "missingEffectError" || expected.some(({ severity }) => severity !== report.severity)) continue;
+    if (!expected.some(({ message }) => message === report.message)) continue;
+    const other = expected.find(({ message }) => message !== report.message);
+    const full = missingErrorMembers(report.message);
+    const subset = other && missingErrorMembers(other.message);
+    if (full && subset && subset.size < full.size && [...subset].every((member) => full.has(member))) {
+      sites.add(site);
     }
   }
-  return duplicates;
+  return sites;
 }
 
 function documentedMechanisms(): DocumentedTag[] {
@@ -526,7 +533,7 @@ function documentedMechanisms(): DocumentedTag[] {
     const names = Array.from(cell.matchAll(/`([^`]+)`/g), ([, tag]) => tag);
     if (!names.includes(anchor)) throw new Error(`Missing differential tag on documented difference ${anchor}.`);
     for (const name of names) {
-      const match = /^([a-z][a-z0-9-]*)(?::(\*|[a-zA-Z][a-zA-Z0-9]*)(?::(missing|extra|earlier-pipe-stage|duplicate-reference|severity (?:error|warning)→(?:error|warning)))?)?$/.exec(name);
+      const match = /^([a-z][a-z0-9-]*)(?::(\*|[a-zA-Z][a-zA-Z0-9]*)(?::(missing|extra|earlier-pipe-stage|extra-reference-subset|severity (?:error|warning)→(?:error|warning)))?)?$/.exec(name);
       if (!match) throw new Error(`Invalid differential tag on documented difference ${anchor}: ${name}`);
       const [, mechanism, rule = "*", outcome] = match;
       tags.push({ anchor, mechanism, rule, outcome });
@@ -754,7 +761,7 @@ try {
     const expected = reference.get(mode) ?? [];
     const actual = candidate.get(mode) ?? [];
     const { agreements, differences } = compare(expected, actual);
-    const duplicates = mode === relationMode ? duplicateReferenceReports(expected, actual) : new Map<string, number>();
+    const subsetSites = mode === relationMode ? referenceSubsetSites(expected, actual) : new Set<string>();
     const declaredTypeMove = substitutedConditionalMove(differences);
     const recoveryMoves = mode === "single-config" || mode === "extends-plugin"
       ? missingContextPipeMoves(differences, byFile) : new Set<Difference>();
@@ -773,13 +780,10 @@ try {
       const applicableTags = mechanism === pipeableDeclaredTypes && !declaredTypeMove.includes(difference) ? [] : tags;
       let outcome: string | undefined;
       if (recoveryMove) outcome = earlierPipeStage;
-      if (difference.reference && !difference.candidate) {
-        const key = diagnosticKey(difference.reference);
-        const excess = duplicates.get(key) ?? 0;
-        if (excess > 0) {
-          duplicates.set(key, excess - 1);
-          outcome = duplicateReference;
-        }
+      // Location matching can consume either reference report. Classify the
+      // surplus copy using the two reference messages and Bun's full message.
+      if (difference.reference && !difference.candidate && subsetSites.has(diagnosticSite(difference.reference))) {
+        outcome = extraReferenceSubset;
       }
       const result = classify(applicableTags, mechanism, difference, outcome);
       const finding: Finding = { ...difference, mode, mechanism, seed: sample.fixture, ...result };
