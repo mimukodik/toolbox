@@ -51,11 +51,12 @@ revision alongside the parity evidence. Set `regenerate_rule_docs` to run
 `bun src/codegen/lint-rule-docs.ts --write` with that same candidate and check
 that it reproduces the patched rule pages, index, and example reports.
 
-The candidate gate requires all 195 locations reported by Oxlint across the
-[19 Bun Effect rules](../bun/README.md), with zero extras and zero fixture
-execution or parsing failures. Against the direct compiler it requires 195 of
-218 locations, exact agreement on the set of 35 lower-severity omissions
-described above, zero extras, and matching severity at every shared location.
+The candidate gate checks all 195 Oxlint diagnostics across the
+[19 Bun Effect rules](../bun/README.md). It requires 194 exact locations, the
+[listed pipe-stage move](../bun/effect-port-differences.md#relation-overload-recovery),
+and zero fixture execution or parsing failures. Against the direct compiler
+it requires the same locations and move, the exact 35 lower-severity
+omissions described above, and matching severity at every shared location.
 Oxlint formats the compiler's warnings as errors in Unix output.
 
 ## Generated differential

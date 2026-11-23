@@ -4,9 +4,14 @@ import { basename, dirname, join, relative } from "node:path";
 import { type Diagnostic, parseTypeScript } from "./diagnostics";
 import { discoverFixtures, type Fixture, layOutFixture } from "./fixtures";
 import { effectAlias, type Mutation, optionalPipeReceiverKind } from "./mutations";
-import { compareLocations, exposeReferencePackages, gatedBunRules, gatedDiagnostics, runPass } from "./score";
+import {
+  compareLocations, exposeReferencePackages, gatedBunRules, gatedDiagnostics,
+  isMissingContextPipeDiagnostic, missingContextPipe, runPass,
+} from "./score";
 
 const relationMode = "relation-positions";
+const overloadRecovery = "relation-overload-recovery";
+const earlierPipeStage = "earlier-pipe-stage";
 const modes = ["single-config", "extends-plugin", "global-error", "rule-configuration", optionalPipeReceiverKind, relationMode] as const;
 type Mode = typeof modes[number];
 type Case = Mutation & { file: string; fixture: string; expectedRule?: string };
@@ -443,7 +448,7 @@ function documentedMechanisms(): DocumentedTag[] {
     const names = Array.from(cell.matchAll(/`([^`]+)`/g), ([, tag]) => tag);
     if (!names.includes(anchor)) throw new Error(`Missing differential tag on documented difference ${anchor}.`);
     for (const name of names) {
-      const match = /^([a-z][a-z0-9-]*)(?::(\*|[a-zA-Z][a-zA-Z0-9]*)(?::(missing|extra|severity (?:error|warning)→(?:error|warning)))?)?$/.exec(name);
+      const match = /^([a-z][a-z0-9-]*)(?::(\*|[a-zA-Z][a-zA-Z0-9]*)(?::(missing|extra|earlier-pipe-stage|severity (?:error|warning)→(?:error|warning)))?)?$/.exec(name);
       if (!match) throw new Error(`Invalid differential tag on documented difference ${anchor}: ${name}`);
       const [, mechanism, rule = "*", outcome] = match;
       tags.push({ anchor, mechanism, rule, outcome });
@@ -457,9 +462,9 @@ function matchingTags(tags: DocumentedTag[], mechanism: string, rule: string): D
   return tags.filter((tag) => tag.mechanism === mechanism && (tag.rule === rule || tag.rule === "*"));
 }
 
-function classify(tags: DocumentedTag[], mechanism: string, { reference, candidate }: Difference) {
+function classify(tags: DocumentedTag[], mechanism: string, { reference, candidate }: Difference, pairedOutcome?: string) {
   const { rule } = (reference ?? candidate)!;
-  const outcome = !candidate ? "missing" : !reference ? "extra" : `severity ${reference.severity}→${candidate.severity}`;
+  const outcome = pairedOutcome ?? (!candidate ? "missing" : !reference ? "extra" : `severity ${reference.severity}→${candidate.severity}`);
   const listedBy = matchingTags(tags, mechanism, rule)
     .filter((tag) => tag.outcome === outcome)
     .map(({ anchor }) => anchor);
@@ -479,6 +484,29 @@ function substitutedConditionalMove(differences: Difference[]): Difference[] {
   const missing = differences.find(({ reference, candidate }) => !candidate && at(reference, site.syncColumn));
   const extra = differences.find(({ reference, candidate }) => !reference && at(candidate, site.subjectColumn));
   return missing && extra ? [missing, extra] : [];
+}
+
+function missingContextPipeMoves(differences: Difference[], byFile: Map<string, Case>): Set<Difference> {
+  const relevant = differences.filter((difference) => {
+    const { file, rule } = (difference.reference ?? difference.candidate)!;
+    return rule === missingContextPipe.rule && byFile.get(file)?.fixture === missingContextPipe.fixture;
+  });
+  const bySource = Map.groupBy(relevant, (difference) => (difference.reference ?? difference.candidate)!.file);
+  const moves = new Set<Difference>();
+  for (const [file, entries] of bySource) {
+    if (entries.length !== 2) continue;
+    // The namespace-import mutation inserts one line before both stages.
+    const offset = byFile.get(file)!.kind === "import-namespace" ? 1 : 0;
+    const missing = entries.find(({ reference, candidate }) =>
+      reference && !candidate && isMissingContextPipeDiagnostic(reference, "reference", offset));
+    const extra = entries.find(({ reference, candidate }) =>
+      !reference && candidate && isMissingContextPipeDiagnostic(candidate, "candidate", offset));
+    if (missing && extra) {
+      moves.add(missing);
+      moves.add(extra);
+    }
+  }
+  return moves;
 }
 
 class ClassifierSelfTestError extends Error {}
@@ -641,12 +669,14 @@ try {
 
   const kindCounts = Map.groupBy(allCases, ({ kind }) => kind);
   const mechanisms = [...new Set([
-    ...kindCounts.keys(), ...modes, "pipe-form", "data-call-form",
+    ...kindCounts.keys(), ...modes, overloadRecovery, "pipe-form", "data-call-form",
     "package-manifest", "checker-type-query", "floating-statement-hook",
   ])].sort();
   for (const mode of modes) {
     const { agreements, differences } = compare(reference.get(mode) ?? [], candidate.get(mode) ?? []);
     const declaredTypeMove = substitutedConditionalMove(differences);
+    const recoveryMoves = mode === "single-config" || mode === "extends-plugin"
+      ? missingContextPipeMoves(differences, byFile) : new Set<Difference>();
     for (const agreement of agreements) {
       const kind = byFile.get(agreement.file)!.kind;
       tally(mode === "single-config" || mode === relationMode ? kind : mode, agreement.rule, "agreements");
@@ -656,9 +686,11 @@ try {
       const sample = byFile.get(file)!;
       const key = disagreementKey(difference);
       if (mode === "single-config") controlDifferences.add(key);
-      const mechanism = mode === relationMode || controlDifferences.has(key) ? sample.kind : mode;
+      const recoveryMove = recoveryMoves.has(difference);
+      const defaultMechanism = mode === relationMode || controlDifferences.has(key) ? sample.kind : mode;
+      const mechanism = recoveryMove ? overloadRecovery : defaultMechanism;
       const applicableTags = mechanism === pipeableDeclaredTypes && !declaredTypeMove.includes(difference) ? [] : tags;
-      const result = classify(applicableTags, mechanism, difference);
+      const result = classify(applicableTags, mechanism, difference, recoveryMove ? earlierPipeStage : undefined);
       const finding: Finding = { ...difference, mode, mechanism, seed: sample.fixture, ...result };
       findings.push(finding);
       tally(mechanism, rule, finding.classification);

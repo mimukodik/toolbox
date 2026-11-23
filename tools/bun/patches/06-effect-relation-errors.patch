@@ -764,7 +764,7 @@ diff --git a/test/cli/lint/effect.test.ts b/test/cli/lint/effect.test.ts
 index 9a1b0b1b..21c7e662 100644
 --- a/test/cli/lint/effect.test.ts
 +++ b/test/cli/lint/effect.test.ts
-@@ -625,3 +625,43 @@ describe("Effect v4 expected types and runtime contexts", () => {
+@@ -625,3 +625,92 @@ describe("Effect v4 expected types and runtime contexts", () => {
      expect(exitCode).toBe(0);
    });
  });
@@ -805,6 +805,55 @@ index 9a1b0b1b..21c7e662 100644
 +    expect(errors[0]).toContain("Missing errors Second in the expected Effect type.");
 +    expect(errors[1]).toContain("expected Effect context: `Second`.");
 +    expect(errors[2]).toContain("Missing 'Second' in the expected Layer context.");
++    expect(exitCode).toBe(1);
++  });
++
++  test.concurrent("pins the listed missingEffectContext difference on an earlier pipe stage", async () => {
++    // The reference reports at runPromise. Bun reports at provide when pipe overload resolution fails.
++    const code = [
++      'interface Pipeable {',
++      '  pipe<A>(this: A): A;',
++      '  pipe<A, B = never>(this: A, ab: (_: A) => B): B;',
++      '  pipe<A, B = never, C = never>(this: A, ab: (_: A) => B, bc: (_: B) => C): C;',
++      '  pipe<A, B = never, C = never, D = never>(this: A, ab: (_: A) => B, bc: (_: B) => C, cd: (_: C) => D): D;',
++      '}',
++      'interface Effect<out A, out E = never, out R = never> extends Pipeable {',
++      '  readonly "~effect/Effect": { _A: () => A; _E: () => E; _R: () => R };',
++      '}',
++      'interface Layer<in Out, out E, out R> {',
++      '  readonly "~effect/Layer": { _ROut: (_: Out) => void; _E: () => E; _RIn: () => R };',
++      '}',
++      'interface DbConnection { readonly db: unique symbol }',
++      'interface FileSystem { readonly fs: unique symbol }',
++      'interface Scope { readonly scope: unique symbol }',
++      'interface UserRepository { readonly repository: unique symbol }',
++      'declare namespace Effect {',
++      '  function provide<Out, E2, In>(layer: Layer<Out, E2, In>):',
++      '    <A, E, R>(self: Effect<A, E, R>) => Effect<A, E | E2, In | Exclude<R, Out>>;',
++      '  function provide<A, E, R, Out, E2, In>(self: Effect<A, E, R>, layer: Layer<Out, E2, In>):',
++      '    Effect<A, E | E2, In | Exclude<R, Out>>;',
++      '  function scoped<A, E, R>(self: Effect<A, E, R>): Effect<A, E, Exclude<R, Scope>>;',
++      '  function runPromise<A, E>(effect: Effect<A, E>, options?: { signal?: unknown }): Promise<A>;',
++      '}',
++      'declare const liveWithPipeable: Layer<DbConnection | UserRepository, never, DbConnection>;',
++      'declare const program: Effect<{}, never, FileSystem | Scope>;',
++      'export const result = program.pipe(',
++      '    Effect.provide(liveWithPipeable),',
++      '    Effect.scoped,',
++      '    Effect.runPromise',
++      ');',
++    ].join("\n");
++    const files = {
++      ".oxlintrc.json": JSON.stringify({ options: { typeAware: true }, categories: { correctness: "off" } }),
++      "tsconfig.json": JSON.stringify({
++        compilerOptions: { ...options, strict: true, plugins: [{ name: "@effect/language-service" }] },
++      }),
++      "pipe.ts": code,
++    };
++    const { errors, exitCode } = await lint(files, ["pipe.ts"]);
++    expect(errors).toEqual([
++      "28:5 This Effect requires a service that is missing from the expected Effect context: `FileSystem | Scope`.",
++    ]);
 +    expect(exitCode).toBe(1);
 +  });
 +});
