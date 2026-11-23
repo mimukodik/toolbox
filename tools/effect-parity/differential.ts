@@ -36,6 +36,7 @@ function publish(lines: string[], title = "Effect lint differential"): void {
 }
 
 const pipeableDeclaredTypes = "pipeable-declared-types";
+const substitutedConditionalVariant = "reordered-conditional-substituted";
 
 // Keep the reference fixtures' overload shapes and lift their results into
 // Promise-returning thunks so the lint range reveals normalized pipe steps.
@@ -75,7 +76,7 @@ const inlineBranch = "{ readonly value: [C] extends [never] ? B : C }";
 const reorderedProbes = [
   { variant: "reordered-fixture", first: "B | C", last: "C | B" },
   { variant: "reordered-conditional-inline", first: inlineBranch, last: inlineBranch },
-  { variant: "reordered-conditional-substituted", first: inlineBranch,
+  { variant: substitutedConditionalVariant, first: inlineBranch,
     last: '{ readonly value: Branches<C, B>["value"] }' },
 ].map(({ variant, first, last }) => overloadProbe("pipingFlows_dataFirstOverloads.ts", variant, `
 interface Box<A> { readonly value: A }
@@ -303,6 +304,20 @@ function classify(tags: DocumentedTag[], mechanism: string, { reference, candida
   return { classification, listedBy } as const;
 }
 
+// A missing warning alone is a regression. The tags cover the paired move
+// on this probe's data-first call.
+function substitutedConditionalMove(differences: Difference[]): Difference[] {
+  const { sample, sites: [site] } = reorderedProbes.find(
+    ({ sample }) => basename(sample.file, ".ts") === substitutedConditionalVariant,
+  )!;
+  const at = (diagnostic: Diagnostic | undefined, column: number) =>
+    diagnostic?.file === `/.src/${sample.file}` && diagnostic.rule === "lazyPromiseInEffectSync"
+      && diagnostic.severity === "warning" && diagnostic.line === site.line && diagnostic.col === column;
+  const missing = differences.find(({ reference, candidate }) => !candidate && at(reference, site.syncColumn));
+  const extra = differences.find(({ reference, candidate }) => !reference && at(candidate, site.subjectColumn));
+  return missing && extra ? [missing, extra] : [];
+}
+
 class ClassifierSelfTestError extends Error {}
 
 function checkClassifier(tags: DocumentedTag[]): void {
@@ -404,7 +419,7 @@ function formatGapEvidence(
     ...(skippedTsx.length ? [`  These copies still failed TSX parsing: ${skippedTsx.join(", ")}.`] : []),
     initializers.length
       ? `- \`floating-statement-hook\` runs ${initializers.length} variants. Both linters stayed silent on the initializer in ${silent.length} of them.`
-      : "- `floating-statement-hook` has no eligible seed with an existing classic for loop and an expression or empty initializer.",
+      : "- `floating-statement-hook` has 0 cases. No seed in the pinned corpus has a classic `for` loop, so the initializer mutation is out of reach.",
     "",
   ];
 }
@@ -463,6 +478,7 @@ try {
   ])].sort();
   for (const mode of modes) {
     const { agreements, differences } = compare(reference.get(mode) ?? [], candidate.get(mode) ?? []);
+    const declaredTypeMove = substitutedConditionalMove(differences);
     for (const agreement of agreements) {
       const kind = byFile.get(agreement.file)!.kind;
       tally(mode === "single-config" ? kind : mode, agreement.rule, "agreements");
@@ -473,7 +489,8 @@ try {
       const key = disagreementKey(difference);
       if (mode === "single-config") controlDifferences.add(key);
       const mechanism = controlDifferences.has(key) ? sample.kind : mode;
-      const result = classify(tags, mechanism, difference);
+      const applicableTags = mechanism === pipeableDeclaredTypes && !declaredTypeMove.includes(difference) ? [] : tags;
+      const result = classify(applicableTags, mechanism, difference);
       const finding: Finding = { ...difference, mode, mechanism, seed: sample.fixture, ...result };
       findings.push(finding);
       tally(mechanism, rule, finding.classification);
@@ -519,6 +536,7 @@ try {
     ] : []),
     "Agreements count identical visible diagnostic tuples. A severity change at one location counts as one disagreement.",
     "A listed difference matches a documented prediction for its mechanism, rule, and outcome.",
+    "The declaration-level pipeable tags cover the paired warning move on the substituted data-first probe.",
     "A disagreement repeated in the inherited config is counted under its original mutation. Agreements there appear under the config name.", "",
     ...formatGapEvidence(
       kindCounts, Map.groupBy(compilerDiagnostics, ({ fixture }) => fixture),
