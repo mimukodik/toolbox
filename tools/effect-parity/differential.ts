@@ -141,6 +141,13 @@ export function inspectJob(detail: false): Effect.Effect<void>;
 export function inspectJob(detail: true): Effect.Effect<number>;
 export function inspectJob(detail: boolean): Effect.Effect<void> | Effect.Effect<number> {
   return ${nestedEffect};
+}
+
+export function job(mode: "run"): Effect.Effect<void>;
+export function job(mode: "stop"): Effect.Effect<never>;
+export function job(mode: "run" | "stop"): Effect.Effect<void> {
+  if (mode === "stop") return Effect.never;
+  return ${nestedEffect};
 }`,
   },
 ].map(({ kind, source }) => ({
@@ -152,7 +159,7 @@ ${source}
 }));
 
 const runtimeProbe: Mutation = {
-  kind: "runtime-api-callee",
+  kind: "effect-runner-alias",
   source: `// @effect-diagnostics runEffectInsideEffect:warning
 import { Effect } from "effect";
 

@@ -91,9 +91,10 @@ member. The report shows where `lazyPromiseInEffectSync` lands on each form.
 
 The expected/real type probes move the fixture’s nested Effect between an
 annotated and inferred const, a function return, a typed argument, and
-overloads with matching or mixed success channels. The runtime probe checks a
-local alias of an Effect runner. The report includes the diagnostic locations
-from all three engines.
+overloads with matching, mixed, or `void` and `never` success channels. The
+`effect-runner-alias` probe checks a local alias of `Effect.runSync`. The fixture
+gate and Bun suite cover platform `runMain`. The report includes the diagnostic
+locations from all three engines.
 
 The same corpus runs in a single-config project and in a project whose
 child config redeclares the base config's plugin by name.

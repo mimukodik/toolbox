@@ -255,14 +255,14 @@ index 5681539..0d89ba1 100644
      (b"effectTryWithoutCatch", b"bun/effect-try-without-catch", Off),
 diff --git a/src/lint/plugins/effect/expected_and_real_type.rs b/src/lint/plugins/effect/expected_and_real_type.rs
 new file mode 100644
-index 0000000..51483e6
+index 0000000..640928b
 --- /dev/null
 +++ b/src/lint/plugins/effect/expected_and_real_type.rs
-@@ -0,0 +1,184 @@
+@@ -0,0 +1,160 @@
 +// Adapted from Effect's MIT-licensed ets_typeparser at 0e722d359c969bdf1b1316f08e8637022cde3cce.
 +use super::generator_context::{call_syntax, containing_function, function_syntax};
 +use bun_lint::ast::{FnBody, Node};
-+use bun_lint::types::{SyntaxKind as Kind, TsNode, TsSymbol, Type, TypeFlags};
++use bun_lint::types::{SyntaxKind as Kind, TsNode, TsSymbol, Type};
 +use std::collections::VecDeque;
 +
 +pub(super) struct Pair<'a> {
@@ -419,30 +419,6 @@ index 0000000..51483e6
 +    }
 +}
 +
-+impl<'a> ExpectedTypes<'a> {
-+    pub(super) fn any_distinct_and_all_match(
-+        self,
-+        real: Type<'a>,
-+        matches: impl Fn(Type<'a>) -> bool,
-+    ) -> bool {
-+        match self {
-+            Self::Single(ty) => ty != real && matches(ty),
-+            Self::OverloadReturns(returns) => {
-+                let mut distinct = false;
-+                for ty in returns
-+                    .into_iter()
-+                    .filter(|ty| !ty.has_flags(TypeFlags::NEVER))
-+                {
-+                    distinct |= ty != real;
-+                    if !matches(ty) {
-+                        return false;
-+                    }
-+                }
-+                distinct
-+            }
-+        }
-+    }
-+}
 diff --git a/src/lint/plugins/effect/generator_context.rs b/src/lint/plugins/effect/generator_context.rs
 index 9281c72..71ae53f 100644
 --- a/src/lint/plugins/effect/generator_context.rs
@@ -641,11 +617,14 @@ index 0000000..2dda03e
 +}
 diff --git a/src/lint/plugins/effect/rules/bun_effect_in_void_success.rs b/src/lint/plugins/effect/rules/bun_effect_in_void_success.rs
 new file mode 100644
-index 0000000..cdd55a3
+index 0000000..18c50bc
 --- /dev/null
 +++ b/src/lint/plugins/effect/rules/bun_effect_in_void_success.rs
-@@ -0,0 +1,48 @@
-+use crate::effect::{expected_and_real_type, report, type_parser};
+@@ -0,0 +1,82 @@
++use crate::effect::{
++    expected_and_real_type::{self, ExpectedTypes},
++    report, type_parser,
++};
 +use bun_lint::prelude::*;
 +use bun_lint::types::{Type, TypeFlags};
 +
@@ -654,8 +633,33 @@ index 0000000..cdd55a3
 +    "There is a nested '{{type}}' in the 'void' success channel, beware that this could lead to nested Effect<Effect<...>> that won't be executed.",
 +);
 +
-+fn has_void_success(ty: Type<'_>) -> bool {
-+    type_parser::effect(ty).is_some_and(|effect| effect.output.has_flags(TypeFlags::VOID))
++fn has_expected_void_success<'a>(
++    expected: ExpectedTypes<'a>,
++    real: Type<'a>,
++    ignored_returns: TypeFlags,
++) -> bool {
++    match expected {
++        ExpectedTypes::Single(ty) => {
++            ty != real
++                && type_parser::effect(ty).is_some_and(|effect| effect.output.has_flags(TypeFlags::VOID))
++        }
++        ExpectedTypes::OverloadReturns(returns) => {
++            // In the union's success channel, never contributes no members.
++            let mut distinct = false;
++            let mut has_void = false;
++            for ty in returns.into_iter().filter(|ty| !ty.has_flags(ignored_returns)) {
++                let Some(effect) = type_parser::effect(ty) else {
++                    return false;
++                };
++                if !effect.output.has_flags(TypeFlags::VOID | TypeFlags::NEVER) {
++                    return false;
++                }
++                distinct |= ty != real;
++                has_void |= effect.output.has_flags(TypeFlags::VOID);
++            }
++            distinct && has_void
++        }
++    }
 +}
 +
 +effect_rule!(
@@ -665,7 +669,13 @@ index 0000000..cdd55a3
 +    On::new().finish(),
 +    fn finish(&self, cx: &mut Cx<'_, Self>) {
 +        let file = cx.file();
-+        let root = file.type_checker().ts_node(file);
++        let checker = file.type_checker();
++        let ignored_returns = if checker.compiler_options().strict_null_checks {
++            TypeFlags::NEVER
++        } else {
++            TypeFlags::NEVER | TypeFlags::UNDEFINED
++        };
++        let root = checker.ts_node(file);
 +        expected_and_real_type::visit(root, |pair| {
 +            // ets_rules/src/effect_in_void_success.rs:31–75. Resolve the real Effect first.
 +            let Some(real) = type_parser::type_at(pair.real) else {
@@ -677,7 +687,7 @@ index 0000000..cdd55a3
 +            let Some(expected) = pair.expected.resolve() else {
 +                return;
 +            };
-+            if !expected.any_distinct_and_all_match(real, has_void_success) {
++            if !has_expected_void_success(expected, real, ignored_returns) {
 +                return;
 +            }
 +            let Some(nested) = type_parser::union_members(effect.output)
@@ -695,7 +705,7 @@ index 0000000..cdd55a3
 +);
 diff --git a/src/lint/plugins/effect/rules/bun_run_effect_inside_effect.rs b/src/lint/plugins/effect/rules/bun_run_effect_inside_effect.rs
 new file mode 100644
-index 0000000..41fd9a1
+index 0000000..b883e9a
 --- /dev/null
 +++ b/src/lint/plugins/effect/rules/bun_run_effect_inside_effect.rs
 @@ -0,0 +1,92 @@
@@ -712,7 +722,7 @@ index 0000000..41fd9a1
 +);
 +const NESTED: &Message = &Message::new(
 +    "runEffectInsideEffectNested",
-+    "`{{callee}}` is called inside an Effect with a separate services invocation. In this context, child Effects run with the surrounding services, which can be accessed through Effect.context and Effect.{{method}}With.",
++    "`{{callee}}` is called inside an Effect with a separate services invocation. In this context, child Effects run with the surrounding services, which can be accessed through `Effect.context` and `Effect.{{method}}With`.",
 +);
 +const PLATFORM: &Message = &Message::new(
 +    "runEffectInsideEffectRunMain",
@@ -881,20 +891,20 @@ index 6637e63..ee7f98b 100644
  
  pub(super) fn catch_return_types<'a>(
 diff --git a/test/cli/lint/effect.test.ts b/test/cli/lint/effect.test.ts
-index 4214510..d9f4445 100644
+index 4214510..47f91dd 100644
 --- a/test/cli/lint/effect.test.ts
 +++ b/test/cli/lint/effect.test.ts
-@@ -491,3 +491,111 @@ declare const object: { readonly a: number };
+@@ -491,3 +491,135 @@ declare const object: { readonly a: number };
      ]);
    });
  });
 +
 +describe("Effect v4 expected types and runtime contexts", () => {
-+  function project(source: string, severity: Record<string, string>) {
++  function project(source: string, severity: Record<string, string>, strictNullChecks = true) {
 +    return {
 +      ".oxlintrc.json": JSON.stringify({ options: { typeAware: true }, categories: { correctness: "off" } }),
 +      "tsconfig.json": JSON.stringify({
-+        compilerOptions: { ...options, strict: true, plugins: [{ name: "@effect/language-service", diagnosticSeverity: severity }] },
++        compilerOptions: { ...options, strict: true, strictNullChecks, plugins: [{ name: "@effect/language-service", diagnosticSeverity: severity }] },
 +      }),
 +      "node_modules/effect/package.json": '{ "name": "effect", "version": "4.1.2", "types": "./index.d.ts" }',
 +      "node_modules/effect/index.d.ts": 'export * as Effect from "./Effect";',
@@ -905,6 +915,7 @@ index 4214510..d9f4445 100644
 +        "  [Symbol.iterator](): Generator<Effect<A, E, R>, A, unknown>;",
 +        "}",
 +        "export declare function succeed<A>(value: A): Effect<A>;",
++        "export declare const never: Effect<never>;",
 +        "export declare function gen<A>(body: () => Generator<unknown, A, unknown>): Effect<A>;",
 +        "export declare function runSync<A>(value: Effect<A>): A;",
 +        "export declare function sync<A>(thunk: () => A): Effect<A>;",
@@ -954,12 +965,35 @@ index 4214510..d9f4445 100644
 +      "  return nested;",
 +      "}",
 +      "function predicate(value: unknown): value is Effect.Effect<void> { return typeof value === 'object'; }",
++      'function job(mode: "run"): Effect.Effect<void>;',
++      'function job(mode: "stop"): Effect.Effect<never>;',
++      'function job(mode: "run" | "stop"): Effect.Effect<void> {',
++      '  if (mode === "stop") return Effect.never;',
++      "  return Effect.succeed(Effect.succeed(42));",
++      "}",
 +    ].join("\n");
 +    const { stdout, exitCode } = await lint(project(source, { effectInVoidSuccess: "error" }), ["a.ts"]);
 +    expect(expectedLocations(stdout, "effect-in-void-success")).toEqual([
-+      "11:3", "13:48", "14:47", "15:17", "19:3", "3:7", "6:11", "9:1",
++      "11:3", "13:48", "14:47", "15:17", "19:3", "31:3", "3:7", "6:11", "9:1",
 +    ].sort());
 +    expect(exitCode).toBe(1);
++  });
++
++  test.concurrent("drops bare undefined overload returns only without strict null checks", async () => {
++    const source = [
++      'import { Effect } from "effect";',
++      'function job(mode: "run"): Effect.Effect<void>;',
++      'function job(mode: "skip"): undefined;',
++      'function job(mode: "run" | "skip"): Effect.Effect<void> | undefined {',
++      '  if (mode === "skip") return undefined;',
++      "  return Effect.succeed(Effect.succeed(42));",
++      "}",
++    ].join("\n");
++    const severity = { effectInVoidSuccess: "error" };
++    const strict = await lint(project(source, severity), ["a.ts"]);
++    expect(expectedLocations(strict.stdout, "effect-in-void-success")).toEqual([]);
++    const loose = await lint(project(source, severity, false), ["a.ts"]);
++    expect(expectedLocations(loose.stdout, "effect-in-void-success")).toEqual(["6:3"]);
 +  });
 +
 +  test.concurrent("reports run APIs in Effect generators and platform runMain in thunks", async () => {
