@@ -4,7 +4,7 @@ import { type Diagnostic, type ParsedOutput, parityRules, parseTypeScript } from
 import type { Fixture } from "./fixtures";
 
 const linterModules = join(import.meta.dir, "linter/node_modules");
-const gatedBunRules = new Set<string>([
+export const gatedBunRules = new Set<string>([
   "floatingEffect",
   "globalErrorInEffectFailure",
   "globalErrorInEffectCatch",
@@ -130,11 +130,10 @@ function parseUnix(fixture: Fixture, output: string): ParsedOutput {
   return { effect, nonEffect };
 }
 
-function key({ fixture, file, line, col, rule }: Diagnostic): string {
-  return JSON.stringify([fixture, file, line, col, rule]);
-}
-
-function compareLocations(baseline: Diagnostic[], actual: Diagnostic[]) {
+export function compareLocations(baseline: Diagnostic[], actual: Diagnostic[], includeSeverity = false) {
+  function key({ fixture, file, line, col, rule, severity }: Diagnostic): string {
+    return JSON.stringify([fixture, file, line, col, rule, includeSeverity ? severity : null]);
+  }
   const expected = new Map<string, Diagnostic[]>();
   for (const item of baseline) {
     const location = key(item);
@@ -256,7 +255,7 @@ export function referenceGateFailures(compiler: Pass, oxlint: Pass): string[] {
   return failures;
 }
 
-function gatedDiagnostics(pass: Pass): Diagnostic[] {
+export function gatedDiagnostics(pass: Pass): Diagnostic[] {
   const { matched, extra } = totals(pass);
   return [...matched.map(({ actual }) => actual), ...extra].filter(({ rule }) => gatedBunRules.has(rule));
 }

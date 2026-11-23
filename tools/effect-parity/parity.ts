@@ -76,6 +76,7 @@ if (gateFailures.length) {
   publish(floatingEffectTable(bun));
   savePass("bun", bun);
   if (process.env.EFFECT_PARITY_CANDIDATE_BUN) {
+    if (process.env.GITHUB_OUTPUT) appendFileSync(process.env.GITHUB_OUTPUT, "candidate_scored=true\n");
     const gate = candidateGate(compiler, oxlint, bun);
     publish(gate.evidence);
     if (!gate.passed) {
