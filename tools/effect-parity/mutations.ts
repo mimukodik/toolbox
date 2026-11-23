@@ -13,6 +13,7 @@ type Import = Node & {
 };
 type Member = Node & { object: Node; property: Identifier; computed: boolean; optional: boolean };
 type Call = Node & { callee: Node; arguments: Node[]; optional: boolean };
+type FunctionNode = Node & { params: Array<Node & { typeAnnotation?: Node }> };
 type Program = Node & { body: Node[] };
 type SourceCode = {
   text: string;
@@ -20,9 +21,18 @@ type SourceCode = {
   getDeclaredVariables(node: Node): Array<{ references: Array<{ identifier: Identifier }> }>;
 };
 
-export type Mutation = { kind: string; source: string; reexport?: string };
+export type Mutation = {
+  kind: string;
+  source: string;
+  direction?: "function-to-method" | "method-to-function" | "first-to-last" | "last-to-first";
+  reexport?: string;
+  extension?: "tsx";
+  probeLine?: number;
+};
 type Edit = { range: Range; text: string };
-type Proposal = { kind: string; edits: Edit[]; focus: Range; reexport?: string };
+type Proposal = Omit<Mutation, "source" | "probeLine"> & { edits: Edit[]; focus: Range; probeOffset?: number };
+
+export const effectAlias = "effect-differential-alias";
 
 const seed = 2431;
 export function rank(value: string): number {
@@ -41,6 +51,11 @@ function applyEdits(source: string, edits: Edit[]): string {
 // Restrict optional calls to imported, non-nullable v4 methods used as values in
 // the fixtures. Resolving references also excludes a shadowed Effect binding.
 const optionalMethods = new Set(["succeed", "fail", "sync", "gen", "try", "tryPromise", "log", "die", "promise"]);
+// These constructors always supply a Pipeable receiver. A standalone function
+// or a value in a point-free constructor fixture need not have a .pipe method.
+const effectConstructors = new Set(["succeed", "fail", "sync", "suspend", "gen", "try", "tryPromise", "log", "die", "promise"]);
+const effectValues = new Set(["void", "never"]);
+const dualMethods = new Set(["map", "mapError", "flatMap", "andThen", "tap", "catch"]);
 
 export function mutationVisitor(
   sourceCode: SourceCode, fixture: string, diagnosticOffsets: number[], save: (mutations: Mutation[]) => void,
@@ -49,17 +64,37 @@ export function mutationVisitor(
   const text = ({ range: [start, end] }: Node) => source.slice(start, end);
   const proposals: Proposal[] = [];
   const effectReferences = new Set<number>();
+  const pipeReferences = new Set<number>();
+  const comments = sourceCode.getAllComments();
+  let hasAngleAssertion = false;
 
-  function propose(kind: string, node: Node, replacement: string, focus = node.range): void {
-    proposals.push({ kind, edits: [{ range: node.range, text: replacement }], focus });
+  function propose(
+    kind: string, node: Node, replacement: string, focus = node.range, direction?: Mutation["direction"],
+  ): void {
+    proposals.push({ kind, edits: [{ range: node.range, text: replacement }], focus, direction });
   }
 
   function imports(program: Program): void {
+    const aliasEdits: Edit[] = [];
     for (const node of program.body) {
       if (node.type !== "ImportDeclaration") continue;
       const declaration = node as Import;
       if (declaration.importKind === "type" || declaration.attributes.length) continue;
       const from = declaration.source.value;
+      if (from === "effect" || from.startsWith("effect/")) {
+        aliasEdits.push({
+          range: declaration.source.range,
+          text: JSON.stringify(effectAlias + from.slice("effect".length)),
+        });
+      }
+      if (from === "effect" || from === "effect/Function") {
+        for (const specifier of declaration.specifiers) {
+          if (specifier.importKind === "type" || specifier.imported?.name !== "pipe") continue;
+          for (const { references } of sourceCode.getDeclaredVariables(specifier)) {
+            for (const { identifier } of references) pipeReferences.add(identifier.range[0]);
+          }
+        }
+      }
       const binding = declaration.specifiers.find((specifier) => specifier.importKind !== "type" && (
         (from === "effect" && specifier.imported?.name === "Effect")
         || (from === "effect/Effect" && specifier.type === "ImportNamespaceSpecifier")
@@ -105,9 +140,105 @@ export function mutationVisitor(
         }
       }
     }
+    if (aliasEdits.length) proposals.push({ kind: "package-manifest", edits: aliasEdits, focus: program.range });
+  }
+
+  function effectMember(node: Node): Member | undefined {
+    if (node.type !== "MemberExpression") return;
+    const member = node as Member;
+    if (!member.computed && !member.optional && member.object.type === "Identifier"
+      && effectReferences.has(member.object.range[0])) return member;
+  }
+
+  function effectValue(node: Node): boolean {
+    if (node.type !== "CallExpression") {
+      const member = effectMember(node);
+      return !!member && effectValues.has(member.property.name);
+    }
+    const call = node as Call;
+    const member = effectMember(call.callee);
+    return !!member && !call.optional && effectConstructors.has(member.property.name);
+  }
+
+  function importAtEnd(specifier: string): Edit {
+    return { range: [source.length, source.length], text: `\nimport { ${specifier} } from "effect"\n` };
+  }
+
+  function hasComments(node: Node): boolean {
+    const [start, end] = node.range;
+    return comments.some(({ range }) => range[0] >= start && range[1] <= end);
+  }
+
+  function hasPlainArguments(call: Call): boolean {
+    return !call.optional && !call.arguments.some(({ type }) => type === "SpreadElement" || type === "SequenceExpression")
+      && /^\s*\(/.test(source.slice(call.callee.range[1], call.range[1]));
+  }
+
+  function pipeForm(call: Call): void {
+    if (!hasPlainArguments(call) || hasComments(call)) return;
+    const [subject, ...steps] = call.arguments;
+    if (call.callee.type === "Identifier" && pipeReferences.has(call.callee.range[0])
+      && steps.length && effectValue(subject)) {
+      propose("pipe-form", call, `${text(subject)}.pipe(${steps.map(text).join(", ")})`, call.range, "function-to-method");
+    }
+    if (call.callee.type !== "MemberExpression" || !subject || /\b__effectDifferentialPipe\b/.test(source)) return;
+    const member = call.callee as Member;
+    if (member.computed || member.optional || member.property.name !== "pipe" || !effectValue(member.object)) return;
+    proposals.push({
+      kind: "pipe-form",
+      direction: "method-to-function",
+      edits: [
+        { range: call.range, text: `__effectDifferentialPipe(${[member.object, ...call.arguments].map(text).join(", ")})` },
+        importAtEnd("pipe as __effectDifferentialPipe"),
+      ],
+      focus: call.range,
+    });
+  }
+
+  function dualCallForm(call: Call): void {
+    if (!hasPlainArguments(call) || hasComments(call)) return;
+    const direct = effectMember(call.callee);
+    const [subject, step] = call.arguments;
+    if (direct && dualMethods.has(direct.property.name) && call.arguments.length === 2 && effectValue(subject)) {
+      // In the curried form callback parameters no longer infer from the
+      // receiver. Keep callbacks that carry their own types.
+      const callback = step.type === "ArrowFunctionExpression" || step.type === "FunctionExpression";
+      const explicit = callback && (step as FunctionNode).params.every(({ typeAnnotation }) => !!typeAnnotation);
+      if (explicit || (direct.property.name === "andThen" && effectValue(step))) {
+        propose("data-call-form", call, `${text(direct)}(${text(step)})(${text(subject)})`, call.range, "first-to-last");
+      }
+    }
+    if (call.callee.type !== "CallExpression" || call.arguments.length !== 1 || !effectValue(subject)) return;
+    const factory = call.callee as Call;
+    const member = effectMember(factory.callee);
+    if (member && dualMethods.has(member.property.name) && factory.arguments.length === 1 && hasPlainArguments(factory)) {
+      propose("data-call-form", call, `${text(member)}(${text(subject)}, ${text(factory.arguments[0])})`, call.range, "last-to-first");
+    }
+  }
+
+  function forInitializer(node: Node & { init: Node | null }): void {
+    if (/\b__EffectDifferential\b/.test(source)) return;
+    const init = node.init;
+    // Avoid removing a declaration the condition or body may use.
+    if (init?.type === "VariableDeclaration") return;
+    const empty = /^for\s*\(\s*(?=;)/.exec(text(node));
+    if (!init && !empty) return;
+    const at = node.range[0] + (empty?.[0].length ?? 0);
+    const range: Range = init?.range ?? [at, at];
+    proposals.push({
+      kind: "floating-statement-hook",
+      edits: [
+        { range, text: "__EffectDifferential.succeed(1)" },
+        importAtEnd("Effect as __EffectDifferential"),
+      ],
+      focus: node.range,
+      probeOffset: range[0],
+    });
   }
 
   function calls(call: Call): void {
+    pipeForm(call);
+    dualCallForm(call);
     if (call.optional || call.callee.type !== "MemberExpression") return;
     const member = call.callee as Member;
     const [start, end] = member.range;
@@ -163,7 +294,6 @@ export function mutationVisitor(
   }
 
   function directives(program: Program): void {
-    const comments = sourceCode.getAllComments();
     for (const comment of comments) {
       const value = comment.value.trim().replace(/^\*\s*/, "");
       if (!/^@effect-diagnostics(?:-next-line)?\s+[^\r\n]+$/.test(value)) continue;
@@ -201,15 +331,26 @@ export function mutationVisitor(
       directives(program);
     },
     CallExpression: calls,
+    ForStatement: forInitializer,
+    TSTypeAssertion() { hasAngleAssertion = true; },
     "Program:exit"() {
-      const choices = Map.groupBy(proposals, ({ kind }) => kind);
+      const choices = Map.groupBy(proposals, ({ kind, direction }) => direction ? `${kind}/${direction}` : kind);
       const distance = ([start, end]: Range) =>
         Math.min(...diagnosticOffsets.map((offset) => Math.max(start - offset, offset - end, 0)));
-      const mutations = Array.from(choices, ([kind, options]) => {
-        const order = ({ focus }: Proposal) => rank(`${fixture}/${kind}/${focus[0]}`);
+      const mutations = Array.from(choices, ([variant, options]) => {
+        const order = ({ focus }: Proposal) => rank(`${fixture}/${variant}/${focus[0]}`);
         const best = options.sort((a, b) => distance(a.focus) - distance(b.focus) || order(a) - order(b))[0];
-        return { kind, source: applyEdits(source, best.edits), reexport: best.reexport };
+        return {
+          kind: best.kind,
+          direction: best.direction,
+          source: applyEdits(source, best.edits),
+          reexport: best.reexport,
+          probeLine: best.probeOffset === undefined
+            ? undefined
+            : source.slice(0, best.probeOffset).replace(/^\n+/, "").split("\n").length,
+        };
       });
+      if (!hasAngleAssertion) mutations.push({ kind: "checker-type-query", source, extension: "tsx" });
       save(mutations);
     },
   };

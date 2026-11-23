@@ -1,6 +1,6 @@
 # Patched Bun
 
-Toolbox adds eleven Effect v4 rules to Bun's native `bun lint`.
+Toolbox adds fourteen Effect v4 rules to Bun's native `bun lint`.
 Bun 1.4.5 has no `bun lint` command, so the Linux x86-64 build uses
 Bun 1.4.6-canary.1 at
 [`b15f51302d72e1cd9038ecd0cf33782c02ee7681`](https://github.com/oven-sh/bun/commit/b15f51302d72e1cd9038ecd0cf33782c02ee7681).
@@ -8,12 +8,12 @@ Move the pin to the first Bun release that includes `bun lint`.
 
 ## Install
 
-Use the `bun-1.4.6-canary.1-b15f513-p4` release. Copy `sha256` from the
+Use the `bun-1.4.6-canary.1-b15f513-p5` release. Copy `sha256` from the
 release's `.tar.zst.sha256` file and run [the Toolbox installer](../../README.md)
 from the same tag.
 
 ```sh
-tag=bun-1.4.6-canary.1-b15f513-p4
+tag=bun-1.4.6-canary.1-b15f513-p5
 url="https://github.com/mimukodik/toolbox/releases/download/$tag/$tag-x86_64-linux.tar.zst"
 sudo sh ./install.sh "$url" "$sha256"
 bun --version
@@ -23,7 +23,7 @@ bun lint --help
 ## Build and use the rules
 
 Both packages use the same release build with LTO and AOT disabled. The
-patched package applies the patches in this directory at patch level `p4`.
+patched package applies the patches in this directory at patch level `p5`.
 The unpatched package is the control.
 
 ```sh
@@ -50,11 +50,14 @@ each file, including referenced projects.
 | `returnEffectInGen` | `bun/return-effect-in-gen` | Suggestion |
 | `missingStarInYieldEffectGen` | `bun/missing-star-in-yield-effect-gen` | Error |
 | `missingReturnYieldStar` | `bun/missing-return-yield-star` | Error |
+| `effectTryWithoutCatch` | `bun/effect-try-without-catch` | Off |
+| `catchUnfailableEffect` | `bun/catch-unfailable-effect` | Suggestion |
+| `lazyPromiseInEffectSync` | `bun/lazy-promise-in-effect-sync` | Warning |
 
 Effect's `@effect-diagnostics` and `@effect-diagnostics-next-line` directives
 can change the severity or suppress reports. Bun displays Effect errors and
-warnings. Set either suggestion rule's severity to warning or error to see its
-reports. The Unix formatter spells `bun/floating-effect` as
+warnings. Set a suggestion rule's severity to warning or error to see its reports.
+The Unix formatter spells `bun/floating-effect` as
 `bun(floating-effect)`, and uses the same convention for the other rules.
 
 The build reuses Bun's Ninja graph and URL-keyed prefetch cache. Nix
@@ -102,6 +105,10 @@ New files added by `patches/02-effect-rules.patch`:
 `patches/03-effect-generators.patch` adds `src/lint/plugins/effect/generator_context.rs`,
 the four generator rule modules and their rule pages. It extends the Effect
 registration and refreshes the generated rule index and example reports.
+
+`patches/04-effect-piping.patch` adds the piping-flow and overload-shape
+modules, three piping rules and their rule pages. It extends registration and
+refreshes the generated index and example reports.
 
 The Nix build also edits the existing `scripts/build/flags.ts` to disable
 debug-section compression for both variants.

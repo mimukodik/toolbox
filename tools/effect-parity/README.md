@@ -10,7 +10,7 @@ stock Bun 1.4.5 as its TypeScript runtime.
   `tsrs` 0.25.0-ts7.1.0-beta. Its lockfile uses the resolutions from
   slack-listener at `8132eccf4db7799dc3647e467ddc08f7384aa9a8`.
 - The default subject is Toolbox's Linux x86-64 release
-  `bun-1.4.6-canary.1-b15f513-p3`. The workflow pins the SHA-256 published
+  `bun-1.4.6-canary.1-b15f513-p4`. The workflow pins the SHA-256 published
   with the release and passes it to the installer from the release tag.
 
 ## Run and extend the harness
@@ -51,10 +51,10 @@ revision alongside the parity evidence. Set `regenerate_rule_docs` to run
 `bun src/codegen/lint-rule-docs.ts --write` with that same candidate and check
 that it reproduces the patched rule pages, index, and example reports.
 
-The candidate gate requires all 136 locations reported by Oxlint across the
-[eleven Bun Effect rules](../bun/README.md), with zero extras and zero fixture
-execution or parsing failures. Against the direct compiler it requires 136 of
-143 locations, exact agreement on the set of seven lower-severity omissions
+The candidate gate requires all 177 locations reported by Oxlint across the
+[14 Bun Effect rules](../bun/README.md), with zero extras and zero fixture
+execution or parsing failures. Against the direct compiler it requires 177 of
+191 locations, exact agreement on the set of 14 lower-severity omissions
 described above, zero extras, and matching severity at every shared location.
 Oxlint formats the compiler's warnings as errors in Unix output.
 
@@ -63,24 +63,35 @@ Oxlint formats the compiler's warnings as errors in Unix output.
 Each run that scores a candidate also generates a report on Blacksmith. The
 report step runs after the gate, has a five-minute limit, and cannot fail
 the job. It uses the locked Oxlint parser's TypeScript AST to rewrite the
-standalone v4 fixtures whose baselines mention the eleven gated rules.
+standalone v4 fixtures whose baselines mention the 14 gated rules.
 The AST pass runs just the generator rule, using the existing Oxlint install.
 
-Seed 2431 selects one edit site per fixture and mutation, preferring sites
-that contain a baseline diagnostic. The corpus includes every selected seed
-fixture as a control and caps each mutation at eight files. The same corpus
-runs in a single-config project and in a project whose child config
-redeclares the base config's plugin by name.
+Seed 2431 selects one edit site per eligible fixture, mutation, and rewrite
+direction, preferring sites that contain a baseline diagnostic. The corpus
+includes every seed as a control and every eligible seed for each mutation.
+Pipe mutations toggle between function and method syntax on known Effect receivers and
+switch eligible dual overload calls between direct and curried forms.
+Other mutations copy eligible seeds as TSX, route imports through a
+symlinked Effect package alias, and put a bare Effect into eligible
+initializers of existing classic `for` loops.
+
+The same corpus runs in a single-config project and in a project whose
+child config redeclares the base config's plugin by name.
 The single and base configs set `floatingEffect` to warning to exercise
 inheritance of a setting that differs from the default.
+Two separate projects exercise a project-supplied global `Error` with
+`noLib` and a path-scoped override disabling `floatingEffect` for generated
+files. The override project compares Bun directly with Effect's compiler
+to measure the compiler's scoped configuration.
 
-Each project batches the slack-listener and candidate commands described
-above. The comparison uses file, line, column, rule, and visible severity.
+Each project batches the compiler, slack-listener and candidate commands.
+The comparison uses file, line, column, rule, and visible severity.
 As in the gate, the compiler pass supplies the severity that the Oxlint Unix
 formatter collapses to error. Only errors and warnings are counted.
 
 In the `effect-parity` artifact, `differential-summary.md` gives the counts by
-mechanism and rule, documented coverage, corpus size, and wall time.
+mechanism and rule, documented coverage, case availability, corpus size,
+and wall time.
 A difference is listed when the [difference list](../bun/effect-port-differences.md)
 predicts its mechanism, rule, and outcome. The step tests the classifier on
 two synthetic severity mismatches before starting the linters.
@@ -88,7 +99,10 @@ two synthetic severity mismatches before starting the linters.
 prediction. Each new mechanism gets its smallest affected file under
 `differential-repros/`, with the project config and any local re-export it
 needs. To replay one, make the locked fixture dependencies available from
-that directory and run both commands against it with `--tsconfig tsconfig.json`.
+that directory and run the reference and candidate commands against it with
+`--tsconfig tsconfig.json` (the direct compiler uses `-p tsconfig.json`).
+For a `package-manifest` reproduction, also run
+`ln -s effect node_modules/effect-differential-alias` in the reproduction root.
 
 ## Bun p1 findings
 
