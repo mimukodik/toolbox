@@ -16,7 +16,7 @@ const extraReferenceSubset = "extra-reference-subset";
 const modes = ["single-config", "extends-plugin", "global-error", "rule-configuration", optionalPipeReceiverKind, relationMode] as const;
 type Mode = typeof modes[number];
 type Case = Mutation & { file: string; fixture: string; expectedRule?: string; expectedReports?: number };
-type Difference = { reference?: Diagnostic; candidate?: Diagnostic };
+type Difference = { reference?: Diagnostic; candidate?: Diagnostic; outcome?: "message-difference" };
 type DocumentedTag = { anchor: string; mechanism: string; rule: string; outcome?: string };
 type Finding = Difference & {
   mode: Mode;
@@ -278,6 +278,15 @@ const callbackReturns = [
   return backup;
 };`,
   },
+  {
+    kind: "relation-overloaded-callback",
+    expectedReports: 1,
+    body: `interface Load {
+  (): Effect.Effect<number>;
+  (options: { readonly force: boolean }): Effect.Effect<number>;
+}
+export const load: Load = () => primary;`,
+  },
 ];
 for (const { kind, expectedReports, body } of callbackReturns) {
   relationCases.push({
@@ -482,16 +491,32 @@ function disagreementKey(difference: Difference): string {
   ]);
 }
 
-function compare(reference: Diagnostic[], candidate: Diagnostic[]) {
-  const exact = compareLocations(reference, candidate, true);
+function matchMessages(reference: Diagnostic[], candidate: Diagnostic[]) {
+  const key = (report: Diagnostic) => JSON.stringify([diagnosticSite(report), report.severity, report.message]);
+  const byMessage = Map.groupBy(reference, key);
+  const agreements: Diagnostic[] = [];
+  const extra: Diagnostic[] = [];
+  for (const report of candidate) {
+    const match = byMessage.get(key(report))?.shift();
+    (match ? agreements : extra).push(report);
+  }
+  return { agreements, missing: [...byMessage.values()].flat(), extra };
+}
+
+function compare(reference: Diagnostic[], candidate: Diagnostic[], checkMessages = false) {
+  const messages = checkMessages ? matchMessages(reference, candidate) : undefined;
+  const exact = compareLocations(messages?.missing ?? reference, messages?.extra ?? candidate, true);
   // Pair any remaining reports at one location so a severity mismatch counts once.
   const changed = compareLocations(exact.missing, exact.extra);
   const differences: Difference[] = [
+    ...(checkMessages ? exact.matched.map(({ expected, actual }) => ({
+      reference: expected, candidate: actual, outcome: "message-difference" as const,
+    })) : []),
     ...changed.matched.map(({ expected, actual }) => ({ reference: expected, candidate: actual })),
     ...changed.missing.map((reference) => ({ reference })),
     ...changed.extra.map((candidate) => ({ candidate })),
   ];
-  return { agreements: exact.matched.map(({ actual }) => actual), differences };
+  return { agreements: messages?.agreements ?? exact.matched.map(({ actual }) => actual), differences };
 }
 
 function diagnosticSite({ fixture, file, line, col, rule }: Diagnostic): string {
@@ -547,9 +572,9 @@ function matchingTags(tags: DocumentedTag[], mechanism: string, rule: string): D
   return tags.filter((tag) => tag.mechanism === mechanism && (tag.rule === rule || tag.rule === "*"));
 }
 
-function classify(tags: DocumentedTag[], mechanism: string, { reference, candidate }: Difference, pairedOutcome?: string) {
+function classify(tags: DocumentedTag[], mechanism: string, { reference, candidate, outcome: reportOutcome }: Difference, pairedOutcome?: string) {
   const { rule } = (reference ?? candidate)!;
-  const outcome = pairedOutcome ?? (!candidate ? "missing" : !reference ? "extra" : `severity ${reference.severity}→${candidate.severity}`);
+  const outcome = pairedOutcome ?? reportOutcome ?? (!candidate ? "missing" : !reference ? "extra" : `severity ${reference.severity}→${candidate.severity}`);
   const listedBy = matchingTags(tags, mechanism, rule)
     .filter((tag) => tag.outcome === outcome)
     .map(({ anchor }) => anchor);
@@ -760,7 +785,7 @@ try {
   for (const mode of modes) {
     const expected = reference.get(mode) ?? [];
     const actual = candidate.get(mode) ?? [];
-    const { agreements, differences } = compare(expected, actual);
+    const { agreements, differences } = compare(expected, actual, mode === relationMode);
     const subsetSites = mode === relationMode ? referenceSubsetSites(expected, actual) : new Set<string>();
     const declaredTypeMove = substitutedConditionalMove(differences);
     const recoveryMoves = mode === "single-config" || mode === "extends-plugin"
@@ -780,8 +805,7 @@ try {
       const applicableTags = mechanism === pipeableDeclaredTypes && !declaredTypeMove.includes(difference) ? [] : tags;
       let outcome: string | undefined;
       if (recoveryMove) outcome = earlierPipeStage;
-      // Location matching can consume either reference report. Classify the
-      // surplus copy using the two reference messages and Bun's full message.
+      // The full message pairs first, leaving the subset report as surplus.
       if (difference.reference && !difference.candidate && subsetSites.has(diagnosticSite(difference.reference))) {
         outcome = extraReferenceSubset;
       }

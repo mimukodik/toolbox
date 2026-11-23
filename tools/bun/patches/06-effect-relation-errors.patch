@@ -507,10 +507,10 @@ index 85f26803..1cd74202 100644
      bun_return_effect_in_gen::ReturnEffectInGen,
 diff --git a/src/lint/plugins/effect/relation_errors.rs b/src/lint/plugins/effect/relation_errors.rs
 new file mode 100644
-index 00000000..8edad48e
+index 00000000..b84e8357
 --- /dev/null
 +++ b/src/lint/plugins/effect/relation_errors.rs
-@@ -0,0 +1,256 @@
+@@ -0,0 +1,270 @@
 +// Adapted from Effect-TS/tsgo's MIT-licensed missing channel rules at
 +// 0e722d359c969bdf1b1316f08e8637022cde3cce.
 +use super::{
@@ -521,7 +521,7 @@ index 00000000..8edad48e
 +};
 +use bun_lint::ast::{FnBody, Node};
 +use bun_lint::prelude::*;
-+use bun_lint::types::{Literal, SyntaxKind as Kind, TsNode, Type, TypeFlags};
++use bun_lint::types::{Literal, SignatureList, SyntaxKind as Kind, TsNode, Type, TypeFlags};
 +use bun_lint::utils::text::number_to_string;
 +use std::borrow::Cow;
 +use std::collections::HashSet;
@@ -656,6 +656,17 @@ index 00000000..8edad48e
 +    }
 +}
 +
++fn common_return_type(signatures: SignatureList<'_>) -> Option<Type<'_>> {
++    let mut signatures = signatures.into_iter();
++    let first = signatures.next()?.get_return_type();
++    signatures
++        .all(|signature| {
++            let ty = signature.get_return_type();
++            ty == first || (ty.is_assignable_to(first) && first.is_assignable_to(ty))
++        })
++        .then_some(first)
++}
++
 +fn visit_failed<'a>(
 +    location: TsNode<'a>,
 +    value: TsNode<'a>,
@@ -721,14 +732,14 @@ index 00000000..8edad48e
 +    let source_signatures = source.get_call_signatures();
 +    let target_signatures = target.get_call_signatures();
 +    if source_signatures.len() == 1
-+        && target_signatures.len() == 1
 +        && let (Some(source), Some(target)) = (source_signatures.first(), target_signatures.first())
 +    {
++        let single_target = target_signatures.len() == 1;
 +        if matches!(value.kind(), Kind::ArrowFunction | Kind::FunctionExpression)
 +            && let Some(function) = function_syntax(value)
++            && let Some(target) = common_return_type(target_signatures)
 +        {
 +            let source = source.get_return_type();
-+            let target = target.get_return_type();
 +            // Concise arrows with untyped parameters elaborate at the body.
 +            // Block bodies retain the enclosing assignment or argument site.
 +            let body = match function.body() {
@@ -757,6 +768,9 @@ index 00000000..8edad48e
 +            }
 +        }
 +
++        if !single_target {
++            return;
++        }
 +        // The supplied callback must accept the expected callback's input.
 +        // This also covers pipe stages that fail on an Effect input.
 +        for (accepts, supplied) in source.parameters().into_iter().zip(target.parameters()) {
@@ -837,10 +851,10 @@ index 00000000..c7a5f4d2
 +    }
 +);
 diff --git a/test/cli/lint/effect.test.ts b/test/cli/lint/effect.test.ts
-index 9a1b0b1b..a17598db 100644
+index 9a1b0b1b..ccb0ea5e 100644
 --- a/test/cli/lint/effect.test.ts
 +++ b/test/cli/lint/effect.test.ts
-@@ -625,3 +625,162 @@ describe("Effect v4 expected types and runtime contexts", () => {
+@@ -625,3 +625,187 @@ describe("Effect v4 expected types and runtime contexts", () => {
      expect(exitCode).toBe(0);
    });
  });
@@ -1001,5 +1015,30 @@ index 9a1b0b1b..a17598db 100644
 +      expect(errors).toEqual([`${location} Missing errors BackupError | ReadError in the expected Effect type.`]);
 +      expect(exitCode).toBe(1);
 +    }
++  });
++
++  test.concurrent("checks the return shared by a callback's target overloads", async () => {
++    const code = [
++      'interface Effect<A, E = never> { "~effect/Effect": { _A: () => A; _E: () => E; _R: () => never } }',
++      'interface ReadError { readonly _tag: "ReadError" }',
++      'interface Load {',
++      '  (): Effect<number>;',
++      '  (options: { readonly force: boolean }): Effect<number>;',
++      '}',
++      'declare const primary: Effect<number, ReadError>;',
++      'declare const ready: Effect<number>;',
++      'export const fallback: Load = () => ready;',
++      'export const load: Load = () => primary;',
++    ].join("\n");
++    const files = {
++      ".oxlintrc.json": JSON.stringify({ options: { typeAware: true }, categories: { correctness: "off" } }),
++      "tsconfig.json": JSON.stringify({
++        compilerOptions: { ...options, strict: true, plugins: [{ name: "@effect/language-service" }] },
++      }),
++      "overloads.ts": code,
++    };
++    const { errors, exitCode } = await lint(files, ["overloads.ts"]);
++    expect(errors).toEqual(["10:33 Missing errors ReadError in the expected Effect type."]);
++    expect(exitCode).toBe(1);
 +  });
 +});
