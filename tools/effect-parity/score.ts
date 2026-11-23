@@ -217,7 +217,7 @@ export function passTable(pass: Pass): string {
     "",
     `Wall time across the fixture pass: ${pass.wallSeconds.toFixed(2)} s`,
     `Non-Effect diagnostics: ${nonEffect}`,
-    `Out-of-scope Effect diagnostics: ${extra.filter((item) => !requestedRules.has(item.rule)).length}`,
+    `Out-of-scope Effect diagnostics: ${extra.filter(({ rule }) => !gatedBunRules.has(rule)).length}`,
     `Fixture execution or parsing failures: ${pass.failures.length}`,
     "",
   ].join("\n");
