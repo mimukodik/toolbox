@@ -249,7 +249,7 @@ ${body}
   }),
 ));
 
-const conditionalReturns = [
+const callbackReturns = [
   {
     kind: "relation-conditional-return",
     expectedReports: 2,
@@ -269,8 +269,16 @@ const conditionalReturns = [
     expectedReports: 1,
     body: `export const choose: (flag: boolean) => Effect.Effect<number> = (flag) => flag ? primary : backup;`,
   },
+  {
+    kind: "relation-contextual-multiple-returns",
+    expectedReports: 1,
+    body: `export const choose: (flag: boolean) => Effect.Effect<number> = (flag) => {
+  if (flag) return primary;
+  return backup;
+};`,
+  },
 ];
-for (const { kind, expectedReports, body } of conditionalReturns) {
+for (const { kind, expectedReports, body } of callbackReturns) {
   relationCases.push({
     kind,
     file: `cases/${kind}/missingEffectError.ts`,
