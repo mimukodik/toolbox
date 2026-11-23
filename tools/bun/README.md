@@ -1,6 +1,6 @@
 # Patched Bun
 
-Toolbox adds sixteen Effect v4 rules to Bun's native `bun lint`.
+Toolbox adds nineteen Effect v4 rules to Bun's native `bun lint`.
 Bun 1.4.5 has no `bun lint` command, so the Linux x86-64 build uses
 Bun 1.4.6-canary.1 at
 [`b15f51302d72e1cd9038ecd0cf33782c02ee7681`](https://github.com/oven-sh/bun/commit/b15f51302d72e1cd9038ecd0cf33782c02ee7681).
@@ -8,12 +8,12 @@ Move the pin to the first Bun release that includes `bun lint`.
 
 ## Install
 
-Use the `bun-1.4.6-canary.1-b15f513-p6` release. Copy `sha256` from the
+Use the `bun-1.4.6-canary.1-b15f513-p7` release. Copy `sha256` from the
 release's `.tar.zst.sha256` file and run [the Toolbox installer](../../README.md)
 from the same tag.
 
 ```sh
-tag=bun-1.4.6-canary.1-b15f513-p6
+tag=bun-1.4.6-canary.1-b15f513-p7
 url="https://github.com/mimukodik/toolbox/releases/download/$tag/$tag-x86_64-linux.tar.zst"
 sudo sh ./install.sh "$url" "$sha256"
 bun --version
@@ -23,7 +23,7 @@ bun lint --help
 ## Build and use the rules
 
 Both packages use the same release build with LTO and AOT disabled. The
-patched package applies the patches in this directory at patch level `p6`.
+patched package applies the patches in this directory at patch level `p7`.
 The unpatched package is the control.
 
 ```sh
@@ -55,6 +55,9 @@ each file, including referenced projects.
 | `lazyPromiseInEffectSync` | `bun/lazy-promise-in-effect-sync` | Warning |
 | `effectInVoidSuccess` | `bun/effect-in-void-success` | Warning |
 | `runEffectInsideEffect` | `bun/run-effect-inside-effect` | Suggestion |
+| `missingEffectError` | `bun/missing-effect-error` | Error |
+| `missingEffectContext` | `bun/missing-effect-context` | Error |
+| `missingLayerContext` | `bun/missing-layer-context` | Error |
 
 Effect's `@effect-diagnostics` and `@effect-diagnostics-next-line` directives
 can change the severity or suppress reports. Bun displays Effect errors and
@@ -115,6 +118,11 @@ refreshes the generated index and example reports.
 `patches/05-effect-contextual-types.patch` adds the expected/real type pairing
 and platform runtime lookup modules, two rules and their pages. It extends the
 Effect registrations, regression fixtures and generated rule docs.
+
+`patches/06-effect-relation-errors.patch` adds the three missing-channel rules,
+their expected/actual type comparisons, regression cases and rule docs. It
+uses Bun's existing type queries. The generated rule index and reports are
+the only upstream-owned files touched by this patch.
 
 The Nix build also edits the existing `scripts/build/flags.ts` to disable
 debug-section compression for both variants.
