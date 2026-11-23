@@ -1358,10 +1358,10 @@ index 000000000..3b2b1361f
 +}
 diff --git a/src/lint/plugins/effect/piping_flow.rs b/src/lint/plugins/effect/piping_flow.rs
 new file mode 100644
-index 000000000..a9a122f6c
+index 0000000..b84acb5
 --- /dev/null
 +++ b/src/lint/plugins/effect/piping_flow.rs
-@@ -0,0 +1,386 @@
+@@ -0,0 +1,400 @@
 +// Adapted from Effect's MIT-licensed ets_typeparser at 0e722d359c969bdf1b1316f08e8637022cde3cce.
 +use super::generator_context::{call_syntax, is_direct_function};
 +use super::pipeable_signature_shape::{data_subject, has_rest, is_curried, required_arity};
@@ -1371,14 +1371,18 @@ index 000000000..a9a122f6c
 +};
 +use bun_lint::ast::{Expr, File, Node};
 +use bun_lint::modules::Modules;
-+use bun_lint::types::{SyntaxKind as Kind, TsNode, Type, TypeFlags};
++use bun_lint::types::{NodeFlags, SyntaxKind as Kind, TsNode, Type, TypeFlags};
 +use smallvec::SmallVec;
 +
 +#[derive(Clone, Copy)]
 +enum Output<'a> {
 +    Expression(TsNode<'a>),
 +    Call(TsNode<'a>),
-+    Argument { call: TsNode<'a>, index: usize },
++    Argument {
++        call: TsNode<'a>,
++        index: usize,
++        next_index: Option<usize>,
++    },
 +}
 +
 +impl<'a> Output<'a> {
@@ -1386,8 +1390,13 @@ index 000000000..a9a122f6c
 +        match self {
 +            Self::Expression(node) => usable(node.get_type_at_location()),
 +            Self::Call(node) => usable(node.get_resolved_signature()?.get_return_type()),
-+            Self::Argument { call, index } => {
-+                let input = contextual_signature(call, index + 1)
++            Self::Argument {
++                call,
++                index,
++                next_index,
++            } => {
++                let input = next_index
++                    .and_then(|index| contextual_signature(call, index))
 +                    .and_then(|signature| signature.parameters().first())
 +                    .and_then(|parameter| usable(parameter.get_type()));
 +                if input.is_some_and(|ty| !ty.has_flags(TypeFlags::ANY | TypeFlags::UNKNOWN)) {
@@ -1727,17 +1736,22 @@ index 000000000..a9a122f6c
 +where
 +    'a: 's,
 +{
++    // The result of an optional call also includes the short-circuit path.
++    let use_call_result = last_is_call_result && !call.flags().contains(NodeFlags::OPTIONAL_CHAIN);
 +    args.iter().enumerate().map(move |(offset, arg)| {
 +        let node = arg.ts_node_with_parentheses();
 +        let (callee, argument_count) = call_syntax(node)
 +            .and_then(|syntax| Some((node.expression()?, syntax.args().len())))
 +            .unwrap_or((node, 0));
-+        let output = if last_is_call_result && offset + 1 == args.len() {
++        let index = start + offset;
++        let last = offset + 1 == args.len();
++        let output = if use_call_result && last {
 +            Output::Expression(call)
 +        } else {
 +            Output::Argument {
 +                call,
-+                index: start + offset,
++                index,
++                next_index: (!last).then_some(index + 1),
 +            }
 +        };
 +        Step {
@@ -2017,10 +2031,10 @@ index 94543c679..6637e63c0 100644
  }
 
 diff --git a/test/cli/lint/effect.test.ts b/test/cli/lint/effect.test.ts
-index 1766fdc255d60d417cba581eb554df1cb7ff36cd..6d9655b8e49395d9645d38a2b7b483b54d39f74c 100644
+index 1766fdc..4214510 100644
 --- a/test/cli/lint/effect.test.ts
 +++ b/test/cli/lint/effect.test.ts
-@@ -249,3 +249,226 @@ test.concurrent("recognizes Effect catch APIs through an npm package alias and r
+@@ -249,3 +249,245 @@ test.concurrent("recognizes Effect catch APIs through an npm package alias and r
    expect(parenthesized.stdout).toMatch(/parenthesized\.ts:2:30: .*\[Error\/bun\(unknown-in-effect-catch\)\]/);
    expect(parenthesized.stdout).toMatch(/parenthesized\.ts:4:28: .*\[Error\/bun\(global-error-in-effect-catch\)\]/);
  });
@@ -2047,6 +2061,7 @@ index 1766fdc255d60d417cba581eb554df1cb7ff36cd..6d9655b8e49395d9645d38a2b7b483b5
 +      }),
 +      "node_modules/effect/package.json": '{ "name": "effect", "version": "4.1.2", "types": "./index.d.ts" }',
 +      "node_modules/effect/index.d.ts": [
++        'export * as Cause from "./Cause";',
 +        'export * as Effect from "./Effect";',
 +        'export { pipe } from "./Function";',
 +      ].join("\n"),
@@ -2054,13 +2069,15 @@ index 1766fdc255d60d417cba581eb554df1cb7ff36cd..6d9655b8e49395d9645d38a2b7b483b5
 +        "export declare function pipe<A, B>(value: A, ab: (value: A) => B): B;",
 +        "export declare function pipe<A, B, C>(value: A, ab: (value: A) => B, bc: (value: B) => C): C;",
 +      ].join("\n"),
++      "node_modules/effect/Cause.d.ts": "export interface UnknownError { readonly _tag: 'UnknownError'; }",
 +      "node_modules/effect/Effect.d.ts": [
++        'import type { UnknownError } from "./Cause";',
 +        'declare const TypeId: "~effect/Effect";',
 +        "export interface Effect<A, E = never, R = never> {",
 +        "  readonly [TypeId]: { _A: () => A; _E: () => E; _R: () => R };",
 +        "  pipe<B>(ab: (value: Effect<A, E, R>) => B): B;",
++        "  pipe<T, B, C>(this: T, ab: (value: T) => B, bc: (value: B) => C): C;",
 +        "}",
-+        "interface UnknownError { readonly _tag: 'UnknownError'; }",
 +        "export declare function succeed<A>(value: A): Effect<A>;",
 +        "export declare function sync<A>(thunk: () => A): Effect<A>;",
 +        "export declare function fn<A, E, B>(body: () => Effect<A, E>, step: (self: Effect<A, E>) => B): () => B;",
@@ -2094,6 +2111,22 @@ index 1766fdc255d60d417cba581eb554df1cb7ff36cd..6d9655b8e49395d9645d38a2b7b483b5
 +      "8:33",
 +      "9:65",
 +    ]);
++  });
++
++  test.concurrent("checks the final Effect.try in an optional pipe", async () => {
++    const source = [
++      'import { Cause, Effect } from "effect";',
++      'declare const source: Effect.Effect<number> | undefined;',
++      'export const result = source?.pipe<',
++      '  Effect.Effect<number>,',
++      '  () => number,',
++      '  Effect.Effect<number, Cause.UnknownError>',
++      '>(() => () => 1, Effect.try);',
++    ].join("\n");
++    const { errors, stdout, exitCode } = await lint(pipingProject(source), ["a.ts"]);
++    expect(errors).toHaveLength(1);
++    expect(stdout).toMatch(/^.*?:7:18: .*\[Error\/bun\(effect-try-without-catch\)\]/m);
++    expect(exitCode).toBe(1);
 +  });
 +
 +  // A downstream point-free sync reports at its callee after a normalized step.

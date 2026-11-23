@@ -3,10 +3,10 @@ import { tmpdir } from "node:os";
 import { basename, dirname, join, relative } from "node:path";
 import { type Diagnostic, parseTypeScript } from "./diagnostics";
 import { discoverFixtures, type Fixture, layOutFixture } from "./fixtures";
-import { effectAlias, type Mutation } from "./mutations";
+import { effectAlias, type Mutation, optionalPipeReceiverKind } from "./mutations";
 import { compareLocations, exposeReferencePackages, gatedBunRules, gatedDiagnostics, runPass } from "./score";
 
-const modes = ["single-config", "extends-plugin", "global-error", "rule-configuration"] as const;
+const modes = ["single-config", "extends-plugin", "global-error", "rule-configuration", optionalPipeReceiverKind] as const;
 type Mode = typeof modes[number];
 type Case = Mutation & { file: string; fixture: string };
 type Difference = { reference?: Diagnostic; candidate?: Diagnostic };
@@ -93,6 +93,22 @@ const options = { onEmpty: () => "empty", onValue: (value: number) => value };
 
 const overloadProbes = [traverseProbe, ...reorderedProbes];
 
+const optionalPipeProbeName = "optionalPipeTry.ts";
+const optionalPipeProbe: Mutation = {
+  kind: optionalPipeReceiverKind,
+  source: `// @effect-diagnostics effectTryWithoutCatch:warning
+import { Cause, Effect } from "effect";
+
+declare const source: Effect.Effect<number> | undefined;
+
+export const result = source?.pipe<
+  Effect.Effect<number>,
+  () => number,
+  Effect.Effect<number, Cause.UnknownError>
+>(() => () => 1, Effect.try);
+`,
+};
+
 function generateCases() {
   const fixtureDirectory = join(upstream, "testdata/tests/effect-v4");
   const baselineDirectory = join(upstream, "testdata/baselines/reference/effect-v4");
@@ -163,7 +179,8 @@ function generateCases() {
   });
   if (!variants.length) throw new Error("The AST pass generated an empty mutation corpus.");
   const skippedTsx: string[] = [];
-  const selected = [...variants, ...overloadProbes.map(({ sample }) => sample)].filter(({ source, file, extension, fixture }) => {
+  const probes = [...overloadProbes.map(({ sample }) => sample), asCase(optionalPipeProbeName, optionalPipeProbe)];
+  const selected = [...variants, ...probes].filter(({ source, file, extension, fixture }) => {
     try {
       parsers[extension ?? "ts"].transformSync(source);
       return true;
@@ -242,6 +259,7 @@ function project(mode: Mode, cases: Case[]): Fixture {
   if (mode === "rule-configuration") {
     plugin.overrides = [{ include: ["generated/**/*.ts"], options: { diagnosticSeverity: { floatingEffect: "off" } } }];
   }
+  if (mode === optionalPipeReceiverKind) config.compilerOptions.strictNullChecks = true;
   json(fixture.tsconfig, config);
   return fixture;
 }
@@ -430,8 +448,12 @@ try {
   const { cases, angleAssertions, skippedTsx } = generateCases();
   const allCases = [...cases, ...Object.values(specialCases).flat()];
   const byFile = new Map(allCases.map((item) => [`/.src/${item.file}`, item]));
-  const projects = modes.map((mode) => project(mode,
-    mode === "global-error" || mode === "rule-configuration" ? specialCases[mode] : cases));
+  const optionalPipeCases = cases.filter(({ kind }) => kind === optionalPipeReceiverKind);
+  const sharedCases = cases.filter(({ kind }) => kind !== optionalPipeReceiverKind);
+  const projects = modes.map((mode) => {
+    if (mode === "global-error" || mode === "rule-configuration") return project(mode, specialCases[mode]);
+    return project(mode, mode === optionalPipeReceiverKind ? optionalPipeCases : sharedCases);
+  });
   exposeReferencePackages(root);
   const compiler = await runPass("compiler", projects, []);
   const oxlint = await runPass("oxlint", projects, []);
@@ -523,13 +545,18 @@ try {
     const coverage = [...new Set(matchingTags(tags, mechanism, rule).map(({ anchor }) => anchor))].join(", ");
     return `| ${mechanism} | ${rule} | ${row?.new ?? 0} | ${row?.listed ?? 0} | ${row?.agreements ?? 0} | ${coverage} |`;
   }));
+  const optionalProbeFile = optionalPipeCases.find(({ fixture }) => fixture === optionalPipeProbeName)!.file;
+  const optionalProbeCount = (pass: Map<string, Diagnostic[]>) =>
+    (pass.get(optionalPipeReceiverKind) ?? []).filter(({ file, rule }) =>
+      file === `/.src/${optionalProbeFile}` && rule === "effectTryWithoutCatch").length;
   json(join(artifactDirectory, "differential-differences.json"), findings);
   publish([
     "Classifier self-test passed.", "",
-    `Corpus: ${kindCounts.get("single-config")!.length} seed files and ${cases.length - kindCounts.get("single-config")!.length} mutations, plus ${cases.filter(({ reexport }) => reexport).length} local re-export files, in each shared-corpus project. The noLib and scoped override projects run separately.`,
+    `Corpus: ${kindCounts.get("single-config")!.length} seed files and ${sharedCases.length - kindCounts.get("single-config")!.length} mutations, plus ${sharedCases.filter(({ reexport }) => reexport).length} local re-export files, in each shared-corpus project. The noLib, scoped override and optional receiver projects run separately.`,
     `One site per eligible seed, mutation and rewrite direction. Candidate build run: ${process.env.BUN_BUILD_RUN ?? "unspecified"}.`,
     `Pipe rewrites per direction: ${(["function-to-method", "method-to-function", "first-to-last", "last-to-first"] as const)
-      .map((direction) => `${direction} ${directions.get(direction)?.length ?? 0}`).join(", ")}.`, "",
+      .map((direction) => `${direction} ${directions.get(direction)?.length ?? 0}`).join(", ")}.`,
+    `Optional pipe receivers: ${optionalPipeCases.length} cases with strict null checks. On the final Effect.try probe, Oxlint emitted ${optionalProbeCount(reference)} target reports and Bun emitted ${optionalProbeCount(candidate)}.`, "",
     `Pass times: Oxlint ${oxlint.wallSeconds.toFixed(2)} s, Bun ${bun.wallSeconds.toFixed(2)} s, compiler severity lookup ${compiler.wallSeconds.toFixed(2)} s.`, "",
     ...(severity.extra.length ? [
       `Oxlint emitted ${severity.extra.length} diagnostics without matching compiler locations. Those use the Unix output severity.`, "",

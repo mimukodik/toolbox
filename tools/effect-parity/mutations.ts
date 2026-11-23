@@ -33,6 +33,7 @@ type Edit = { range: Range; text: string };
 type Proposal = Omit<Mutation, "source" | "probeLine"> & { edits: Edit[]; focus: Range; probeOffset?: number };
 
 export const effectAlias = "effect-differential-alias";
+export const optionalPipeReceiverKind = "optional-pipe-receiver";
 
 const seed = 2431;
 export function rank(value: string): number {
@@ -195,6 +196,26 @@ export function mutationVisitor(
     });
   }
 
+  function optionalPipeReceiver(call: Call): void {
+    if (call.optional || call.callee.type !== "MemberExpression" || !call.arguments.length
+      || hasComments(call) || /\b__effectDifferentialPipePresent\b/.test(source)) return;
+    const member = call.callee as Member;
+    if (member.computed || member.optional || member.property.name !== "pipe" || !effectValue(member.object)) return;
+
+    const start = member.range[0];
+    let outer: Node = call;
+    while (outer.parent?.range[0] === start && outer.parent.type !== "Program") outer = outer.parent;
+    const separator = outer.type === "ExpressionStatement" ? ";" : "";
+    proposals.push({
+      kind: optionalPipeReceiverKind,
+      edits: [
+        { range: member.range, text: `${separator}(__effectDifferentialPipePresent ? (${text(member.object)}) : undefined)?.pipe` },
+        { range: [source.length, source.length], text: "\ndeclare const __effectDifferentialPipePresent: boolean;\n" },
+      ],
+      focus: call.range,
+    });
+  }
+
   function dualCallForm(call: Call): void {
     if (!hasPlainArguments(call) || hasComments(call)) return;
     const direct = effectMember(call.callee);
@@ -238,6 +259,7 @@ export function mutationVisitor(
 
   function calls(call: Call): void {
     pipeForm(call);
+    optionalPipeReceiver(call);
     dualCallForm(call);
     if (call.optional || call.callee.type !== "MemberExpression") return;
     const member = call.callee as Member;
