@@ -109,6 +109,59 @@ export const result = source?.pipe<
 `,
 };
 
+// Reuse the nested Effect from the fixture and vary the position supplying
+// its expected type. Include controls for inference and mixed overload returns.
+const nestedEffect = "Effect.succeed(Effect.succeed(42))";
+const expectedTypeMutations = [
+  {
+    kind: "expected-real-const",
+    source: `export const annotated: Effect.Effect<void> = ${nestedEffect};
+export const inferred = ${nestedEffect};`,
+  },
+  {
+    kind: "expected-real-return",
+    source: `export function createJob(): Effect.Effect<void> {
+  return ${nestedEffect};
+}`,
+  },
+  {
+    kind: "expected-real-argument",
+    source: `export function enqueue(_job: Effect.Effect<void>): void {}
+enqueue(${nestedEffect});`,
+  },
+  {
+    kind: "expected-real-overload",
+    source: `export function createJob(queue: "local"): Effect.Effect<void>;
+export function createJob(queue: "remote"): Effect.Effect<void, Error>;
+export function createJob(queue: string): Effect.Effect<void, Error> {
+  return ${nestedEffect};
+}
+
+export function inspectJob(detail: false): Effect.Effect<void>;
+export function inspectJob(detail: true): Effect.Effect<number>;
+export function inspectJob(detail: boolean): Effect.Effect<void> | Effect.Effect<number> {
+  return ${nestedEffect};
+}`,
+  },
+].map(({ kind, source }) => ({
+  kind,
+  source: `import { Effect } from "effect";
+
+${source}
+`,
+}));
+
+const runtimeProbe: Mutation = {
+  kind: "runtime-api-callee",
+  source: `// @effect-diagnostics runEffectInsideEffect:warning
+import { Effect } from "effect";
+
+const run = Effect.runSync;
+export const job = Effect.gen(function* () {
+  return run(Effect.succeed(42));
+});`,
+};
+
 function generateCases() {
   const fixtureDirectory = join(upstream, "testdata/tests/effect-v4");
   const baselineDirectory = join(upstream, "testdata/baselines/reference/effect-v4");
@@ -120,6 +173,7 @@ function generateCases() {
 
   const seeds = new Map<string, string>();
   const catchSeeds = new Set<string>();
+  const virtualSeeds: string[] = [];
   for (const name of discoverFixtures(fixtureDirectory)) {
     const baseline = join(baselineDirectory, name.replace(/\.ts$/, ".errors.txt"));
     if (!existsSync(baseline)) continue;
@@ -129,7 +183,10 @@ function generateCases() {
     if (diagnostics.some(({ rule }) => rule === "catchUnfailableEffect")) catchSeeds.add(name);
     const source = readFileSync(join(fixtureDirectory, name), "utf8").replace(/\r\n/g, "\n");
     if (/^\/\/\s*@filename\s*:/im.test(source) || diagnostics.some(({ file }) => basename(file) !== name)) {
-      throw new Error(`Expected a standalone TypeScript seed, found virtual files in ${name}`);
+      // The fixture gate retains all virtual units and their config. AST
+      // mutations run standalone sources so their baseline offsets stay valid.
+      virtualSeeds.push(name);
+      continue;
     }
     const lineStarts = [0];
     for (const newline of source.matchAll(/\n/g)) lineStarts.push(newline.index! + 1);
@@ -181,7 +238,12 @@ function generateCases() {
   });
   if (!variants.length) throw new Error("The AST pass generated an empty mutation corpus.");
   const skippedTsx: string[] = [];
-  const probes = [...overloadProbes.map(({ sample }) => sample), asCase(optionalPipeProbeName, optionalPipeProbe)];
+  const probes = [
+    ...overloadProbes.map(({ sample }) => sample),
+    asCase(optionalPipeProbeName, optionalPipeProbe),
+    ...expectedTypeMutations.map((mutation) => asCase("effectInVoidSuccess.ts", mutation)),
+    asCase("runEffectInsideEffect.ts", runtimeProbe),
+  ];
   const selected = [...variants, ...probes].filter(({ source, file, extension, fixture }) => {
     try {
       parsers[extension ?? "ts"].transformSync(source);
@@ -197,6 +259,7 @@ function generateCases() {
   return {
     cases: [...controls, ...selected].sort((a, b) => a.file.localeCompare(b.file)),
     skippedTsx,
+    virtualSeeds,
     catchSeeds,
     angleAssertions: seeds.size - variants.filter(({ extension }) => extension === "tsx").length,
   };
@@ -448,7 +511,7 @@ function formatGapEvidence(
 try {
   const tags = documentedMechanisms();
   checkClassifier(tags);
-  const { cases, angleAssertions, catchSeeds, skippedTsx } = generateCases();
+  const { cases, angleAssertions, catchSeeds, skippedTsx, virtualSeeds } = generateCases();
   const allCases = [...cases, ...Object.values(specialCases).flat()];
   const byFile = new Map(allCases.map((item) => [`/.src/${item.file}`, item]));
   const optionalPipeCases = cases.filter(({ kind }) => kind === optionalPipeReceiverKind);
@@ -558,10 +621,22 @@ try {
   const catchCount = (pass: Map<string, Diagnostic[]>) =>
     optionalDiagnostics(pass, "catchUnfailableEffect").filter(({ file }) => catchFiles.has(file)).length;
   const catchReferenceCount = catchCount(reference);
+  const expectedTypeEvidence = [...expectedTypeMutations, runtimeProbe].map(({ kind }) => {
+    const files = new Set((kindCounts.get(kind) ?? []).map(({ file }) => `/.src/${file}`));
+    const rule = kind === runtimeProbe.kind ? "runEffectInsideEffect" : "effectInVoidSuccess";
+    const reports = (diagnostics: Diagnostic[]) => diagnostics.filter((item) =>
+      item.fixture === "single-config" && item.rule === rule && files.has(item.file))
+      .map(({ line, col }) => `${line}:${col}`).join(", ") || "none";
+    return `| ${kind} | ${reports(compilerDiagnostics)} | ${reports(oxlintDiagnostics)} | ${reports(candidateDiagnostics)} |`;
+  });
   json(join(artifactDirectory, "differential-differences.json"), findings);
   publish([
-    "Classifier self-test passed.", "",
+    "Classifier self-test passed.",
+    `Gated rules: ${[...gatedBunRules].join(", ")}.`, "",
     `Corpus: ${kindCounts.get("single-config")!.length} seed files and ${sharedCases.length - kindCounts.get("single-config")!.length} mutations, plus ${sharedCases.filter(({ reexport }) => reexport).length} local re-export files, in each shared-corpus project. The noLib, scoped override and optional receiver projects run separately.`,
+    ...(virtualSeeds.length ? [
+      `Virtual-file fixtures remain in the fixture gate: ${virtualSeeds.join(", ")}.`,
+    ] : []),
     `One site per eligible seed, mutation and rewrite direction. Candidate build run: ${process.env.BUN_BUILD_RUN ?? "unspecified"}.`,
     `Pipe rewrites per direction: ${(["function-to-method", "method-to-function", "first-to-last", "last-to-first"] as const)
       .map((direction) => `${direction} ${directions.get(direction)?.length ?? 0}`).join(", ")}.`,
@@ -584,6 +659,10 @@ try {
       Map.groupBy(oxlintDiagnostics, ({ fixture }) => fixture), candidate, angleAssertions, skippedTsx,
     ),
     ...formatOverloadEvidence(compilerDiagnostics, oxlintDiagnostics, candidateDiagnostics),
+    "## Expected type and runtime probes", "",
+    "| Mechanism | Compiler locations | Oxlint locations | Bun locations |",
+    "| --- | --- | --- | --- |",
+    ...expectedTypeEvidence, "",
     "| Mechanism | New | Listed | Agreements |",
     "| --- | ---: | ---: | ---: |",
     ...mechanismRows,

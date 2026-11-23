@@ -19,6 +19,8 @@ export const gatedBunRules = new Set<string>([
   "effectTryWithoutCatch",
   "catchUnfailableEffect",
   "lazyPromiseInEffectSync",
+  "effectInVoidSuccess",
+  "runEffectInsideEffect",
 ]);
 const requestedRules = new Set<string>(parityRules);
 const oxlintRules = new Map(parityRules.map((name) => [
@@ -275,9 +277,9 @@ export function candidateGate(compiler: Pass, oxlint: Pass, bun: Pass): { passed
   const omissions = compareLocations(expectedOmissions, direct.missing);
   const omissionsMatch = omissions.missing.length === 0 && omissions.extra.length === 0
     && omissions.matched.every(({ expected, actual }) => expected.severity === actual.severity);
-  const passed = lint.matched.length === 177 && lint.missing.length === 0
+  const passed = lint.matched.length === 183 && lint.missing.length === 0
     && lint.extra.length === 0 && bun.failures.length === 0
-    && direct.matched.length === 177 && direct.missing.length === 14
+    && direct.matched.length === 183 && direct.missing.length === 35
     && direct.extra.length === 0 && omissionsMatch && severityMismatches.length === 0;
   const ruleRows = [...gatedBunRules].map((rule) => {
     const lintCount = lintReference.filter((diagnostic) => diagnostic.rule === rule).length;
