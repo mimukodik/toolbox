@@ -10,7 +10,7 @@ stock Bun 1.4.5 as its TypeScript runtime.
   `tsrs` 0.25.0-ts7.1.0-beta. Its lockfile uses the resolutions from
   slack-listener at `8132eccf4db7799dc3647e467ddc08f7384aa9a8`.
 - The default subject is Toolbox's Linux x86-64 release
-  `bun-1.4.6-canary.1-b15f513-p4`. The workflow pins the SHA-256 published
+  `bun-1.4.6-canary.1-b15f513-p5`. The workflow pins the SHA-256 published
   with the release and passes it to the installer from the release tag.
 
 ## Run and extend the harness
@@ -51,10 +51,10 @@ revision alongside the parity evidence. Set `regenerate_rule_docs` to run
 `bun src/codegen/lint-rule-docs.ts --write` with that same candidate and check
 that it reproduces the patched rule pages, index, and example reports.
 
-The candidate gate requires all 177 locations reported by Oxlint across the
-[14 Bun Effect rules](../bun/README.md), with zero extras and zero fixture
-execution or parsing failures. Against the direct compiler it requires 177 of
-191 locations, exact agreement on the set of 14 lower-severity omissions
+The candidate gate requires all 183 locations reported by Oxlint across the
+[16 Bun Effect rules](../bun/README.md), with zero extras and zero fixture
+execution or parsing failures. Against the direct compiler it requires 183 of
+218 locations, exact agreement on the set of 35 lower-severity omissions
 described above, zero extras, and matching severity at every shared location.
 Oxlint formats the compiler's warnings as errors in Unix output.
 
@@ -63,7 +63,7 @@ Oxlint formats the compiler's warnings as errors in Unix output.
 Each run that scores a candidate also generates a report on Blacksmith. The
 report step runs after the gate, has a five-minute limit, and cannot fail
 the job. It uses the locked Oxlint parser's TypeScript AST to rewrite the
-standalone v4 fixtures whose baselines mention the 14 gated rules.
+standalone v4 fixtures whose baselines mention the 16 gated rules. Virtual-file fixtures stay in the fixture gate.
 The AST pass runs just the generator rule, using the existing Oxlint install.
 
 Seed 2431 selects one edit site per eligible fixture, mutation, and rewrite
@@ -88,6 +88,13 @@ overloads from Effect's pinned `pipingFlows_selfDualOverloads` and
 data-last forms through `Effect.sync`. The `reordered` probes compare an
 inline conditional with the same conditional instantiated through a generic
 member. The report shows where `lazyPromiseInEffectSync` lands on each form.
+
+The expected/real type probes move the fixture’s nested Effect between an
+annotated and inferred const, a function return, a typed argument, and
+overloads with matching, mixed, or `void` and `never` success channels. The
+`effect-runner-alias` probe checks a local alias of `Effect.runSync`. The fixture
+gate and Bun suite cover platform `runMain`. The report includes the diagnostic
+locations from all three engines.
 
 The same corpus runs in a single-config project and in a project whose
 child config redeclares the base config's plugin by name.
