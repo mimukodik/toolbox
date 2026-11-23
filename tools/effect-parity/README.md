@@ -51,11 +51,12 @@ revision alongside the parity evidence. Set `regenerate_rule_docs` to run
 `bun src/codegen/lint-rule-docs.ts --write` with that same candidate and check
 that it reproduces the patched rule pages, index, and example reports.
 
-The candidate gate requires all 183 locations reported by Oxlint across the
-[16 Bun Effect rules](../bun/README.md), with zero extras and zero fixture
-execution or parsing failures. Against the direct compiler it requires 183 of
-218 locations, exact agreement on the set of 35 lower-severity omissions
-described above, zero extras, and matching severity at every shared location.
+The candidate gate checks all 195 Oxlint diagnostics across the
+[19 Bun Effect rules](../bun/README.md). It requires 194 exact locations, the
+[listed pipe-stage move](../bun/effect-port-differences.md#relation-overload-recovery),
+and zero fixture execution or parsing failures. Against the direct compiler
+it requires the same locations and move, the exact 35 lower-severity
+omissions described above, and matching severity at every shared location.
 Oxlint formats the compiler's warnings as errors in Unix output.
 
 ## Generated differential
@@ -63,7 +64,14 @@ Oxlint formats the compiler's warnings as errors in Unix output.
 Each run that scores a candidate also generates a report on Blacksmith. The
 report step runs after the gate, has a five-minute limit, and cannot fail
 the job. It uses the locked Oxlint parser's TypeScript AST to rewrite the
-standalone v4 fixtures whose baselines mention the 16 gated rules. Virtual-file fixtures stay in the fixture gate.
+standalone v4 fixtures whose baselines mention the 19 gated rules. Virtual-file fixtures stay in the fixture gate.
+A separate strict TypeScript project exercises each missing-channel rule in
+`satisfies`, reassignment, class property initializers, default parameters,
+object properties, concise callback returns, array elements, inferred generic
+calls, JSX attributes, async returns and computed properties. Conditional
+return probes check both arms with an explicit return annotation and cover the
+assignment and expression locations for contextually typed callbacks. The report
+includes both references and Bun by position and rule.
 The AST pass runs just the generator rule, using the existing Oxlint install.
 
 Seed 2431 selects one edit site per eligible fixture, mutation, and rewrite

@@ -4,30 +4,12 @@ import { type Diagnostic, type ParsedOutput, parityRules, parseTypeScript } from
 import type { Fixture } from "./fixtures";
 
 const linterModules = join(import.meta.dir, "linter/node_modules");
-export const gatedBunRules = new Set<string>([
-  "floatingEffect",
-  "globalErrorInEffectFailure",
-  "globalErrorInEffectCatch",
-  "unknownInEffectCatch",
-  "effectInFailure",
-  "anyUnknownInErrorContext",
-  "unsafeEffectTypeAssertion",
-  "tryCatchInEffectGen",
-  "returnEffectInGen",
-  "missingStarInYieldEffectGen",
-  "missingReturnYieldStar",
-  "effectTryWithoutCatch",
-  "catchUnfailableEffect",
-  "lazyPromiseInEffectSync",
-  "effectInVoidSuccess",
-  "runEffectInsideEffect",
-]);
-const requestedRules = new Set<string>(parityRules);
+export const gatedBunRules = new Set<string>(parityRules);
 const oxlintRules = new Map(parityRules.map((name) => [
   name.replace(/([a-z0-9])([A-Z])/g, "$1-$2").toLowerCase(), name,
 ]));
 const bunRules = new Map<string, string>(
-  [...oxlintRules].filter(([, name]) => gatedBunRules.has(name)).flatMap(([slug, name]) => [
+  [...oxlintRules].flatMap(([slug, name]) => [
     [`bun(${slug})`, name] as const,
     [`bun/${slug}`, name] as const,
   ]),
@@ -183,7 +165,7 @@ export async function runPass(
         ]);
         raw.push({ fixture: fixture.name, exitCode, stdout, stderr });
         const result = parse(fixture, stdout);
-        const baseline = (expected.get(fixture.name) ?? []).filter(({ rule }) => requestedRules.has(rule));
+        const baseline = (expected.get(fixture.name) ?? []).filter(({ rule }) => gatedBunRules.has(rule));
         scores.push({ fixture: fixture.name, ...compareLocations(baseline, result.effect), nonEffect: result.nonEffect });
         const reportedDiagnostics = result.effect.length + result.nonEffect > 0;
         if (exitCode !== 0 && !(diagnosticExits.includes(exitCode) && reportedDiagnostics)) {
@@ -235,7 +217,7 @@ export function passTable(pass: Pass): string {
     "",
     `Wall time across the fixture pass: ${pass.wallSeconds.toFixed(2)} s`,
     `Non-Effect diagnostics: ${nonEffect}`,
-    `Out-of-scope Effect diagnostics: ${extra.filter((item) => !requestedRules.has(item.rule)).length}`,
+    `Out-of-scope Effect diagnostics: ${extra.filter(({ rule }) => !gatedBunRules.has(rule)).length}`,
     `Fixture execution or parsing failures: ${pass.failures.length}`,
     "",
   ].join("\n");
@@ -245,7 +227,7 @@ export function referenceGateFailures(compiler: Pass, oxlint: Pass): string[] {
   const failures: string[] = [];
   const direct = totals(compiler);
   const lint = totals(oxlint);
-  const scoredExtra = ({ rule }: Diagnostic) => requestedRules.has(rule);
+  const scoredExtra = ({ rule }: Diagnostic) => gatedBunRules.has(rule);
   if (compiler.failures.length || direct.matched.length !== 230 || direct.missing.length
     || direct.extra.some(scoredExtra)) {
     failures.push("Direct compiler gate failed. Expected 230 matched, zero missing and zero scored extras.");
@@ -265,6 +247,30 @@ export function gatedDiagnostics(pass: Pass): Diagnostic[] {
   return [...matched.map(({ actual }) => actual), ...extra].filter(({ rule }) => gatedBunRules.has(rule));
 }
 
+export const missingContextPipe = {
+  fixture: "missingEffectContext_sugg.ts",
+  rule: "missingEffectContext",
+  col: 5,
+  reference: { line: 42, members: "DbConnection | FileSystem" },
+  candidate: { line: 40, members: "FileSystem | Scope" },
+} as const;
+
+export function isMissingContextPipeDiagnostic(
+  diagnostic: Diagnostic, side: "reference" | "candidate", lineOffset = 0,
+): boolean {
+  const { line, members } = missingContextPipe[side];
+  return diagnostic.rule === missingContextPipe.rule && diagnostic.severity === "error"
+    && diagnostic.line === line + lineOffset && diagnostic.col === missingContextPipe.col
+    && diagnostic.message === `This Effect requires a service that is missing from the expected Effect context: \`${members}\`.`;
+}
+
+function isMissingContextPipeMove({ missing, extra }: ReturnType<typeof compareLocations>): boolean {
+  const at = (diagnostic: Diagnostic, side: "reference" | "candidate") =>
+    diagnostic.fixture === missingContextPipe.fixture && diagnostic.file === `/.src/${missingContextPipe.fixture}`
+    && isMissingContextPipeDiagnostic(diagnostic, side);
+  return missing.length === 1 && extra.length === 1 && at(missing[0], "reference") && at(extra[0], "candidate");
+}
+
 export function candidateGate(compiler: Pass, oxlint: Pass, bun: Pass): { passed: boolean; evidence: string } {
   const candidate = gatedDiagnostics(bun);
   const lintReference = gatedDiagnostics(oxlint);
@@ -274,13 +280,13 @@ export function candidateGate(compiler: Pass, oxlint: Pass, bun: Pass): { passed
   // Oxlint reports the compiler's warnings as errors in its Unix output.
   const severityMismatches = direct.matched.filter(({ expected, actual }) => expected.severity !== actual.severity);
   const expectedOmissions = compilerReference.filter(({ severity }) => severity === "message" || severity === "suggestion");
-  const omissions = compareLocations(expectedOmissions, direct.missing);
-  const omissionsMatch = omissions.missing.length === 0 && omissions.extra.length === 0
-    && omissions.matched.every(({ expected, actual }) => expected.severity === actual.severity);
-  const passed = lint.matched.length === 183 && lint.missing.length === 0
-    && lint.extra.length === 0 && bun.failures.length === 0
-    && direct.matched.length === 183 && direct.missing.length === 35
-    && direct.extra.length === 0 && omissionsMatch && severityMismatches.length === 0;
+  const omissions = compareLocations(expectedOmissions, direct.missing, true);
+  const lintMove = isMissingContextPipeMove(lint);
+  const directMove = omissions.missing.length === 0 && isMissingContextPipeMove({
+    missing: omissions.extra, extra: direct.extra, matched: [],
+  });
+  const passed = lint.matched.length === 194 && lintMove && bun.failures.length === 0
+    && direct.matched.length === 194 && directMove && severityMismatches.length === 0;
   const ruleRows = [...gatedBunRules].map((rule) => {
     const lintCount = lintReference.filter((diagnostic) => diagnostic.rule === rule).length;
     const compilerCount = compilerReference.filter((diagnostic) => diagnostic.rule === rule).length;
@@ -304,7 +310,8 @@ export function candidateGate(compiler: Pass, oxlint: Pass, bun: Pass): { passed
       "| --- | ---: | ---: | ---: | ---: |",
       ...ruleRows, "",
       `- Fixture execution or parsing failures: ${bun.failures.length}`,
-      `- Direct compiler omissions are exactly the message and suggestion diagnostics: ${omissionsMatch ? "yes" : "no"}`,
+      `- Direct compiler omissions are exactly the message and suggestion diagnostics plus the listed pipe-stage move: ${directMove ? "yes" : "no"}`,
+      `- Listed Oxlint move (${missingContextPipe.fixture}, ${missingContextPipe.rule}): ${lintMove ? "42:5 → 40:5" : "no"}`,
       `- Direct compiler severity mismatches: ${severityMismatches.length}`,
       ...lint.missing.map((item) => `- Oxlint only: ${location(item)} — ${item.message}`),
       ...lint.extra.map((item) => `- Bun only: ${location(item)} — ${item.message}`),

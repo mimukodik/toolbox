@@ -4,12 +4,19 @@ import { basename, dirname, join, relative } from "node:path";
 import { type Diagnostic, parseTypeScript } from "./diagnostics";
 import { discoverFixtures, type Fixture, layOutFixture } from "./fixtures";
 import { effectAlias, type Mutation, optionalPipeReceiverKind } from "./mutations";
-import { compareLocations, exposeReferencePackages, gatedBunRules, gatedDiagnostics, runPass } from "./score";
+import {
+  compareLocations, exposeReferencePackages, gatedBunRules, gatedDiagnostics,
+  isMissingContextPipeDiagnostic, missingContextPipe, runPass,
+} from "./score";
 
-const modes = ["single-config", "extends-plugin", "global-error", "rule-configuration", optionalPipeReceiverKind] as const;
+const relationMode = "relation-positions";
+const overloadRecovery = "relation-overload-recovery";
+const earlierPipeStage = "earlier-pipe-stage";
+const extraReferenceSubset = "extra-reference-subset";
+const modes = ["single-config", "extends-plugin", "global-error", "rule-configuration", optionalPipeReceiverKind, relationMode] as const;
 type Mode = typeof modes[number];
-type Case = Mutation & { file: string; fixture: string };
-type Difference = { reference?: Diagnostic; candidate?: Diagnostic };
+type Case = Mutation & { file: string; fixture: string; expectedRule?: string; expectedReports?: number };
+type Difference = { reference?: Diagnostic; candidate?: Diagnostic; outcome?: "message-difference" };
 type DocumentedTag = { anchor: string; mechanism: string; rule: string; outcome?: string };
 type Finding = Difference & {
   mode: Mode;
@@ -168,6 +175,137 @@ export const job = Effect.gen(function* () {
   return run(Effect.succeed(42));
 });`,
 };
+
+// Reuse the Effect and Layer fixture contracts. Every position gets a value
+// whose full type fits and a value with exactly one additional channel member.
+const relationContracts = [
+  {
+    rule: "missingEffectError", api: "Effect",
+    types: 'interface ReadError { readonly _tag: "ReadError" }',
+    allowed: "Effect.Effect<number>", requires: "Effect.Effect<number, ReadError>",
+  },
+  {
+    rule: "missingEffectContext", api: "Effect",
+    types: 'interface Database { readonly query: () => number }',
+    allowed: "Effect.Effect<number>", requires: "Effect.Effect<number, never, Database>",
+  },
+  {
+    rule: "missingLayerContext", api: "Layer",
+    types: `interface Database { readonly query: () => number }
+interface Repository { readonly read: () => number }`,
+    allowed: "Layer.Layer<Repository>", requires: "Layer.Layer<Repository, never, Database>",
+  },
+];
+const relationPositions = [
+  { kind: "relation-satisfies", body: `export const good = ready satisfies Expected;
+export const bad = missing satisfies Expected;` },
+  { kind: "relation-reassignment", body: `let job: Expected = ready;
+job = missing;
+export { job };` },
+  { kind: "relation-class-property", body: `export class Worker {
+  readonly ready: Expected = ready;
+  readonly job: Expected = missing;
+}` },
+  { kind: "relation-default-parameter", body: `export function worker(fallback: Expected = ready, job: Expected = missing) {
+  return { fallback, job };
+}` },
+  { kind: "relation-object-property", body: `export const options: { fallback: Expected; job: Expected } = {
+  fallback: ready,
+  job: missing,
+};` },
+  { kind: "relation-arrow-return", body: `function schedule(build: () => Expected): Expected { return build(); }
+export const fallback = schedule(() => ready);
+export const job = schedule(() => missing);` },
+  { kind: "relation-async-return", body: `export async function load(): Promise<Expected> {
+  return missing;
+}` },
+  { kind: "relation-computed-property", body: `const key = "job";
+export const options: { queue: { job: Expected } } = {
+  queue: { [key]: missing },
+};` },
+  { kind: "relation-array-element", body: `export const jobs: ReadonlyArray<Expected> = [ready, missing];` },
+  { kind: "relation-generic", body: `function dispatch<Job>(job: Job, consume: (job: NoInfer<Job>) => void): void {
+  consume(job);
+}
+declare function enqueue(job: Expected): void;
+dispatch(ready, enqueue);
+dispatch(missing, enqueue);` },
+  { kind: "relation-jsx-attribute", extension: "tsx" as const, body: `declare global { namespace JSX { interface Element {} } }
+declare function Schedule(props: { job: Expected }): JSX.Element;
+export const fallback = <Schedule job={ready} />;
+export const job = <Schedule job={missing} />;` },
+];
+const relationCases: Case[] = relationPositions.flatMap(({ kind, body, extension }) => relationContracts.map(
+  ({ api, rule, types, allowed, requires }) => ({
+    kind, extension, fixture: `${rule}.ts`, expectedRule: rule,
+    file: `cases/${kind}/${rule}.${extension ?? "ts"}`,
+    source: `import { ${api} } from "effect";
+${types}
+type Expected = ${allowed};
+declare const ready: Expected;
+declare const missing: ${requires};
+
+${body}
+`,
+  }),
+));
+
+const callbackReturns = [
+  {
+    kind: "relation-conditional-return",
+    expectedReports: 2,
+    body: `export function select(usePrimary: boolean): Effect.Effect<number> {
+  return (usePrimary ? (primary) : (backup));
+}`,
+  },
+  {
+    kind: "relation-contextual-block-return",
+    expectedReports: 2,
+    body: `export const choose: (flag: boolean) => Effect.Effect<number> = (flag) => {
+  return flag ? primary : backup;
+};`,
+  },
+  {
+    kind: "relation-contextual-expression-return",
+    expectedReports: 2,
+    body: `export const choose: (flag: boolean) => Effect.Effect<number> = (flag) => flag ? primary : backup;`,
+  },
+  {
+    kind: "relation-contextual-multiple-returns",
+    expectedReports: 2,
+    body: `export const choose: (flag: boolean) => Effect.Effect<number> = (flag) => {
+  if (flag) return primary;
+  return backup;
+};`,
+  },
+  {
+    kind: "relation-overloaded-callback",
+    expectedReports: 1,
+    body: `interface Load {
+  (): Effect.Effect<number>;
+  (options: { readonly force: boolean }): Effect.Effect<number>;
+}
+export const load: Load = () => primary;`,
+  },
+];
+for (const { kind, expectedReports, body } of callbackReturns) {
+  relationCases.push({
+    kind,
+    file: `cases/${kind}/missingEffectError.ts`,
+    fixture: "missingEffectError.ts",
+    expectedRule: "missingEffectError",
+    expectedReports,
+    source: `import { type Effect } from "effect";
+
+interface ReadError { readonly _tag: "ReadError" }
+interface BackupError { readonly _tag: "BackupError" }
+declare const primary: Effect.Effect<number, ReadError>;
+declare const backup: Effect.Effect<number, BackupError>;
+
+${body}
+`,
+  });
+}
 
 function generateCases() {
   const fixtureDirectory = join(upstream, "testdata/tests/effect-v4");
@@ -333,6 +471,10 @@ function project(mode: Mode, cases: Case[]): Fixture {
     plugin.overrides = [{ include: ["generated/**/*.ts"], options: { diagnosticSeverity: { floatingEffect: "off" } } }];
   }
   if (mode === optionalPipeReceiverKind) config.compilerOptions.strictNullChecks = true;
+  if (mode === relationMode) {
+    config.compilerOptions.strict = true;
+    config.compilerOptions.jsx = "preserve";
+  }
   json(fixture.tsconfig, config);
   return fixture;
 }
@@ -349,16 +491,61 @@ function disagreementKey(difference: Difference): string {
   ]);
 }
 
-function compare(reference: Diagnostic[], candidate: Diagnostic[]) {
-  const exact = compareLocations(reference, candidate, true);
+function matchMessages(reference: Diagnostic[], candidate: Diagnostic[]) {
+  const key = (report: Diagnostic) => JSON.stringify([diagnosticSite(report), report.severity, report.message]);
+  const byMessage = Map.groupBy(reference, key);
+  const agreements: Diagnostic[] = [];
+  const extra: Diagnostic[] = [];
+  for (const report of candidate) {
+    const match = byMessage.get(key(report))?.shift();
+    (match ? agreements : extra).push(report);
+  }
+  return { agreements, missing: [...byMessage.values()].flat(), extra };
+}
+
+function compare(reference: Diagnostic[], candidate: Diagnostic[], checkMessages = false) {
+  const messages = checkMessages ? matchMessages(reference, candidate) : undefined;
+  const exact = compareLocations(messages?.missing ?? reference, messages?.extra ?? candidate, true);
   // Pair any remaining reports at one location so a severity mismatch counts once.
   const changed = compareLocations(exact.missing, exact.extra);
   const differences: Difference[] = [
+    ...(checkMessages ? exact.matched.map(({ expected, actual }) => ({
+      reference: expected, candidate: actual, outcome: "message-difference" as const,
+    })) : []),
     ...changed.matched.map(({ expected, actual }) => ({ reference: expected, candidate: actual })),
     ...changed.missing.map((reference) => ({ reference })),
     ...changed.extra.map((candidate) => ({ candidate })),
   ];
-  return { agreements: exact.matched.map(({ actual }) => actual), differences };
+  return { agreements: messages?.agreements ?? exact.matched.map(({ actual }) => actual), differences };
+}
+
+function diagnosticSite({ fixture, file, line, col, rule }: Diagnostic): string {
+  return JSON.stringify([fixture, file, line, col, rule]);
+}
+
+function missingErrorMembers(message: string): Set<string> | undefined {
+  const errors = /^Missing errors (.+) in the expected Effect type\.$/.exec(message)?.[1];
+  // The rule joins its formatted members with this delimiter.
+  return errors ? new Set(errors.split(" | ")) : undefined;
+}
+
+function referenceSubsetSites(reference: Diagnostic[], candidate: Diagnostic[]): Set<string> {
+  const candidateBySite = Map.groupBy(candidate, diagnosticSite);
+  const sites = new Set<string>();
+  for (const [site, expected] of Map.groupBy(reference, diagnosticSite)) {
+    const actual = candidateBySite.get(site);
+    if (expected.length !== 2 || actual?.length !== 1) continue;
+    const [report] = actual;
+    if (report.rule !== "missingEffectError" || expected.some(({ severity }) => severity !== report.severity)) continue;
+    if (!expected.some(({ message }) => message === report.message)) continue;
+    const other = expected.find(({ message }) => message !== report.message);
+    const full = missingErrorMembers(report.message);
+    const subset = other && missingErrorMembers(other.message);
+    if (full && subset && subset.size < full.size && [...subset].every((member) => full.has(member))) {
+      sites.add(site);
+    }
+  }
+  return sites;
 }
 
 function documentedMechanisms(): DocumentedTag[] {
@@ -371,7 +558,7 @@ function documentedMechanisms(): DocumentedTag[] {
     const names = Array.from(cell.matchAll(/`([^`]+)`/g), ([, tag]) => tag);
     if (!names.includes(anchor)) throw new Error(`Missing differential tag on documented difference ${anchor}.`);
     for (const name of names) {
-      const match = /^([a-z][a-z0-9-]*)(?::(\*|[a-zA-Z][a-zA-Z0-9]*)(?::(missing|extra|severity (?:error|warning)→(?:error|warning)))?)?$/.exec(name);
+      const match = /^([a-z][a-z0-9-]*)(?::(\*|[a-zA-Z][a-zA-Z0-9]*)(?::(missing|extra|earlier-pipe-stage|extra-reference-subset|severity (?:error|warning)→(?:error|warning)))?)?$/.exec(name);
       if (!match) throw new Error(`Invalid differential tag on documented difference ${anchor}: ${name}`);
       const [, mechanism, rule = "*", outcome] = match;
       tags.push({ anchor, mechanism, rule, outcome });
@@ -385,9 +572,9 @@ function matchingTags(tags: DocumentedTag[], mechanism: string, rule: string): D
   return tags.filter((tag) => tag.mechanism === mechanism && (tag.rule === rule || tag.rule === "*"));
 }
 
-function classify(tags: DocumentedTag[], mechanism: string, { reference, candidate }: Difference) {
+function classify(tags: DocumentedTag[], mechanism: string, { reference, candidate, outcome: reportOutcome }: Difference, pairedOutcome?: string) {
   const { rule } = (reference ?? candidate)!;
-  const outcome = !candidate ? "missing" : !reference ? "extra" : `severity ${reference.severity}→${candidate.severity}`;
+  const outcome = pairedOutcome ?? reportOutcome ?? (!candidate ? "missing" : !reference ? "extra" : `severity ${reference.severity}→${candidate.severity}`);
   const listedBy = matchingTags(tags, mechanism, rule)
     .filter((tag) => tag.outcome === outcome)
     .map(({ anchor }) => anchor);
@@ -407,6 +594,29 @@ function substitutedConditionalMove(differences: Difference[]): Difference[] {
   const missing = differences.find(({ reference, candidate }) => !candidate && at(reference, site.syncColumn));
   const extra = differences.find(({ reference, candidate }) => !reference && at(candidate, site.subjectColumn));
   return missing && extra ? [missing, extra] : [];
+}
+
+function missingContextPipeMoves(differences: Difference[], byFile: Map<string, Case>): Set<Difference> {
+  const relevant = differences.filter((difference) => {
+    const { file, rule } = (difference.reference ?? difference.candidate)!;
+    return rule === missingContextPipe.rule && byFile.get(file)?.fixture === missingContextPipe.fixture;
+  });
+  const bySource = Map.groupBy(relevant, (difference) => (difference.reference ?? difference.candidate)!.file);
+  const moves = new Set<Difference>();
+  for (const [file, entries] of bySource) {
+    if (entries.length !== 2) continue;
+    // The namespace-import mutation inserts one line before both stages.
+    const offset = byFile.get(file)!.kind === "import-namespace" ? 1 : 0;
+    const missing = entries.find(({ reference, candidate }) =>
+      reference && !candidate && isMissingContextPipeDiagnostic(reference, "reference", offset));
+    const extra = entries.find(({ reference, candidate }) =>
+      !reference && candidate && isMissingContextPipeDiagnostic(candidate, "candidate", offset));
+    if (missing && extra) {
+      moves.add(missing);
+      moves.add(extra);
+    }
+  }
+  return moves;
 }
 
 class ClassifierSelfTestError extends Error {}
@@ -519,13 +729,14 @@ try {
   const tags = documentedMechanisms();
   checkClassifier(tags);
   const { cases, angleAssertions, catchSeeds, skippedTsx, virtualSeeds } = generateCases();
-  const allCases = [...cases, ...Object.values(specialCases).flat()];
+  const allCases = [...cases, ...relationCases, ...Object.values(specialCases).flat()];
   const byFile = new Map(allCases.map((item) => [`/.src/${item.file}`, item]));
   const optionalPipeCases = cases.filter(({ kind }) => kind === optionalPipeReceiverKind);
   const sharedCases = cases.filter(({ kind }) => kind !== optionalPipeReceiverKind);
   const projects = modes.map((mode) => {
     if (mode === "global-error" || mode === "rule-configuration") return project(mode, specialCases[mode]);
-    return project(mode, mode === optionalPipeReceiverKind ? optionalPipeCases : sharedCases);
+    if (mode === optionalPipeReceiverKind) return project(mode, optionalPipeCases);
+    return project(mode, mode === relationMode ? relationCases : sharedCases);
   });
   exposeReferencePackages(root);
   const compiler = await runPass("compiler", projects, []);
@@ -568,24 +779,37 @@ try {
 
   const kindCounts = Map.groupBy(allCases, ({ kind }) => kind);
   const mechanisms = [...new Set([
-    ...kindCounts.keys(), ...modes, "pipe-form", "data-call-form",
+    ...kindCounts.keys(), ...modes, overloadRecovery, "pipe-form", "data-call-form",
     "package-manifest", "checker-type-query", "floating-statement-hook",
   ])].sort();
   for (const mode of modes) {
-    const { agreements, differences } = compare(reference.get(mode) ?? [], candidate.get(mode) ?? []);
+    const expected = reference.get(mode) ?? [];
+    const actual = candidate.get(mode) ?? [];
+    const { agreements, differences } = compare(expected, actual, mode === relationMode);
+    const subsetSites = mode === relationMode ? referenceSubsetSites(expected, actual) : new Set<string>();
     const declaredTypeMove = substitutedConditionalMove(differences);
+    const recoveryMoves = mode === "single-config" || mode === "extends-plugin"
+      ? missingContextPipeMoves(differences, byFile) : new Set<Difference>();
     for (const agreement of agreements) {
       const kind = byFile.get(agreement.file)!.kind;
-      tally(mode === "single-config" ? kind : mode, agreement.rule, "agreements");
+      tally(mode === "single-config" || mode === relationMode ? kind : mode, agreement.rule, "agreements");
     }
     for (const difference of differences) {
       const { file, rule } = (difference.reference ?? difference.candidate)!;
       const sample = byFile.get(file)!;
       const key = disagreementKey(difference);
       if (mode === "single-config") controlDifferences.add(key);
-      const mechanism = controlDifferences.has(key) ? sample.kind : mode;
+      const recoveryMove = recoveryMoves.has(difference);
+      const defaultMechanism = mode === relationMode || controlDifferences.has(key) ? sample.kind : mode;
+      const mechanism = recoveryMove ? overloadRecovery : defaultMechanism;
       const applicableTags = mechanism === pipeableDeclaredTypes && !declaredTypeMove.includes(difference) ? [] : tags;
-      const result = classify(applicableTags, mechanism, difference);
+      let outcome: string | undefined;
+      if (recoveryMove) outcome = earlierPipeStage;
+      // The full message pairs first, leaving the subset report as surplus.
+      if (difference.reference && !difference.candidate && subsetSites.has(diagnosticSite(difference.reference))) {
+        outcome = extraReferenceSubset;
+      }
+      const result = classify(applicableTags, mechanism, difference, outcome);
       const finding: Finding = { ...difference, mode, mechanism, seed: sample.fixture, ...result };
       findings.push(finding);
       tally(mechanism, rule, finding.classification);
@@ -636,11 +860,22 @@ try {
       .map(({ line, col }) => `${line}:${col}`).join(", ") || "none";
     return `| ${kind} | ${reports(compilerDiagnostics)} | ${reports(oxlintDiagnostics)} | ${reports(candidateDiagnostics)} |`;
   });
+  const relationEvidence = relationCases.map(({ kind, expectedRule, expectedReports = 1, file }) => {
+    const reports = (diagnostics: Diagnostic[]) => diagnostics.filter((item) =>
+      item.fixture === relationMode && item.rule === expectedRule && item.file === `/.src/${file}`);
+    const [direct, lint, candidate] = [compilerDiagnostics, oxlintDiagnostics, candidateDiagnostics].map(reports);
+    const locations = (items: Diagnostic[]) => items.map(({ line, col }) => `${line}:${col}`).join(", ") || "none";
+    return {
+      row: `| ${kind} | ${expectedRule} | ${locations(direct)} | ${locations(lint)} | ${locations(candidate)} |`,
+      covered: direct.length === expectedReports && lint.length === expectedReports,
+    };
+  });
+  const uncoveredRelations = relationEvidence.filter(({ covered }) => !covered).length;
   json(join(artifactDirectory, "differential-differences.json"), findings);
   publish([
     "Classifier self-test passed.",
     `Gated rules: ${[...gatedBunRules].join(", ")}.`, "",
-    `Corpus: ${kindCounts.get("single-config")!.length} seed files and ${sharedCases.length - kindCounts.get("single-config")!.length} mutations, plus ${sharedCases.filter(({ reexport }) => reexport).length} local re-export files, in each shared-corpus project. The noLib, scoped override and optional receiver projects run separately.`,
+    `Corpus: ${kindCounts.get("single-config")!.length} seed files and ${sharedCases.length - kindCounts.get("single-config")!.length} mutations, plus ${sharedCases.filter(({ reexport }) => reexport).length} local re-export files, in each shared-corpus project. The noLib, scoped override, optional receiver and strict relation-position projects run separately.`,
     ...(virtualSeeds.length ? [
       `Virtual-file fixtures remain in the fixture gate: ${virtualSeeds.join(", ")}.`,
     ] : []),
@@ -670,6 +905,11 @@ try {
     "| Mechanism | Compiler locations | Oxlint locations | Bun locations |",
     "| --- | --- | --- | --- |",
     ...expectedTypeEvidence, "",
+    "## Strict relation positions", "",
+    `The ${relationCases.length} cases expect one reference diagnostic each, with two for the explicitly annotated conditional return and the three contextual callback probes. Cases with unexpected reference counts: ${uncoveredRelations}.`, "",
+    "| Position | Rule | Compiler locations | Oxlint locations | Bun locations |",
+    "| --- | --- | --- | --- | --- |",
+    ...relationEvidence.map(({ row }) => row), "",
     "| Mechanism | New | Listed | Agreements |",
     "| --- | ---: | ---: | ---: |",
     ...mechanismRows,
@@ -682,6 +922,7 @@ try {
     ...(repros.length ? repros : ["None."]), "",
     "See `differential-differences.json` for each disagreement, its configuration, and the matching difference-list row, if any.",
   ]);
+  if (uncoveredRelations) process.exitCode = 1;
   console.log(`Effect differential completed in ${elapsed()} s: ${totals.new} new, ${totals.listed} listed, ${totals.agreements} agreements.`);
 } catch (error) {
   if (error instanceof ClassifierSelfTestError) {
