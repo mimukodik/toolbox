@@ -16,6 +16,9 @@ export const gatedBunRules = new Set<string>([
   "returnEffectInGen",
   "missingStarInYieldEffectGen",
   "missingReturnYieldStar",
+  "effectTryWithoutCatch",
+  "catchUnfailableEffect",
+  "lazyPromiseInEffectSync",
 ]);
 const requestedRules = new Set<string>(parityRules);
 const oxlintRules = new Map(parityRules.map((name) => [
@@ -272,9 +275,9 @@ export function candidateGate(compiler: Pass, oxlint: Pass, bun: Pass): { passed
   const omissions = compareLocations(expectedOmissions, direct.missing);
   const omissionsMatch = omissions.missing.length === 0 && omissions.extra.length === 0
     && omissions.matched.every(({ expected, actual }) => expected.severity === actual.severity);
-  const passed = lint.matched.length === 136 && lint.missing.length === 0
+  const passed = lint.matched.length === 177 && lint.missing.length === 0
     && lint.extra.length === 0 && bun.failures.length === 0
-    && direct.matched.length === 136 && direct.missing.length === 7
+    && direct.matched.length === 177 && direct.missing.length === 14
     && direct.extra.length === 0 && omissionsMatch && severityMismatches.length === 0;
   const ruleRows = [...gatedBunRules].map((rule) => {
     const lintCount = lintReference.filter((diagnostic) => diagnostic.rule === rule).length;
@@ -301,8 +304,8 @@ export function candidateGate(compiler: Pass, oxlint: Pass, bun: Pass): { passed
       `- Fixture execution or parsing failures: ${bun.failures.length}`,
       `- Direct compiler omissions are exactly the message and suggestion diagnostics: ${omissionsMatch ? "yes" : "no"}`,
       `- Direct compiler severity mismatches: ${severityMismatches.length}`,
-      ...lint.missing.map((item) => `- Missing Oxlint location: ${location(item)}`),
-      ...lint.extra.map((item) => `- Extra Bun location: ${location(item)}`),
+      ...lint.missing.map((item) => `- Oxlint only: ${location(item)} — ${item.message}`),
+      ...lint.extra.map((item) => `- Bun only: ${location(item)} — ${item.message}`),
       ...direct.missing.map((item) => `- Missing direct compiler location: ${location(item)}`),
       ...severityMismatches.map(({ expected, actual }) => `- Severity mismatch: ${location(actual)}, expected ${expected.severity}`),
     ].join("\n"),
