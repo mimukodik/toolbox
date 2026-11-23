@@ -494,16 +494,23 @@ function compare(reference: Diagnostic[], candidate: Diagnostic[]) {
   return { agreements: exact.matched.map(({ actual }) => actual), differences };
 }
 
-function duplicateReferenceReports(reference: Diagnostic[], candidate: Diagnostic[]): Set<Diagnostic> {
-  const site = ({ fixture, file, line, col, rule }: Diagnostic) => JSON.stringify([fixture, file, line, col, rule]);
-  const candidateBySite = Map.groupBy(candidate, site);
-  const duplicates = new Set<Diagnostic>();
-  for (const [key, expected] of Map.groupBy(reference, site)) {
-    const actual = candidateBySite.get(key);
-    if (expected.length === 2 && actual?.length === 1
-      && expected.every(({ severity, message }) => severity === actual[0].severity && message === actual[0].message)) {
-      // The location comparer consumes the first report in input order.
-      duplicates.add(expected[1]);
+function diagnosticSite({ fixture, file, line, col, rule }: Diagnostic): string {
+  return JSON.stringify([fixture, file, line, col, rule]);
+}
+
+function diagnosticKey(diagnostic: Diagnostic): string {
+  return JSON.stringify([diagnosticSite(diagnostic), diagnostic.severity, diagnostic.message]);
+}
+
+function duplicateReferenceReports(reference: Diagnostic[], candidate: Diagnostic[]): Map<string, number> {
+  const candidateBySite = Map.groupBy(candidate, diagnosticSite);
+  const duplicates = new Map<string, number>();
+  for (const [site, expected] of Map.groupBy(reference, diagnosticSite)) {
+    const actual = candidateBySite.get(site);
+    if (expected.length !== 2 || actual?.length !== 1) continue;
+    const key = diagnosticKey(actual[0]);
+    if (expected.every((report) => diagnosticKey(report) === key)) {
+      duplicates.set(key, expected.length - actual.length);
     }
   }
   return duplicates;
@@ -747,7 +754,7 @@ try {
     const expected = reference.get(mode) ?? [];
     const actual = candidate.get(mode) ?? [];
     const { agreements, differences } = compare(expected, actual);
-    const duplicates = mode === relationMode ? duplicateReferenceReports(expected, actual) : new Set<Diagnostic>();
+    const duplicates = mode === relationMode ? duplicateReferenceReports(expected, actual) : new Map<string, number>();
     const declaredTypeMove = substitutedConditionalMove(differences);
     const recoveryMoves = mode === "single-config" || mode === "extends-plugin"
       ? missingContextPipeMoves(differences, byFile) : new Set<Difference>();
@@ -766,8 +773,13 @@ try {
       const applicableTags = mechanism === pipeableDeclaredTypes && !declaredTypeMove.includes(difference) ? [] : tags;
       let outcome: string | undefined;
       if (recoveryMove) outcome = earlierPipeStage;
-      if (difference.reference && !difference.candidate && duplicates.has(difference.reference)) {
-        outcome = duplicateReference;
+      if (difference.reference && !difference.candidate) {
+        const key = diagnosticKey(difference.reference);
+        const excess = duplicates.get(key) ?? 0;
+        if (excess > 0) {
+          duplicates.set(key, excess - 1);
+          outcome = duplicateReference;
+        }
       }
       const result = classify(applicableTags, mechanism, difference, outcome);
       const finding: Finding = { ...difference, mode, mechanism, seed: sample.fixture, ...result };
