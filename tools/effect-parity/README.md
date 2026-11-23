@@ -68,9 +68,10 @@ standalone v4 fixtures whose baselines mention the 19 gated rules. Virtual-file 
 A separate strict TypeScript project exercises each missing-channel rule in
 `satisfies`, reassignment, class property initializers, default parameters,
 object properties, concise callback returns, array elements, inferred generic
-calls, JSX attributes, async returns and computed properties. A conditional
-return probe checks both arms for distinct errors. The report includes both references and Bun by
-position and rule.
+calls, JSX attributes, async returns and computed properties. Conditional
+return probes check both arms with an explicit return annotation and cover the
+assignment and expression locations for contextually typed callbacks. The report
+includes both references and Bun by position and rule.
 The AST pass runs just the generator rule, using the existing Oxlint install.
 
 Seed 2431 selects one edit site per eligible fixture, mutation, and rewrite

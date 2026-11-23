@@ -249,24 +249,45 @@ ${body}
   }),
 ));
 
-relationCases.push({
-  kind: "relation-conditional-return",
-  file: "cases/relation-conditional-return/missingEffectError.ts",
-  fixture: "missingEffectError.ts",
-  expectedRule: "missingEffectError",
-  expectedReports: 2,
-  source: `import { type Effect } from "effect";
+const conditionalReturns = [
+  {
+    kind: "relation-conditional-return",
+    expectedReports: 2,
+    body: `export function select(usePrimary: boolean): Effect.Effect<number> {
+  return (usePrimary ? (primary) : (backup));
+}`,
+  },
+  {
+    kind: "relation-contextual-block-return",
+    expectedReports: 1,
+    body: `export const choose: (flag: boolean) => Effect.Effect<number> = (flag) => {
+  return flag ? primary : backup;
+};`,
+  },
+  {
+    kind: "relation-contextual-expression-return",
+    expectedReports: 1,
+    body: `export const choose: (flag: boolean) => Effect.Effect<number> = (flag) => flag ? primary : backup;`,
+  },
+];
+for (const { kind, expectedReports, body } of conditionalReturns) {
+  relationCases.push({
+    kind,
+    file: `cases/${kind}/missingEffectError.ts`,
+    fixture: "missingEffectError.ts",
+    expectedRule: "missingEffectError",
+    expectedReports,
+    source: `import { type Effect } from "effect";
 
 interface ReadError { readonly _tag: "ReadError" }
 interface BackupError { readonly _tag: "BackupError" }
 declare const primary: Effect.Effect<number, ReadError>;
 declare const backup: Effect.Effect<number, BackupError>;
 
-export function select(usePrimary: boolean): Effect.Effect<number> {
-  return (usePrimary ? (primary) : (backup));
-}
+${body}
 `,
-});
+  });
+}
 
 function generateCases() {
   const fixtureDirectory = join(upstream, "testdata/tests/effect-v4");
@@ -813,7 +834,7 @@ try {
     "| --- | --- | --- | --- |",
     ...expectedTypeEvidence, "",
     "## Strict relation positions", "",
-    `The ${relationCases.length} cases expect one reference diagnostic each, with two for the conditional return. Cases with unexpected reference counts: ${uncoveredRelations}.`, "",
+    `The ${relationCases.length} cases expect one reference diagnostic each, with two for the explicitly annotated conditional return. Cases with unexpected reference counts: ${uncoveredRelations}.`, "",
     "| Position | Rule | Compiler locations | Oxlint locations | Bun locations |",
     "| --- | --- | --- | --- | --- |",
     ...relationEvidence.map(({ row }) => row), "",

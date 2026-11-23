@@ -319,7 +319,7 @@ index 0d89ba10..8d599771 100644
      (b"effectTryWithoutCatch", b"bun/effect-try-without-catch", Off),
      (b"catchUnfailableEffect", b"bun/catch-unfailable-effect", Suggestion),
 diff --git a/src/lint/plugins/effect/expected_and_real_type.rs b/src/lint/plugins/effect/expected_and_real_type.rs
-index 640928b3..ea6def0d 100644
+index 640928b3..4e08c6e6 100644
 --- a/src/lint/plugins/effect/expected_and_real_type.rs
 +++ b/src/lint/plugins/effect/expected_and_real_type.rs
 @@ -16,6 +16,8 @@ pub(super) enum Expected<'a> {
@@ -331,26 +331,16 @@ index 640928b3..ea6def0d 100644
  }
 
  pub(super) enum ExpectedTypes<'a> {
-@@ -31,6 +33,18 @@ impl<'a> Expected<'a> {
+@@ -31,6 +33,8 @@ impl<'a> Expected<'a> {
              Self::Symbol(symbol, site) => symbol.get_type_at_location(site),
              Self::Contextual(node) => node.get_contextual_type()?,
              Self::Return(declaration) => return return_types(declaration),
-+            Self::RelationReturn(declaration) => {
-+                if let Some(annotation) = declaration.type_node() {
-+                    annotation.get_type_from_type_node()
-+                } else {
-+                    let signatures = declaration.get_contextual_type()?.get_call_signatures();
-+                    if signatures.len() != 1 {
-+                        return None;
-+                    }
-+                    signatures.first()?.get_return_type()
-+                }
-+            }
++            Self::RelationReturn(declaration) => declaration.type_node()?.get_type_from_type_node(),
 +            Self::Argument(call, index) => call.get_contextual_type_for_argument_at_index(index)?,
          };
          Some(ExpectedTypes::Single(ty))
      }
-@@ -60,6 +74,14 @@ fn return_types(declaration: TsNode<'_>) -> Option<ExpectedTypes<'_>> {
+@@ -60,6 +64,14 @@ fn return_types(declaration: TsNode<'_>) -> Option<ExpectedTypes<'_>> {
 
  // ets_typeparser/src/expected_and_real_type.rs:124–318.
  pub(super) fn visit<'a>(root: TsNode<'a>, mut visit_pair: impl FnMut(Pair<'a>)) {
@@ -365,7 +355,7 @@ index 640928b3..ea6def0d 100644
      let mut pending = VecDeque::from([root]);
      while let Some(node) = pending.pop_front() {
          let mut pair = |location, real, expected| {
-@@ -73,8 +95,49 @@ pub(super) fn visit<'a>(root: TsNode<'a>, mut visit_pair: impl FnMut(Pair<'a>))
+@@ -73,8 +85,49 @@ pub(super) fn visit<'a>(root: TsNode<'a>, mut visit_pair: impl FnMut(Pair<'a>))
              Kind::VariableDeclaration => {
                  if let (Some(name), Some(value)) = (node.name(), node.initializer()) {
                      pair(name, value, Expected::At(name));
@@ -417,7 +407,7 @@ index 640928b3..ea6def0d 100644
                  }
              }
              Kind::CallExpression => {
-@@ -88,7 +151,7 @@ pub(super) fn visit<'a>(root: TsNode<'a>, mut visit_pair: impl FnMut(Pair<'a>))
+@@ -88,7 +141,7 @@ pub(super) fn visit<'a>(root: TsNode<'a>, mut visit_pair: impl FnMut(Pair<'a>))
                      }
                  }
              }
@@ -426,7 +416,7 @@ index 640928b3..ea6def0d 100644
                  if let Some(property) = node.parent()
                      && matches!(
                          property.kind(),
-@@ -119,15 +182,22 @@ pub(super) fn visit<'a>(root: TsNode<'a>, mut visit_pair: impl FnMut(Pair<'a>))
+@@ -119,15 +172,23 @@ pub(super) fn visit<'a>(root: TsNode<'a>, mut visit_pair: impl FnMut(Pair<'a>))
                      let left = left.ts_node_with_parentheses();
                      let right = right.ts_node_with_parentheses();
                      pair(left, right, Expected::At(left));
@@ -443,31 +433,38 @@ index 640928b3..ea6def0d 100644
                      && let Some(function) = containing_function(node)
                  {
 -                    pair(node, value, Expected::Return(function));
-+                    let expected = if relations {
-+                        Expected::RelationReturn(function)
++                    if relations {
++                        if function.type_node().is_some() {
++                            pair(node, value, Expected::RelationReturn(function));
++                        }
 +                    } else {
-+                        Expected::Return(function)
-+                    };
-+                    pair(node, value, expected);
++                        pair(node, value, Expected::Return(function));
++                    }
                  }
              }
              Kind::ArrowFunction => {
-@@ -135,19 +205,24 @@ pub(super) fn visit<'a>(root: TsNode<'a>, mut visit_pair: impl FnMut(Pair<'a>))
+@@ -135,19 +196,26 @@ pub(super) fn visit<'a>(root: TsNode<'a>, mut visit_pair: impl FnMut(Pair<'a>))
                      && let FnBody::Expr(body) = function.body()
                  {
                      let body = body.ts_node_with_parentheses();
 -                    let expected = if function.type_params().is_empty() {
-+                    let expected = if relations && node.type_node().is_some() {
-+                        Expected::RelationReturn(node)
-+                    } else if function.type_params().is_empty() {
-                         Expected::Contextual(body)
+-                        Expected::Contextual(body)
++                    if relations {
++                        if node.type_node().is_some() {
++                            pair(body, body, Expected::RelationReturn(node));
++                        }
                      } else {
-                         Expected::Return(node)
-                     };
-                     pair(body, body, expected);
+-                        Expected::Return(node)
+-                    };
+-                    pair(body, body, expected);
 -                    pending.extend(body.children());
 -                    continue;
-+                    if !relations {
++                        let expected = if function.type_params().is_empty() {
++                            Expected::Contextual(body)
++                        } else {
++                            Expected::Return(node)
++                        };
++                        pair(body, body, expected);
 +                        pending.extend(body.children());
 +                        continue;
 +                    }
@@ -481,7 +478,7 @@ index 640928b3..ea6def0d 100644
                      pending.push_back(value);
                      continue;
                  }
-@@ -157,4 +232,3 @@ pub(super) fn visit<'a>(root: TsNode<'a>, mut visit_pair: impl FnMut(Pair<'a>))
+@@ -157,4 +225,3 @@ pub(super) fn visit<'a>(root: TsNode<'a>, mut visit_pair: impl FnMut(Pair<'a>))
          pending.extend(node.children());
      }
  }
@@ -510,10 +507,10 @@ index 85f26803..1cd74202 100644
      bun_return_effect_in_gen::ReturnEffectInGen,
 diff --git a/src/lint/plugins/effect/relation_errors.rs b/src/lint/plugins/effect/relation_errors.rs
 new file mode 100644
-index 0000000..bba581c
+index 00000000..1a9aeb5f
 --- /dev/null
 +++ b/src/lint/plugins/effect/relation_errors.rs
-@@ -0,0 +1,235 @@
+@@ -0,0 +1,232 @@
 +// Adapted from Effect-TS/tsgo's MIT-licensed missing channel rules at
 +// 0e722d359c969bdf1b1316f08e8637022cde3cce.
 +use super::{
@@ -706,41 +703,38 @@ index 0000000..bba581c
 +                }
 +            }
 +        }
-+        Kind::ArrowFunction => {
-+            if let Some(function) = function_syntax(value)
-+                && let FnBody::Expr(body) = function.body()
-+                && function
-+                    .params()
-+                    .iter()
-+                    .all(|param| param.ts_node().type_node().is_none())
-+            {
-+                let signatures = target.get_call_signatures();
-+                if signatures.len() == 1
-+                    && let Some(signature) = signatures.first()
-+                {
-+                    let body = body.ts_node_with_parentheses();
-+                    visit_failed(
-+                        body,
-+                        body,
-+                        body.get_type_at_location(),
-+                        signature.get_return_type(),
-+                        report,
-+                    );
-+                }
-+            }
-+        }
 +        _ => {}
 +    }
 +
-+    // Parameter comparison reverses the assignment: the expected callback's
-+    // input must be accepted by the supplied callback. This also covers bare
-+    // functions passed to pipe, whose failing Effect is in that input.
 +    let source_signatures = source.get_call_signatures();
 +    let target_signatures = target.get_call_signatures();
 +    if source_signatures.len() == 1
 +        && target_signatures.len() == 1
 +        && let (Some(source), Some(target)) = (source_signatures.first(), target_signatures.first())
 +    {
++        if matches!(value.kind(), Kind::ArrowFunction | Kind::FunctionExpression)
++            && let Some(function) = function_syntax(value)
++        {
++            let source = source.get_return_type();
++            let target = target.get_return_type();
++            // The assignment elaborator moves concise arrows with untyped
++            // parameters to the body. For blocks it compares at the assignment.
++            if value.kind() == Kind::ArrowFunction
++                && let FnBody::Expr(body) = function.body()
++                && function
++                    .params()
++                    .iter()
++                    .all(|param| param.ts_node().type_node().is_none())
++            {
++                let body = body.ts_node_with_parentheses();
++                visit_failed(body, body, source, target, report);
++            } else if !source.is_assignable_to(target) {
++                report(location, source, target);
++            }
++        }
++
++        // The supplied callback must accept the expected callback's input.
++        // This also covers pipe stages that fail on an Effect input.
 +        for (accepts, supplied) in source.parameters().into_iter().zip(target.parameters()) {
 +            let (source, target) = (supplied.get_type(), accepts.get_type());
 +            if !source.is_assignable_to(target) {
@@ -819,10 +813,10 @@ index 00000000..c7a5f4d2
 +    }
 +);
 diff --git a/test/cli/lint/effect.test.ts b/test/cli/lint/effect.test.ts
-index 9a1b0b1..b0c48c9 100644
+index 9a1b0b1b..a910d413 100644
 --- a/test/cli/lint/effect.test.ts
 +++ b/test/cli/lint/effect.test.ts
-@@ -625,3 +625,132 @@ describe("Effect v4 expected types and runtime contexts", () => {
+@@ -625,3 +625,158 @@ describe("Effect v4 expected types and runtime contexts", () => {
      expect(exitCode).toBe(0);
    });
  });
@@ -952,6 +946,32 @@ index 9a1b0b1..b0c48c9 100644
 +      "16:37 Missing errors BackupError in the expected Effect type.",
 +      "19:13 Missing 'Database' in the expected Layer context.",
 +    ]);
++    expect(exitCode).toBe(1);
++  });
++
++  test.concurrent("reports contextual callback failures at the block assignment or concise body", async () => {
++    const code = [
++      'interface Effect<A, E = never> { "~effect/Effect": { _A: () => A; _E: () => E; _R: () => never } }',
++      'declare const primary: Effect<number, "ReadError">;',
++      'declare const backup: Effect<number, "BackupError">;',
++      'type Select = (flag: boolean) => Effect<number>;',
++      'export const block: Select = (flag) => {',
++      '  return flag ? primary : backup;',
++      '};',
++      'export const concise: Select = (flag) => flag ? primary : backup;',
++    ].join("\n");
++    const files = {
++      ".oxlintrc.json": JSON.stringify({ options: { typeAware: true }, categories: { correctness: "off" } }),
++      "tsconfig.json": JSON.stringify({
++        compilerOptions: { ...options, strict: true, plugins: [{ name: "@effect/language-service" }] },
++      }),
++      "callbacks.ts": code,
++    };
++    const { errors, exitCode } = await lint(files, ["callbacks.ts"]);
++    expect(errors.map(line => line.split(" ")[0])).toEqual(["5:14", "8:42"]);
++    for (const error of errors) {
++      expect(error).toContain("in the expected Effect type.");
++    }
 +    expect(exitCode).toBe(1);
 +  });
 +});
