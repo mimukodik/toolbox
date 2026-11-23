@@ -13,9 +13,13 @@ on:
   workflow_dispatch:
     inputs:
       bun_build_run:
-        description: Successful Bun build run ID for this commit. Leave blank to score the pinned release.
+        description: Successful Bun build run ID for this commit or an ancestor with the same build inputs. Leave blank to score the pinned release.
         type: string
         required: false
+      regenerate_rule_docs:
+        description: Regenerate Bun rule docs with the candidate and verify the checked-in output.
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -30,8 +34,8 @@ jobs:
     env:
       BUN_BUILD_RUN: ${{ inputs.bun_build_run }}
       EFFECT_REV: 0e722d359c969bdf1b1316f08e8637022cde3cce
-      BUN_RELEASE: bun-1.4.6-canary.1-b15f513-p2
-      BUN_RELEASE_SHA256: 2a005ab0a9eff121afa283bee50e0e5249eb59c1b1706557340640f23f83d03d
+      BUN_RELEASE: bun-1.4.6-canary.1-b15f513-p3
+      BUN_RELEASE_SHA256: c5f5d133f764f912ebdad9776f807f64cc415e33b6b57ad8fa41504bebe54b7d
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
@@ -89,13 +93,31 @@ jobs:
           fi
           head=$(git rev-parse HEAD)
           run=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$BUN_BUILD_RUN")
-          if ! jq -e --arg repo "$GITHUB_REPOSITORY" --arg head "$head" '
-            .head_repository.full_name == $repo and .head_sha == $head and
+          if ! jq -e --arg repo "$GITHUB_REPOSITORY" '
+            .head_repository.full_name == $repo and (.head_sha | test("^[a-f0-9]{40}$")) and
             .path == ".github/workflows/build-bun.yml" and .conclusion == "success"
           ' <<< "$run" > /dev/null; then
-            echo "::error::Run $BUN_BUILD_RUN must be a successful build-bun.yml run from $GITHUB_REPOSITORY at $head."
+            echo "::error::Run $BUN_BUILD_RUN must be a successful build-bun.yml run from $GITHUB_REPOSITORY."
             exit 1
           fi
+          build_sha=$(jq -r .head_sha <<< "$run")
+          if [[ "$build_sha" != "$head" ]]; then
+            # The compare API returns at most 300 changed files, all on page one.
+            compare=$(gh api "repos/$GITHUB_REPOSITORY/compare/$build_sha...$head?per_page=1")
+            if ! jq -e --arg build "$build_sha" '
+              def parity_only:
+                startswith("tools/effect-parity/") or
+                . == ".github/workflows/effect-parity.yml" or
+                . == "tools/bun/effect-port-differences.md";
+              .merge_base_commit.sha == $build and
+              (.files | type == "array" and length < 300 and
+                all(.[]; (.filename | parity_only) and ((.previous_filename // .filename) | parity_only)))
+            ' <<< "$compare" > /dev/null; then
+              echo "::error::Bun build $build_sha must be an ancestor of $head with only parity files changed."
+              exit 1
+            fi
+          fi
+          printf 'EFFECT_PARITY_BUILD_SHA=%s\n' "$build_sha" >> "$GITHUB_ENV"
 
       - name: Set up Nix for the candidate runtime
         if: env.BUN_BUILD_RUN != ''
@@ -131,14 +153,44 @@ jobs:
           mkdir -p "$RUNNER_TEMP/effect-parity"
           {
             printf 'Build run: %s/%s/actions/runs/%s\n' "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$BUN_BUILD_RUN"
-            printf 'Toolbox commit: %s\n' "$GITHUB_SHA"
+            printf 'Bun build commit: %s\nParity commit: %s\n' "$EFFECT_PARITY_BUILD_SHA" "$GITHUB_SHA"
             printf 'Closure SHA-256: %s\nBun revision: %s\n' "$sha256" "$revision"
           } | tee "$RUNNER_TEMP/effect-parity/effect-bun-candidate.txt"
 
       - name: Score both reference paths, then patched Bun
+        id: score
         run: |
           mkdir -p "$RUNNER_TEMP/effect-parity"
           "$STOCK_BUN" tools/effect-parity/parity.ts .effect-tsgo "$RUNNER_TEMP/effect-parity"
+
+      - name: Report generated Effect lint differences
+        if: ${{ !cancelled() && env.BUN_BUILD_RUN != '' && steps.score.outputs.candidate_scored == 'true' }}
+        continue-on-error: true
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          # Leave an artifact even if the process hits the wall-time limit.
+          summary="$RUNNER_TEMP/effect-parity/differential-summary.md"
+          printf '# Effect lint differential\n\nReport incomplete. See the workflow step log.\n' > "$summary"
+          timeout --kill-after=5s 285s "$STOCK_BUN" tools/effect-parity/differential.ts \
+            .effect-tsgo "$RUNNER_TEMP/effect-parity"
+
+      - name: Regenerate candidate Bun rule docs
+        if: ${{ !cancelled() && env.EFFECT_PARITY_CANDIDATE_BUN != '' && inputs.regenerate_rule_docs }}
+        shell: bash
+        run: |
+          source=$(nix build --no-link --print-out-paths .#bun.src)
+          scratch=$(mktemp -d "$RUNNER_TEMP/bun-rule-docs.XXXXXX")
+          tar -xzf "$source" -C "$scratch" --strip-components=1 --wildcards \
+            '*/src/codegen/lint-rule-docs.ts' '*/src/codegen/lint-rule-options.ts' '*/docs/lint/rules/*'
+          for patch in "$GITHUB_WORKSPACE"/tools/bun/patches/*.patch; do
+            [[ -f "$patch" && ! -L "$patch" ]] || continue
+            git -C "$scratch" apply --include='docs/lint/rules/**' "$patch"
+          done
+          cd "$scratch"
+          cp -a docs/lint/rules checked-in
+          "$EFFECT_PARITY_CANDIDATE_BUN" src/codegen/lint-rule-docs.ts --write
+          diff -ru checked-in docs/lint/rules | tee "$RUNNER_TEMP/effect-parity/bun-rule-docs.diff"
 
       - name: Upload parity evidence
         if: ${{ !cancelled() }}

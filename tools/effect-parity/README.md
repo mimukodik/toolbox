@@ -10,7 +10,7 @@ stock Bun 1.4.5 as its TypeScript runtime.
   `tsrs` 0.25.0-ts7.1.0-beta. Its lockfile uses the resolutions from
   slack-listener at `8132eccf4db7799dc3647e467ddc08f7384aa9a8`.
 - The default subject is Toolbox's Linux x86-64 release
-  `bun-1.4.6-canary.1-b15f513-p2`. The workflow pins the SHA-256 published
+  `bun-1.4.6-canary.1-b15f513-p3`. The workflow pins the SHA-256 published
   with the release and passes it to the installer from the release tag.
 
 ## Run and extend the harness
@@ -38,23 +38,57 @@ plugin for all passes. Two reference gates must pass before Bun runs.
    [Patch 180](https://github.com/Effect-TS/tsgo/blob/0e722d359c969bdf1b1316f08e8637022cde3cce/_patches/tsrs/180-lint-type-check-severity.patch)
    filters those categories before Oxlint receives type-check diagnostics.
 
-The pinned Bun release score uses the full `floatingEffect` baseline, including
-its suggestion and message. This score is informational.
+The pinned Bun release score is informational and uses all severities from the compiler baselines.
 
 To gate a candidate Bun build, run **Effect lint parity** on the candidate
 branch and supply `bun_build_run`, the successful **Build and prove Bun lint**
-run ID for that commit. The workflow checks the run's repository, workflow, and
-commit and verifies the closure checksum before importing the build artifact.
-The `effect-parity` artifact records the build run, commit, checksum, and Bun
-revision alongside the parity evidence.
+run ID. The workflow accepts a build from the same repository and commit, or
+from an ancestor when changes are confined to the parity harness, its
+workflow, and the documented difference list. It verifies the closure
+checksum before importing the build artifact. The `effect-parity` artifact
+records the build run, build commit, parity commit, checksum, and Bun
+revision alongside the parity evidence. Set `regenerate_rule_docs` to run
+`bun src/codegen/lint-rule-docs.ts --write` with that same candidate and check
+that it reproduces the patched rule pages, index, and example reports.
 
-The candidate gate requires all 114 locations reported by Oxlint across the
-[seven Bun Effect rules](../bun/README.md), with zero extras and zero fixture
-execution or parsing failures. The direct compiler comparison requires Bun's
-severity to match at each shared location. Oxlint formats the compiler's
-warnings as errors. The two required compiler-only omissions are the message
-at line 23 and the suggestion at line 27 of
-`floatingEffect_directivePrecedence.ts`.
+The candidate gate requires all 136 locations reported by Oxlint across the
+[eleven Bun Effect rules](../bun/README.md), with zero extras and zero fixture
+execution or parsing failures. Against the direct compiler it requires 136 of
+143 locations, exact agreement on the set of seven lower-severity omissions
+described above, zero extras, and matching severity at every shared location.
+Oxlint formats the compiler's warnings as errors in Unix output.
+
+## Generated differential
+
+Each run that scores a candidate also generates a report on Blacksmith. The
+report step runs after the gate, has a five-minute limit, and cannot fail
+the job. It uses the locked Oxlint parser's TypeScript AST to rewrite the
+standalone v4 fixtures whose baselines mention the eleven gated rules.
+The AST pass runs just the generator rule, using the existing Oxlint install.
+
+Seed 2431 selects one edit site per fixture and mutation, preferring sites
+that contain a baseline diagnostic. The corpus includes every selected seed
+fixture as a control and caps each mutation at eight files. The same corpus
+runs in a single-config project and in a project whose child config
+redeclares the base config's plugin by name.
+The single and base configs set `floatingEffect` to warning to exercise
+inheritance of a setting that differs from the default.
+
+Each project batches the slack-listener and candidate commands described
+above. The comparison uses file, line, column, rule, and visible severity.
+As in the gate, the compiler pass supplies the severity that the Oxlint Unix
+formatter collapses to error. Only errors and warnings are counted.
+
+In the `effect-parity` artifact, `differential-summary.md` gives the counts by
+mechanism and rule, documented coverage, corpus size, and wall time.
+A difference is listed when the [difference list](../bun/effect-port-differences.md)
+predicts its mechanism, rule, and outcome. The step tests the classifier on
+two synthetic severity mismatches before starting the linters.
+`differential-differences.json` records every disagreement and any matching
+prediction. Each new mechanism gets its smallest affected file under
+`differential-repros/`, with the project config and any local re-export it
+needs. To replay one, make the locked fixture dependencies available from
+that directory and run both commands against it with `--tsconfig tsconfig.json`.
 
 ## Bun p1 findings
 
