@@ -255,7 +255,7 @@ index 5681539..0d89ba1 100644
      (b"effectTryWithoutCatch", b"bun/effect-try-without-catch", Off),
 diff --git a/src/lint/plugins/effect/expected_and_real_type.rs b/src/lint/plugins/effect/expected_and_real_type.rs
 new file mode 100644
-index 0000000..4633724
+index 0000000..51483e6
 --- /dev/null
 +++ b/src/lint/plugins/effect/expected_and_real_type.rs
 @@ -0,0 +1,184 @@
@@ -331,12 +331,12 @@ index 0000000..4633724
 +            })
 +        };
 +        match node.kind() {
-+            Kind::VariableDeclaration
-+                if let (Some(name), Some(value)) = (node.name(), node.initializer()) =>
-+            {
-+                pair(name, value, Expected::At(name));
-+                pending.push_back(value);
-+                continue;
++            Kind::VariableDeclaration => {
++                if let (Some(name), Some(value)) = (node.name(), node.initializer()) {
++                    pair(name, value, Expected::At(name));
++                    pending.push_back(value);
++                    continue;
++                }
 +            }
 +            Kind::CallExpression => {
 +                if let Some(call) = call_syntax(node)
