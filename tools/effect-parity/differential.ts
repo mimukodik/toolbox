@@ -6,9 +6,10 @@ import { discoverFixtures, type Fixture, layOutFixture } from "./fixtures";
 import { effectAlias, type Mutation, optionalPipeReceiverKind } from "./mutations";
 import { compareLocations, exposeReferencePackages, gatedBunRules, gatedDiagnostics, runPass } from "./score";
 
-const modes = ["single-config", "extends-plugin", "global-error", "rule-configuration", optionalPipeReceiverKind] as const;
+const relationMode = "relation-positions";
+const modes = ["single-config", "extends-plugin", "global-error", "rule-configuration", optionalPipeReceiverKind, relationMode] as const;
 type Mode = typeof modes[number];
-type Case = Mutation & { file: string; fixture: string };
+type Case = Mutation & { file: string; fixture: string; expectedRule?: string };
 type Difference = { reference?: Diagnostic; candidate?: Diagnostic };
 type DocumentedTag = { anchor: string; mechanism: string; rule: string; outcome?: string };
 type Finding = Difference & {
@@ -168,6 +169,73 @@ export const job = Effect.gen(function* () {
   return run(Effect.succeed(42));
 });`,
 };
+
+// Reuse the Effect and Layer fixture contracts. Every position gets a value
+// whose full type fits and a value with exactly one additional channel member.
+const relationContracts = [
+  {
+    rule: "missingEffectError", api: "Effect",
+    types: 'interface ReadError { readonly _tag: "ReadError" }',
+    allowed: "Effect.Effect<number>", requires: "Effect.Effect<number, ReadError>",
+  },
+  {
+    rule: "missingEffectContext", api: "Effect",
+    types: 'interface Database { readonly query: () => number }',
+    allowed: "Effect.Effect<number>", requires: "Effect.Effect<number, never, Database>",
+  },
+  {
+    rule: "missingLayerContext", api: "Layer",
+    types: `interface Database { readonly query: () => number }
+interface Repository { readonly read: () => number }`,
+    allowed: "Layer.Layer<Repository>", requires: "Layer.Layer<Repository, never, Database>",
+  },
+];
+const relationPositions = [
+  { kind: "relation-satisfies", body: `export const good = ready satisfies Expected;
+export const bad = missing satisfies Expected;` },
+  { kind: "relation-reassignment", body: `let job: Expected = ready;
+job = missing;
+export { job };` },
+  { kind: "relation-class-property", body: `export class Worker {
+  readonly ready: Expected = ready;
+  readonly job: Expected = missing;
+}` },
+  { kind: "relation-default-parameter", body: `export function worker(fallback: Expected = ready, job: Expected = missing) {
+  return { fallback, job };
+}` },
+  { kind: "relation-object-property", body: `export const options: { fallback: Expected; job: Expected } = {
+  fallback: ready,
+  job: missing,
+};` },
+  { kind: "relation-arrow-return", body: `function schedule(build: () => Expected): Expected { return build(); }
+export const fallback = schedule(() => ready);
+export const job = schedule(() => missing);` },
+  { kind: "relation-array-element", body: `export const jobs: ReadonlyArray<Expected> = [ready, missing];` },
+  { kind: "relation-generic", body: `function dispatch<Job>(job: Job, consume: (job: NoInfer<Job>) => void): void {
+  consume(job);
+}
+declare function enqueue(job: Expected): void;
+dispatch(ready, enqueue);
+dispatch(missing, enqueue);` },
+  { kind: "relation-jsx-attribute", extension: "tsx" as const, body: `declare global { namespace JSX { interface Element {} } }
+declare function Schedule(props: { job: Expected }): JSX.Element;
+export const fallback = <Schedule job={ready} />;
+export const job = <Schedule job={missing} />;` },
+];
+const relationCases: Case[] = relationPositions.flatMap(({ kind, body, extension }) => relationContracts.map(
+  ({ api, rule, types, allowed, requires }) => ({
+    kind, extension, fixture: `${rule}.ts`, expectedRule: rule,
+    file: `cases/${kind}/${rule}.${extension ?? "ts"}`,
+    source: `import { ${api} } from "effect";
+${types}
+type Expected = ${allowed};
+declare const ready: Expected;
+declare const missing: ${requires};
+
+${body}
+`,
+  }),
+));
 
 function generateCases() {
   const fixtureDirectory = join(upstream, "testdata/tests/effect-v4");
@@ -333,6 +401,10 @@ function project(mode: Mode, cases: Case[]): Fixture {
     plugin.overrides = [{ include: ["generated/**/*.ts"], options: { diagnosticSeverity: { floatingEffect: "off" } } }];
   }
   if (mode === optionalPipeReceiverKind) config.compilerOptions.strictNullChecks = true;
+  if (mode === relationMode) {
+    config.compilerOptions.strict = true;
+    config.compilerOptions.jsx = "preserve";
+  }
   json(fixture.tsconfig, config);
   return fixture;
 }
@@ -519,13 +591,14 @@ try {
   const tags = documentedMechanisms();
   checkClassifier(tags);
   const { cases, angleAssertions, catchSeeds, skippedTsx, virtualSeeds } = generateCases();
-  const allCases = [...cases, ...Object.values(specialCases).flat()];
+  const allCases = [...cases, ...relationCases, ...Object.values(specialCases).flat()];
   const byFile = new Map(allCases.map((item) => [`/.src/${item.file}`, item]));
   const optionalPipeCases = cases.filter(({ kind }) => kind === optionalPipeReceiverKind);
   const sharedCases = cases.filter(({ kind }) => kind !== optionalPipeReceiverKind);
   const projects = modes.map((mode) => {
     if (mode === "global-error" || mode === "rule-configuration") return project(mode, specialCases[mode]);
-    return project(mode, mode === optionalPipeReceiverKind ? optionalPipeCases : sharedCases);
+    if (mode === optionalPipeReceiverKind) return project(mode, optionalPipeCases);
+    return project(mode, mode === relationMode ? relationCases : sharedCases);
   });
   exposeReferencePackages(root);
   const compiler = await runPass("compiler", projects, []);
@@ -576,14 +649,14 @@ try {
     const declaredTypeMove = substitutedConditionalMove(differences);
     for (const agreement of agreements) {
       const kind = byFile.get(agreement.file)!.kind;
-      tally(mode === "single-config" ? kind : mode, agreement.rule, "agreements");
+      tally(mode === "single-config" || mode === relationMode ? kind : mode, agreement.rule, "agreements");
     }
     for (const difference of differences) {
       const { file, rule } = (difference.reference ?? difference.candidate)!;
       const sample = byFile.get(file)!;
       const key = disagreementKey(difference);
       if (mode === "single-config") controlDifferences.add(key);
-      const mechanism = controlDifferences.has(key) ? sample.kind : mode;
+      const mechanism = mode === relationMode || controlDifferences.has(key) ? sample.kind : mode;
       const applicableTags = mechanism === pipeableDeclaredTypes && !declaredTypeMove.includes(difference) ? [] : tags;
       const result = classify(applicableTags, mechanism, difference);
       const finding: Finding = { ...difference, mode, mechanism, seed: sample.fixture, ...result };
@@ -636,11 +709,22 @@ try {
       .map(({ line, col }) => `${line}:${col}`).join(", ") || "none";
     return `| ${kind} | ${reports(compilerDiagnostics)} | ${reports(oxlintDiagnostics)} | ${reports(candidateDiagnostics)} |`;
   });
+  const relationEvidence = relationCases.map(({ kind, expectedRule, file }) => {
+    const reports = (diagnostics: Diagnostic[]) => diagnostics.filter((item) =>
+      item.fixture === relationMode && item.rule === expectedRule && item.file === `/.src/${file}`);
+    const [direct, lint, candidate] = [compilerDiagnostics, oxlintDiagnostics, candidateDiagnostics].map(reports);
+    const locations = (items: Diagnostic[]) => items.map(({ line, col }) => `${line}:${col}`).join(", ") || "none";
+    return {
+      row: `| ${kind} | ${expectedRule} | ${locations(direct)} | ${locations(lint)} | ${locations(candidate)} |`,
+      covered: direct.length === 1 && lint.length === 1,
+    };
+  });
+  const uncoveredRelations = relationEvidence.filter(({ covered }) => !covered).length;
   json(join(artifactDirectory, "differential-differences.json"), findings);
   publish([
     "Classifier self-test passed.",
     `Gated rules: ${[...gatedBunRules].join(", ")}.`, "",
-    `Corpus: ${kindCounts.get("single-config")!.length} seed files and ${sharedCases.length - kindCounts.get("single-config")!.length} mutations, plus ${sharedCases.filter(({ reexport }) => reexport).length} local re-export files, in each shared-corpus project. The noLib, scoped override and optional receiver projects run separately.`,
+    `Corpus: ${kindCounts.get("single-config")!.length} seed files and ${sharedCases.length - kindCounts.get("single-config")!.length} mutations, plus ${sharedCases.filter(({ reexport }) => reexport).length} local re-export files, in each shared-corpus project. The noLib, scoped override, optional receiver and strict relation-position projects run separately.`,
     ...(virtualSeeds.length ? [
       `Virtual-file fixtures remain in the fixture gate: ${virtualSeeds.join(", ")}.`,
     ] : []),
@@ -670,6 +754,11 @@ try {
     "| Mechanism | Compiler locations | Oxlint locations | Bun locations |",
     "| --- | --- | --- | --- |",
     ...expectedTypeEvidence, "",
+    "## Strict relation positions", "",
+    `Each of the ${relationCases.length} cases expects one reference diagnostic for its target rule. Cases without exactly one report in both references: ${uncoveredRelations}.`, "",
+    "| Position | Rule | Compiler locations | Oxlint locations | Bun locations |",
+    "| --- | --- | --- | --- | --- |",
+    ...relationEvidence.map(({ row }) => row), "",
     "| Mechanism | New | Listed | Agreements |",
     "| --- | ---: | ---: | ---: |",
     ...mechanismRows,
@@ -682,6 +771,7 @@ try {
     ...(repros.length ? repros : ["None."]), "",
     "See `differential-differences.json` for each disagreement, its configuration, and the matching difference-list row, if any.",
   ]);
+  if (uncoveredRelations) process.exitCode = 1;
   console.log(`Effect differential completed in ${elapsed()} s: ${totals.new} new, ${totals.listed} listed, ${totals.agreements} agreements.`);
 } catch (error) {
   if (error instanceof ClassifierSelfTestError) {

@@ -4,30 +4,12 @@ import { type Diagnostic, type ParsedOutput, parityRules, parseTypeScript } from
 import type { Fixture } from "./fixtures";
 
 const linterModules = join(import.meta.dir, "linter/node_modules");
-export const gatedBunRules = new Set<string>([
-  "floatingEffect",
-  "globalErrorInEffectFailure",
-  "globalErrorInEffectCatch",
-  "unknownInEffectCatch",
-  "effectInFailure",
-  "anyUnknownInErrorContext",
-  "unsafeEffectTypeAssertion",
-  "tryCatchInEffectGen",
-  "returnEffectInGen",
-  "missingStarInYieldEffectGen",
-  "missingReturnYieldStar",
-  "effectTryWithoutCatch",
-  "catchUnfailableEffect",
-  "lazyPromiseInEffectSync",
-  "effectInVoidSuccess",
-  "runEffectInsideEffect",
-]);
-const requestedRules = new Set<string>(parityRules);
+export const gatedBunRules = new Set<string>(parityRules);
 const oxlintRules = new Map(parityRules.map((name) => [
   name.replace(/([a-z0-9])([A-Z])/g, "$1-$2").toLowerCase(), name,
 ]));
 const bunRules = new Map<string, string>(
-  [...oxlintRules].filter(([, name]) => gatedBunRules.has(name)).flatMap(([slug, name]) => [
+  [...oxlintRules].flatMap(([slug, name]) => [
     [`bun(${slug})`, name] as const,
     [`bun/${slug}`, name] as const,
   ]),
@@ -183,7 +165,7 @@ export async function runPass(
         ]);
         raw.push({ fixture: fixture.name, exitCode, stdout, stderr });
         const result = parse(fixture, stdout);
-        const baseline = (expected.get(fixture.name) ?? []).filter(({ rule }) => requestedRules.has(rule));
+        const baseline = (expected.get(fixture.name) ?? []).filter(({ rule }) => gatedBunRules.has(rule));
         scores.push({ fixture: fixture.name, ...compareLocations(baseline, result.effect), nonEffect: result.nonEffect });
         const reportedDiagnostics = result.effect.length + result.nonEffect > 0;
         if (exitCode !== 0 && !(diagnosticExits.includes(exitCode) && reportedDiagnostics)) {
@@ -245,7 +227,7 @@ export function referenceGateFailures(compiler: Pass, oxlint: Pass): string[] {
   const failures: string[] = [];
   const direct = totals(compiler);
   const lint = totals(oxlint);
-  const scoredExtra = ({ rule }: Diagnostic) => requestedRules.has(rule);
+  const scoredExtra = ({ rule }: Diagnostic) => gatedBunRules.has(rule);
   if (compiler.failures.length || direct.matched.length !== 230 || direct.missing.length
     || direct.extra.some(scoredExtra)) {
     failures.push("Direct compiler gate failed. Expected 230 matched, zero missing and zero scored extras.");
@@ -277,9 +259,9 @@ export function candidateGate(compiler: Pass, oxlint: Pass, bun: Pass): { passed
   const omissions = compareLocations(expectedOmissions, direct.missing);
   const omissionsMatch = omissions.missing.length === 0 && omissions.extra.length === 0
     && omissions.matched.every(({ expected, actual }) => expected.severity === actual.severity);
-  const passed = lint.matched.length === 183 && lint.missing.length === 0
+  const passed = lint.matched.length === 195 && lint.missing.length === 0
     && lint.extra.length === 0 && bun.failures.length === 0
-    && direct.matched.length === 183 && direct.missing.length === 35
+    && direct.matched.length === 195 && direct.missing.length === 35
     && direct.extra.length === 0 && omissionsMatch && severityMismatches.length === 0;
   const ruleRows = [...gatedBunRules].map((rule) => {
     const lintCount = lintReference.filter((diagnostic) => diagnostic.rule === rule).length;
