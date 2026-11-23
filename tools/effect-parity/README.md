@@ -68,7 +68,8 @@ standalone v4 fixtures whose baselines mention the 19 gated rules. Virtual-file 
 A separate strict TypeScript project exercises each missing-channel rule in
 `satisfies`, reassignment, class property initializers, default parameters,
 object properties, concise callback returns, array elements, inferred generic
-calls and JSX attributes. The report includes both references and Bun by
+calls, JSX attributes, async returns and computed properties. A conditional
+return probe checks both arms for distinct errors. The report includes both references and Bun by
 position and rule.
 The AST pass runs just the generator rule, using the existing Oxlint install.
 

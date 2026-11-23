@@ -14,7 +14,7 @@ const overloadRecovery = "relation-overload-recovery";
 const earlierPipeStage = "earlier-pipe-stage";
 const modes = ["single-config", "extends-plugin", "global-error", "rule-configuration", optionalPipeReceiverKind, relationMode] as const;
 type Mode = typeof modes[number];
-type Case = Mutation & { file: string; fixture: string; expectedRule?: string };
+type Case = Mutation & { file: string; fixture: string; expectedRule?: string; expectedReports?: number };
 type Difference = { reference?: Diagnostic; candidate?: Diagnostic };
 type DocumentedTag = { anchor: string; mechanism: string; rule: string; outcome?: string };
 type Finding = Difference & {
@@ -215,6 +215,13 @@ export { job };` },
   { kind: "relation-arrow-return", body: `function schedule(build: () => Expected): Expected { return build(); }
 export const fallback = schedule(() => ready);
 export const job = schedule(() => missing);` },
+  { kind: "relation-async-return", body: `export async function load(): Promise<Expected> {
+  return missing;
+}` },
+  { kind: "relation-computed-property", body: `const key = "job";
+export const options: { queue: { job: Expected } } = {
+  queue: { [key]: missing },
+};` },
   { kind: "relation-array-element", body: `export const jobs: ReadonlyArray<Expected> = [ready, missing];` },
   { kind: "relation-generic", body: `function dispatch<Job>(job: Job, consume: (job: NoInfer<Job>) => void): void {
   consume(job);
@@ -241,6 +248,25 @@ ${body}
 `,
   }),
 ));
+
+relationCases.push({
+  kind: "relation-conditional-return",
+  file: "cases/relation-conditional-return/missingEffectError.ts",
+  fixture: "missingEffectError.ts",
+  expectedRule: "missingEffectError",
+  expectedReports: 2,
+  source: `import { type Effect } from "effect";
+
+interface ReadError { readonly _tag: "ReadError" }
+interface BackupError { readonly _tag: "BackupError" }
+declare const primary: Effect.Effect<number, ReadError>;
+declare const backup: Effect.Effect<number, BackupError>;
+
+export function select(usePrimary: boolean): Effect.Effect<number> {
+  return (usePrimary ? (primary) : (backup));
+}
+`,
+});
 
 function generateCases() {
   const fixtureDirectory = join(upstream, "testdata/tests/effect-v4");
@@ -741,14 +767,14 @@ try {
       .map(({ line, col }) => `${line}:${col}`).join(", ") || "none";
     return `| ${kind} | ${reports(compilerDiagnostics)} | ${reports(oxlintDiagnostics)} | ${reports(candidateDiagnostics)} |`;
   });
-  const relationEvidence = relationCases.map(({ kind, expectedRule, file }) => {
+  const relationEvidence = relationCases.map(({ kind, expectedRule, expectedReports = 1, file }) => {
     const reports = (diagnostics: Diagnostic[]) => diagnostics.filter((item) =>
       item.fixture === relationMode && item.rule === expectedRule && item.file === `/.src/${file}`);
     const [direct, lint, candidate] = [compilerDiagnostics, oxlintDiagnostics, candidateDiagnostics].map(reports);
     const locations = (items: Diagnostic[]) => items.map(({ line, col }) => `${line}:${col}`).join(", ") || "none";
     return {
       row: `| ${kind} | ${expectedRule} | ${locations(direct)} | ${locations(lint)} | ${locations(candidate)} |`,
-      covered: direct.length === 1 && lint.length === 1,
+      covered: direct.length === expectedReports && lint.length === expectedReports,
     };
   });
   const uncoveredRelations = relationEvidence.filter(({ covered }) => !covered).length;
@@ -787,7 +813,7 @@ try {
     "| --- | --- | --- | --- |",
     ...expectedTypeEvidence, "",
     "## Strict relation positions", "",
-    `Each of the ${relationCases.length} cases expects one reference diagnostic for its target rule. Cases without exactly one report in both references: ${uncoveredRelations}.`, "",
+    `The ${relationCases.length} cases expect one reference diagnostic each, with two for the conditional return. Cases with unexpected reference counts: ${uncoveredRelations}.`, "",
     "| Position | Rule | Compiler locations | Oxlint locations | Bun locations |",
     "| --- | --- | --- | --- | --- |",
     ...relationEvidence.map(({ row }) => row), "",

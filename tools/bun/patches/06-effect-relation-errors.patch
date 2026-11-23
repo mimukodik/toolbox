@@ -510,21 +510,23 @@ index 85f26803..1cd74202 100644
      bun_return_effect_in_gen::ReturnEffectInGen,
 diff --git a/src/lint/plugins/effect/relation_errors.rs b/src/lint/plugins/effect/relation_errors.rs
 new file mode 100644
-index 00000000..560afe61
+index 0000000..bba581c
 --- /dev/null
 +++ b/src/lint/plugins/effect/relation_errors.rs
-@@ -0,0 +1,177 @@
+@@ -0,0 +1,235 @@
 +// Adapted from Effect-TS/tsgo's MIT-licensed missing channel rules at
 +// 0e722d359c969bdf1b1316f08e8637022cde3cce.
 +use super::{
 +    Directives,
-+    expected_and_real_type::{self, ExpectedTypes},
++    expected_and_real_type::{self, Expected, ExpectedTypes},
 +    generator_context::function_syntax,
 +    report, type_parser,
 +};
-+use bun_lint::ast::FnBody;
++use bun_lint::ast::{FnBody, Node};
 +use bun_lint::prelude::*;
-+use bun_lint::types::{SyntaxKind as Kind, TsNode, Type, TypeFlags};
++use bun_lint::types::{Literal, SyntaxKind as Kind, TsNode, Type, TypeFlags};
++use bun_lint::utils::text::number_to_string;
++use std::borrow::Cow;
 +use std::collections::HashSet;
 +
 +#[derive(Clone, Copy)]
@@ -544,7 +546,11 @@ index 00000000..560afe61
 +    let root = file.type_checker().ts_node(file);
 +    let mut seen = HashSet::new();
 +    expected_and_real_type::visit_relations(root, |pair| {
-+        let source = pair.real.get_type_at_location();
++        let returned_from = match &pair.expected {
++            Expected::RelationReturn(function) => function_syntax(*function),
++            _ => None,
++        };
++        let source = returned_from.is_none().then(|| pair.real.get_type_at_location());
 +        let Some(ExpectedTypes::Single(target)) = pair.expected.resolve() else {
 +            return;
 +        };
@@ -584,8 +590,61 @@ index 00000000..560afe61
 +                report.data("types", text);
 +            }
 +        };
-+        visit_failed(pair.location, pair.real, source, target, &mut inspect);
++        if let Some(function) = returned_from {
++            let is_async = function.is_async();
++            let target = if is_async {
++                target.get_awaited_type().unwrap_or(target)
++            } else {
++                target
++            };
++            visit_failed_return(pair.location, pair.real, target, is_async, &mut inspect);
++        } else if let Some(source) = source {
++            visit_failed(pair.location, pair.real, source, target, &mut inspect);
++        }
 +    });
++}
++
++fn visit_failed_return<'a>(
++    location: TsNode<'a>,
++    value: TsNode<'a>,
++    target: Type<'a>,
++    is_async: bool,
++    report: &mut impl FnMut(TsNode<'a>, Type<'a>, Type<'a>),
++) {
++    let value = type_parser::skip_parentheses(value);
++    // The checker's return expression path checks each conditional arm at its
++    // own node. General assignment elaboration does not split conditionals.
++    if let Some(Node::Expr(expr)) = value.to_ast()
++        && let Some((_, yes, no)) = expr.as_cond()
++    {
++        for arm in [yes, no] {
++            let arm = type_parser::skip_parentheses(arm.ts_node_with_parentheses());
++            visit_failed_return(arm, arm, target, is_async, report);
++        }
++        return;
++    }
++    let source = value.get_type_at_location();
++    if is_async {
++        if let Some(awaited) = source.get_awaited_type() {
++            visit_failed(location, value, awaited, target, report);
++        }
++    } else {
++        visit_failed(location, value, source, target, report);
++    }
++}
++
++fn property_key(name: TsNode<'_>) -> Option<Cow<'_, [u8]>> {
++    match name.kind() {
++        Kind::Identifier | Kind::StringLiteral | Kind::NumericLiteral => {
++            Some(Cow::Borrowed(name.text()))
++        }
++        Kind::ComputedPropertyName => match name.expression()?.get_type_at_location().value()? {
++            Literal::String(value) => Some(Cow::Borrowed(value)),
++            Literal::Number(value) => Some(Cow::Owned(number_to_string(value))),
++            _ => None,
++        },
++        _ => None,
++    }
 +}
 +
 +fn visit_failed<'a>(
@@ -615,11 +674,10 @@ index 00000000..560afe61
 +                let Some(name) = property.name() else {
 +                    continue;
 +                };
-+                let key = match name.kind() {
-+                    Kind::Identifier | Kind::StringLiteral | Kind::NumericLiteral => name.text(),
-+                    _ => continue,
++                let Some(key) = property_key(name) else {
++                    continue;
 +                };
-+                let Some(expected) = target.get_type_of_property(key) else {
++                let Some(expected) = target.get_type_of_property(&key) else {
 +                    continue;
 +                };
 +                let real = property.initializer().unwrap_or(name);
@@ -761,10 +819,10 @@ index 00000000..c7a5f4d2
 +    }
 +);
 diff --git a/test/cli/lint/effect.test.ts b/test/cli/lint/effect.test.ts
-index 9a1b0b1b..21c7e662 100644
+index 9a1b0b1..b0c48c9 100644
 --- a/test/cli/lint/effect.test.ts
 +++ b/test/cli/lint/effect.test.ts
-@@ -625,3 +625,92 @@ describe("Effect v4 expected types and runtime contexts", () => {
+@@ -625,3 +625,132 @@ describe("Effect v4 expected types and runtime contexts", () => {
      expect(exitCode).toBe(0);
    });
  });
@@ -853,6 +911,46 @@ index 9a1b0b1b..21c7e662 100644
 +    const { errors, exitCode } = await lint(files, ["pipe.ts"]);
 +    expect(errors).toEqual([
 +      "28:5 This Effect requires a service that is missing from the expected Effect context: `FileSystem | Scope`.",
++    ]);
++    expect(exitCode).toBe(1);
++  });
++
++  test.concurrent("checks awaited returns, conditional return arms, and computed layer properties", async () => {
++    const code = [
++      'interface Effect<A, E = never> { "~effect/Effect": { _A: () => A; _E: () => E; _R: () => never } }',
++      'interface Layer<Out, In = never> { "~effect/Layer": { _ROut: (_: Out) => void; _E: () => never; _RIn: () => In } }',
++      'interface ReadError { readonly _tag: "ReadError" }',
++      'interface BackupError { readonly _tag: "BackupError" }',
++      'interface Repository { readonly repo: unique symbol }',
++      'interface Logging { readonly log: unique symbol }',
++      'interface Database { readonly db: unique symbol }',
++      'declare const primary: Effect<number, ReadError>;',
++      'declare const backup: Effect<number, BackupError>;',
++      'declare const combined: Layer<Repository | Logging, Database>;',
++      'const key = "repository";',
++      'export async function load(): Promise<Effect<number>> {',
++      '  return primary;',
++      '}',
++      'export function select(usePrimary: boolean): Effect<number> {',
++      '  return (usePrimary ? (primary) : (backup));',
++      '}',
++      'export const config: { layers: { repository: Layer<Repository | Logging> } } = {',
++      '  layers: { [key]: combined },',
++      '};',
++    ].join("\n");
++    const files = {
++      ".oxlintrc.json": JSON.stringify({ options: { typeAware: true }, categories: { correctness: "off" } }),
++      "tsconfig.json": JSON.stringify({
++        compilerOptions: { ...options, strict: true, plugins: [{ name: "@effect/language-service" }] },
++      }),
++      "relations.ts": code,
++    };
++    const { errors, exitCode } = await lint(files, ["relations.ts"]);
++    expect(errors).toEqual([
++      "13:3 Missing errors ReadError in the expected Effect type.",
++      "16:25 Missing errors ReadError in the expected Effect type.",
++      "16:37 Missing errors BackupError in the expected Effect type.",
++      "19:13 Missing 'Database' in the expected Layer context.",
 +    ]);
 +    expect(exitCode).toBe(1);
 +  });
