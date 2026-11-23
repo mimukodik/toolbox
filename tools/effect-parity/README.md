@@ -75,6 +75,13 @@ Other mutations copy eligible seeds as TSX, route imports through a
 symlinked Effect package alias, and put a bare Effect into eligible
 initializers of existing classic `for` loops.
 
+The `pipeable-declared-types` probes use the `traverse` and `reordered`
+overloads from Effect's pinned `pipingFlows_selfDualOverloads` and
+`pipingFlows_dataFirstOverloads` fixtures. Each probe takes the data-first and
+data-last forms through `Effect.sync`. The `reordered` probes compare an
+inline conditional with the same conditional instantiated through a generic
+member. The report shows where `lazyPromiseInEffectSync` lands on each form.
+
 The same corpus runs in a single-config project and in a project whose
 child config redeclares the base config's plugin by name.
 The single and base configs set `floatingEffect` to warning to exercise

@@ -1867,7 +1867,7 @@ index 000000000..b587626de
 +);
 diff --git a/src/lint/plugins/effect/rules/bun_lazy_promise_in_effect_sync.rs b/src/lint/plugins/effect/rules/bun_lazy_promise_in_effect_sync.rs
 new file mode 100644
-index 000000000..b128cc984
+index 000000000..cd3543f2c
 --- /dev/null
 +++ b/src/lint/plugins/effect/rules/bun_lazy_promise_in_effect_sync.rs
 @@ -0,0 +1,59 @@
@@ -1880,7 +1880,7 @@ index 000000000..b128cc984
 +    "This `Effect.sync` thunk returns a Promise. Use `Effect.promise` or `Effect.tryPromise` to represent async work.",
 +);
 +
-+fn thunk_returns_promise(input: Type<'_>, promise: Type<'_>) -> bool {
++fn thunk_returns_promise<'a>(input: Type<'a>, promise: Type<'a>) -> bool {
 +    type_parser::union_members(input).into_iter().any(|member| {
 +        member.get_call_signatures().into_iter().any(|signature| {
 +            let output = signature.get_return_type();

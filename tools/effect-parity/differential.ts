@@ -35,6 +35,63 @@ function publish(lines: string[], title = "Effect lint differential"): void {
   if (process.env.GITHUB_STEP_SUMMARY) appendFileSync(process.env.GITHUB_STEP_SUMMARY, markdown + "\n");
 }
 
+const pipeableDeclaredTypes = "pipeable-declared-types";
+
+// Keep the reference fixtures' overload shapes and lift their results into
+// Promise-returning thunks so the lint range reveals normalized pipe steps.
+function overloadProbe(fixture: string, variant: string, declarations: string, first: string, last: string) {
+  const lines = ['import { Effect, pipe } from "effect";', ...declarations.trim().split("\n")];
+  const sites = [first, last].map((call, index) => {
+    const form = index === 0 ? "data-first" : "data-last";
+    const prefix = `export const ${index === 0 ? "dataFirst" : "dataLast"} = pipe(`;
+    const sync = `${prefix}${call}, `;
+    lines.push(`${sync}Effect.sync);`);
+    return { form, line: lines.length, subjectColumn: prefix.length + 1, syncColumn: sync.length + 1 };
+  });
+  const sample: Case = {
+    fixture, file: `cases/${pipeableDeclaredTypes}/${variant}.ts`,
+    kind: pipeableDeclaredTypes, source: lines.join("\n") + "\n",
+  };
+  return { sample, sites };
+}
+
+const traverseProbe = overloadProbe("pipingFlows_selfDualOverloads.ts", "traverse-fixture", `
+interface Box<A> { readonly value: A }
+type Infer<S extends Iterable<any>> = S extends ReadonlyArray<infer A> ? A : S extends Iterable<infer A> ? A : never;
+type Options<D> = { readonly concurrency?: number | undefined; readonly discard?: D | undefined };
+declare const traverse: {
+  <A, B, S extends Iterable<A> = Iterable<A>, const D extends boolean = false>(
+    f: (a: A, i: number) => Box<B>, options?: Options<D>
+  ): (self: [S] extends [never] ? Iterable<A> : S) => () => Promise<Box<D extends false ? Array<B> : void>>;
+  <B, S extends Iterable<any>, const D extends boolean = false>(
+    self: S, f: (a: Infer<S>, i: number) => Box<B>, options?: Options<D>
+  ): () => Promise<Box<D extends false ? Array<B> : void>>;
+};
+declare const items: ReadonlyArray<number>;
+declare const wrap: (n: number) => Box<string>;
+`, "traverse(items, wrap)", "traverse(wrap)(items)");
+
+const inlineBranch = "{ readonly value: [C] extends [never] ? B : C }";
+const reorderedProbes = [
+  { variant: "reordered-fixture", first: "B | C", last: "C | B" },
+  { variant: "reordered-conditional-inline", first: inlineBranch, last: inlineBranch },
+  { variant: "reordered-conditional-substituted", first: inlineBranch,
+    last: '{ readonly value: Branches<C, B>["value"] }' },
+].map(({ variant, first, last }) => overloadProbe("pipingFlows_dataFirstOverloads.ts", variant, `
+interface Box<A> { readonly value: A }
+interface Branches<T, Fallback> { readonly value: [T] extends [never] ? Fallback : T }
+declare function reordered<A, B, C = B>(self: Box<A>, options: {
+  readonly onEmpty: () => B; readonly onValue: (value: A) => C;
+}): () => Promise<${first}>;
+declare function reordered<B, A, C = B>(options: {
+  readonly onValue: (value: A) => C; readonly onEmpty: () => B;
+}): (self: Box<A>) => () => Promise<${last}>;
+declare const box: Box<number>;
+const options = { onEmpty: () => "empty", onValue: (value: number) => value };
+`, "reordered(box, options)", "reordered(options)(box)"));
+
+const overloadProbes = [traverseProbe, ...reorderedProbes];
+
 function generateCases() {
   const fixtureDirectory = join(upstream, "testdata/tests/effect-v4");
   const baselineDirectory = join(upstream, "testdata/baselines/reference/effect-v4");
@@ -105,7 +162,7 @@ function generateCases() {
   });
   if (!variants.length) throw new Error("The AST pass generated an empty mutation corpus.");
   const skippedTsx: string[] = [];
-  const selected = variants.filter(({ source, file, extension, fixture }) => {
+  const selected = [...variants, ...overloadProbes.map(({ sample }) => sample)].filter(({ source, file, extension, fixture }) => {
     try {
       parsers[extension ?? "ts"].transformSync(source);
       return true;
@@ -283,6 +340,35 @@ function writeRepro(finding: Finding, sample: Case, fixture: Fixture): string {
   return relative(artifactDirectory, target);
 }
 
+function formatOverloadEvidence(compiler: Diagnostic[], oxlint: Diagnostic[], bun: Diagnostic[]): string[] {
+  const format = ({ sample, sites }: ReturnType<typeof overloadProbe>, diagnostics: Diagnostic[]) => {
+    return sites.map(({ line, syncColumn, subjectColumn }) => {
+      const reports = diagnostics.filter((diagnostic) => diagnostic.fixture === "single-config"
+        && diagnostic.file === `/.src/${sample.file}` && diagnostic.line === line
+        && diagnostic.rule === "lazyPromiseInEffectSync");
+      return reports.map(({ col }) => col === syncColumn ? "Effect.sync"
+        : col === subjectColumn ? "subject call" : `column ${col}`).sort().join(", ") || "none";
+    });
+  };
+  const rows = overloadProbes.flatMap((probe) => {
+    const { sample, sites } = probe;
+    const [direct, reference, candidate] = [compiler, oxlint, bun].map((diagnostics) => format(probe, diagnostics));
+    return sites.map(({ form }, index) => {
+      const location = reference[index] !== candidate[index] ? "differs"
+        : reference[index] === "none" ? "both silent" : "same";
+      return `| ${sample.fixture} | ${basename(sample.file, ".ts")} | ${form} | ${direct[index]} | ${reference[index]} | ${candidate[index]} | ${location} |`;
+    });
+  });
+  return [
+    "## Declaration-level pipeable signature probes", "",
+    "The fixture forms retain the reference overloads with Promise-thunk results. The inline and substituted variants differ only in where the data-last conditional branches are declared.",
+    "An Effect.sync location identifies a pipeline with a preceding normalized step. A subject call location identifies an unflattened input. Both silent means neither linter emitted the target diagnostic.", "",
+    "| Reference fixture | Variant | Form | Compiler | Oxlint | Bun | Oxlint/Bun location |",
+    "| --- | --- | --- | --- | --- | --- | --- |",
+    ...rows, "",
+  ];
+}
+
 function formatGapEvidence(
   kinds: Map<string, Case[]>,
   compiler: Map<string, Diagnostic[]>,
@@ -438,6 +524,7 @@ try {
       kindCounts, Map.groupBy(compilerDiagnostics, ({ fixture }) => fixture),
       Map.groupBy(oxlintDiagnostics, ({ fixture }) => fixture), candidate, angleAssertions, skippedTsx,
     ),
+    ...formatOverloadEvidence(compilerDiagnostics, oxlintDiagnostics, candidateDiagnostics),
     "| Mechanism | New | Listed | Agreements |",
     "| --- | ---: | ---: | ---: |",
     ...mechanismRows,
