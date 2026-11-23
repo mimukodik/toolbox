@@ -119,12 +119,14 @@ function generateCases() {
   mkdirSync(output);
 
   const seeds = new Map<string, string>();
+  const catchSeeds = new Set<string>();
   for (const name of discoverFixtures(fixtureDirectory)) {
     const baseline = join(baselineDirectory, name.replace(/\.ts$/, ".errors.txt"));
     if (!existsSync(baseline)) continue;
     const diagnostics = parseTypeScript(name, readFileSync(baseline, "utf8")).effect
       .filter(({ rule }) => gatedBunRules.has(rule));
     if (!diagnostics.length) continue;
+    if (diagnostics.some(({ rule }) => rule === "catchUnfailableEffect")) catchSeeds.add(name);
     const source = readFileSync(join(fixtureDirectory, name), "utf8").replace(/\r\n/g, "\n");
     if (/^\/\/\s*@filename\s*:/im.test(source) || diagnostics.some(({ file }) => basename(file) !== name)) {
       throw new Error(`Expected a standalone TypeScript seed, found virtual files in ${name}`);
@@ -195,6 +197,7 @@ function generateCases() {
   return {
     cases: [...controls, ...selected].sort((a, b) => a.file.localeCompare(b.file)),
     skippedTsx,
+    catchSeeds,
     angleAssertions: seeds.size - variants.filter(({ extension }) => extension === "tsx").length,
   };
 }
@@ -445,7 +448,7 @@ function formatGapEvidence(
 try {
   const tags = documentedMechanisms();
   checkClassifier(tags);
-  const { cases, angleAssertions, skippedTsx } = generateCases();
+  const { cases, angleAssertions, catchSeeds, skippedTsx } = generateCases();
   const allCases = [...cases, ...Object.values(specialCases).flat()];
   const byFile = new Map(allCases.map((item) => [`/.src/${item.file}`, item]));
   const optionalPipeCases = cases.filter(({ kind }) => kind === optionalPipeReceiverKind);
@@ -546,9 +549,15 @@ try {
     return `| ${mechanism} | ${rule} | ${row?.new ?? 0} | ${row?.listed ?? 0} | ${row?.agreements ?? 0} | ${coverage} |`;
   }));
   const optionalProbeFile = optionalPipeCases.find(({ fixture }) => fixture === optionalPipeProbeName)!.file;
+  const catchCases = optionalPipeCases.filter(({ fixture }) => catchSeeds.has(fixture));
+  const catchFiles = new Set(catchCases.map(({ file }) => `/.src/${file}`));
+  const optionalDiagnostics = (pass: Map<string, Diagnostic[]>, rule: string) =>
+    (pass.get(optionalPipeReceiverKind) ?? []).filter((item) => item.rule === rule);
   const optionalProbeCount = (pass: Map<string, Diagnostic[]>) =>
-    (pass.get(optionalPipeReceiverKind) ?? []).filter(({ file, rule }) =>
-      file === `/.src/${optionalProbeFile}` && rule === "effectTryWithoutCatch").length;
+    optionalDiagnostics(pass, "effectTryWithoutCatch").filter(({ file }) => file === `/.src/${optionalProbeFile}`).length;
+  const catchCount = (pass: Map<string, Diagnostic[]>) =>
+    optionalDiagnostics(pass, "catchUnfailableEffect").filter(({ file }) => catchFiles.has(file)).length;
+  const catchReferenceCount = catchCount(reference);
   json(join(artifactDirectory, "differential-differences.json"), findings);
   publish([
     "Classifier self-test passed.", "",
@@ -556,7 +565,12 @@ try {
     `One site per eligible seed, mutation and rewrite direction. Candidate build run: ${process.env.BUN_BUILD_RUN ?? "unspecified"}.`,
     `Pipe rewrites per direction: ${(["function-to-method", "method-to-function", "first-to-last", "last-to-first"] as const)
       .map((direction) => `${direction} ${directions.get(direction)?.length ?? 0}`).join(", ")}.`,
-    `Optional pipe receivers: ${optionalPipeCases.length} cases with strict null checks. On the final Effect.try probe, Oxlint emitted ${optionalProbeCount(reference)} target reports and Bun emitted ${optionalProbeCount(candidate)}.`, "",
+    `Optional pipe receivers: ${optionalPipeCases.length} cases with strict null checks. On the final Effect.try probe, Oxlint emitted ${optionalProbeCount(reference)} target reports and Bun emitted ${optionalProbeCount(candidate)}.`,
+    catchCases.length
+      ? `Optional receiver coverage for catchUnfailableEffect: ${catchCases.map(({ fixture }) => fixture).join(", ")}. Oxlint emitted ${catchReferenceCount} target reports and Bun emitted ${catchCount(candidate)}.`
+        + (catchReferenceCount === 0 ? " These variants give the rule no positive diagnostic coverage." : "")
+      : "Optional receivers do not cover catchUnfailableEffect because its seeds have no eligible .pipe receiver.",
+    "",
     `Pass times: Oxlint ${oxlint.wallSeconds.toFixed(2)} s, Bun ${bun.wallSeconds.toFixed(2)} s, compiler severity lookup ${compiler.wallSeconds.toFixed(2)} s.`, "",
     ...(severity.extra.length ? [
       `Oxlint emitted ${severity.extra.length} diagnostics without matching compiler locations. Those use the Unix output severity.`, "",

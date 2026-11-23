@@ -198,19 +198,15 @@ export function mutationVisitor(
 
   function optionalPipeReceiver(call: Call): void {
     if (call.optional || call.callee.type !== "MemberExpression" || !call.arguments.length
-      || hasComments(call) || /\b__effectDifferentialPipePresent\b/.test(source)) return;
+      || hasComments(call) || /\boptionalReceiver\b/.test(source)) return;
     const member = call.callee as Member;
     if (member.computed || member.optional || member.property.name !== "pipe" || !effectValue(member.object)) return;
 
-    const start = member.range[0];
-    let outer: Node = call;
-    while (outer.parent?.range[0] === start && outer.parent.type !== "Program") outer = outer.parent;
-    const separator = outer.type === "ExpressionStatement" ? ";" : "";
     proposals.push({
       kind: optionalPipeReceiverKind,
       edits: [
-        { range: member.range, text: `${separator}(__effectDifferentialPipePresent ? (${text(member.object)}) : undefined)?.pipe` },
-        { range: [source.length, source.length], text: "\ndeclare const __effectDifferentialPipePresent: boolean;\n" },
+        { range: member.range, text: `optionalReceiver(${text(member.object)})?.pipe` },
+        { range: [source.length, source.length], text: "\nfunction optionalReceiver<T>(value: T): T | undefined { return value; }\n" },
       ],
       focus: call.range,
     });

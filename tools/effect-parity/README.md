@@ -75,10 +75,12 @@ Other mutations copy eligible seeds as TSX, route imports through a
 symlinked Effect package alias, and put a bare Effect into eligible
 initializers of existing classic `for` loops.
 
-The `optional-pipe-receiver` mutation makes a known Effect receiver
-`Effect | undefined` before calling `?.pipe`, preserving the steps and any
-explicit type arguments. These cases run separately with strict null checks.
-A dedicated probe ends the optional pipe in `Effect.try`.
+The `optional-pipe-receiver` mutation uses a typed identity function to give a
+known Effect receiver type `Effect | undefined` before calling `?.pipe`. The
+receiver still evaluates once, and the steps and explicit type arguments are
+preserved. These cases run separately with strict null checks. The report
+includes a dedicated `Effect.try` probe and counts reports from the
+`catchUnfailableEffect` seed variants.
 
 The `pipeable-declared-types` probes use the `traverse` and `reordered`
 overloads from Effect's pinned `pipingFlows_selfDualOverloads` and
