@@ -259,7 +259,7 @@ index 00000000..29e07bd3
 +export const job: Layer.Layer<Repository, never, Database> = source;
 +```
 diff --git a/docs/lint/rules/index.mdx b/docs/lint/rules/index.mdx
-index 6403c820..50de4177 100644
+index 6403c820..b48a510e 100644
 --- a/docs/lint/rules/index.mdx
 +++ b/docs/lint/rules/index.mdx
 @@ -5,7 +5,7 @@ description: "Every rule built into bun lint"
@@ -271,6 +271,15 @@ index 6403c820..50de4177 100644
 
  ## ESLint
 
+@@ -879,7 +879,7 @@ description: "Every rule built into bun lint"
+
+ ## Bun
+
+-45 rules.
++48 rules.
+
+ | Rule | Description | Default | Fixable | Needs types |
+ | --- | --- | --- | --- | --- |
 @@ -897,6 +897,9 @@ description: "Every rule built into bun lint"
  | [`bun/global-error-in-effect-failure`](/lint/rules/bun/global-error-in-effect-failure) | Report the global Error type in an Effect failure |  |  | yes |
  | [`bun/jsx-no-forbidden-nesting`](/lint/rules/bun/jsx-no-forbidden-nesting) | Disallow a JSX element inside another element that cannot contain it |  |  |  |
