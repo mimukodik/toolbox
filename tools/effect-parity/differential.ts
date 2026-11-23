@@ -12,6 +12,7 @@ import {
 const relationMode = "relation-positions";
 const overloadRecovery = "relation-overload-recovery";
 const earlierPipeStage = "earlier-pipe-stage";
+const duplicateReference = "duplicate-reference";
 const modes = ["single-config", "extends-plugin", "global-error", "rule-configuration", optionalPipeReceiverKind, relationMode] as const;
 type Mode = typeof modes[number];
 type Case = Mutation & { file: string; fixture: string; expectedRule?: string; expectedReports?: number };
@@ -259,19 +260,19 @@ const callbackReturns = [
   },
   {
     kind: "relation-contextual-block-return",
-    expectedReports: 1,
+    expectedReports: 2,
     body: `export const choose: (flag: boolean) => Effect.Effect<number> = (flag) => {
   return flag ? primary : backup;
 };`,
   },
   {
     kind: "relation-contextual-expression-return",
-    expectedReports: 1,
+    expectedReports: 2,
     body: `export const choose: (flag: boolean) => Effect.Effect<number> = (flag) => flag ? primary : backup;`,
   },
   {
     kind: "relation-contextual-multiple-returns",
-    expectedReports: 1,
+    expectedReports: 2,
     body: `export const choose: (flag: boolean) => Effect.Effect<number> = (flag) => {
   if (flag) return primary;
   return backup;
@@ -493,6 +494,21 @@ function compare(reference: Diagnostic[], candidate: Diagnostic[]) {
   return { agreements: exact.matched.map(({ actual }) => actual), differences };
 }
 
+function duplicateReferenceReports(reference: Diagnostic[], candidate: Diagnostic[]): Set<Diagnostic> {
+  const site = ({ fixture, file, line, col, rule }: Diagnostic) => JSON.stringify([fixture, file, line, col, rule]);
+  const candidateBySite = Map.groupBy(candidate, site);
+  const duplicates = new Set<Diagnostic>();
+  for (const [key, expected] of Map.groupBy(reference, site)) {
+    const actual = candidateBySite.get(key);
+    if (expected.length === 2 && actual?.length === 1
+      && expected.every(({ severity, message }) => severity === actual[0].severity && message === actual[0].message)) {
+      // The location comparer consumes the first report in input order.
+      duplicates.add(expected[1]);
+    }
+  }
+  return duplicates;
+}
+
 function documentedMechanisms(): DocumentedTag[] {
   const path = join(import.meta.dir, "../bun/effect-port-differences.md");
   const tags: DocumentedTag[] = [];
@@ -503,7 +519,7 @@ function documentedMechanisms(): DocumentedTag[] {
     const names = Array.from(cell.matchAll(/`([^`]+)`/g), ([, tag]) => tag);
     if (!names.includes(anchor)) throw new Error(`Missing differential tag on documented difference ${anchor}.`);
     for (const name of names) {
-      const match = /^([a-z][a-z0-9-]*)(?::(\*|[a-zA-Z][a-zA-Z0-9]*)(?::(missing|extra|earlier-pipe-stage|severity (?:error|warning)→(?:error|warning)))?)?$/.exec(name);
+      const match = /^([a-z][a-z0-9-]*)(?::(\*|[a-zA-Z][a-zA-Z0-9]*)(?::(missing|extra|earlier-pipe-stage|duplicate-reference|severity (?:error|warning)→(?:error|warning)))?)?$/.exec(name);
       if (!match) throw new Error(`Invalid differential tag on documented difference ${anchor}: ${name}`);
       const [, mechanism, rule = "*", outcome] = match;
       tags.push({ anchor, mechanism, rule, outcome });
@@ -728,7 +744,10 @@ try {
     "package-manifest", "checker-type-query", "floating-statement-hook",
   ])].sort();
   for (const mode of modes) {
-    const { agreements, differences } = compare(reference.get(mode) ?? [], candidate.get(mode) ?? []);
+    const expected = reference.get(mode) ?? [];
+    const actual = candidate.get(mode) ?? [];
+    const { agreements, differences } = compare(expected, actual);
+    const duplicates = mode === relationMode ? duplicateReferenceReports(expected, actual) : new Set<Diagnostic>();
     const declaredTypeMove = substitutedConditionalMove(differences);
     const recoveryMoves = mode === "single-config" || mode === "extends-plugin"
       ? missingContextPipeMoves(differences, byFile) : new Set<Difference>();
@@ -745,7 +764,12 @@ try {
       const defaultMechanism = mode === relationMode || controlDifferences.has(key) ? sample.kind : mode;
       const mechanism = recoveryMove ? overloadRecovery : defaultMechanism;
       const applicableTags = mechanism === pipeableDeclaredTypes && !declaredTypeMove.includes(difference) ? [] : tags;
-      const result = classify(applicableTags, mechanism, difference, recoveryMove ? earlierPipeStage : undefined);
+      let outcome: string | undefined;
+      if (recoveryMove) outcome = earlierPipeStage;
+      if (difference.reference && !difference.candidate && duplicates.has(difference.reference)) {
+        outcome = duplicateReference;
+      }
+      const result = classify(applicableTags, mechanism, difference, outcome);
       const finding: Finding = { ...difference, mode, mechanism, seed: sample.fixture, ...result };
       findings.push(finding);
       tally(mechanism, rule, finding.classification);
@@ -842,7 +866,7 @@ try {
     "| --- | --- | --- | --- |",
     ...expectedTypeEvidence, "",
     "## Strict relation positions", "",
-    `The ${relationCases.length} cases expect one reference diagnostic each, with two for the explicitly annotated conditional return. Cases with unexpected reference counts: ${uncoveredRelations}.`, "",
+    `The ${relationCases.length} cases expect one reference diagnostic each, with two for the explicitly annotated conditional return and the three contextual callback probes. Cases with unexpected reference counts: ${uncoveredRelations}.`, "",
     "| Position | Rule | Compiler locations | Oxlint locations | Bun locations |",
     "| --- | --- | --- | --- | --- |",
     ...relationEvidence.map(({ row }) => row), "",
