@@ -69,8 +69,8 @@ The AST pass runs just the generator rule, using the existing Oxlint install.
 Seed 2431 selects one edit site per fixture and mutation, preferring sites
 that contain a baseline diagnostic. The corpus includes every selected seed
 fixture as a control and caps each mutation at eight files. The same corpus
-runs as three projects: a single config, a base config whose plugin is
-redeclared by name in the child, and a config with `diagnosticSeverity: null`.
+runs in a single-config project and in a project whose child config
+redeclares the base config's plugin by name.
 The single and base configs set `floatingEffect` to warning to exercise
 inheritance of a setting that differs from the default.
 
@@ -80,9 +80,12 @@ As in the gate, the compiler pass supplies the severity that the Oxlint Unix
 formatter collapses to error. Only errors and warnings are counted.
 
 In the `effect-parity` artifact, `differential-summary.md` gives the counts by
-mechanism and rule, corpus size, and wall time. `differential-differences.json`
-records each disagreement and the matching [difference list](../bun/effect-port-differences.md)
-row, if present. Each new mechanism gets its smallest affected file under
+mechanism and rule, documented coverage, corpus size, and wall time.
+A difference is listed when the [difference list](../bun/effect-port-differences.md)
+predicts its mechanism, rule, and outcome. The step tests the classifier on
+two synthetic severity mismatches before starting the linters.
+`differential-differences.json` records every disagreement and any matching
+prediction. Each new mechanism gets its smallest affected file under
 `differential-repros/`, with the project config and any local re-export it
 needs. To replay one, make the locked fixture dependencies available from
 that directory and run both commands against it with `--tsconfig tsconfig.json`.

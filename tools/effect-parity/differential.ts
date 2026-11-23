@@ -6,10 +6,11 @@ import { discoverFixtures, type Fixture, layOutFixture } from "./fixtures";
 import { type Mutation, rank } from "./mutations";
 import { compareLocations, exposeReferencePackages, gatedBunRules, gatedDiagnostics, runPass } from "./score";
 
-const modes = ["single-config", "extends-plugin", "null-severity"] as const;
+const modes = ["single-config", "extends-plugin"] as const;
 type Mode = typeof modes[number];
 type Case = Mutation & { file: string; fixture: string };
 type Difference = { reference?: Diagnostic; candidate?: Diagnostic };
+type DocumentedTag = { anchor: string; mechanism: string; rule: string; outcome?: string };
 type Finding = Difference & {
   mode: Mode;
   mechanism: string;
@@ -29,8 +30,8 @@ const root = mkdtempSync(join(tmpdir(), "effect-differential-"));
 const elapsed = () => ((performance.now() - started) / 1000).toFixed(2);
 const json = (file: string, value: unknown) => writeFileSync(file, JSON.stringify(value, null, 2) + "\n");
 
-function publish(lines: string[]): void {
-  const markdown = ["# Effect lint differential", "", ...lines, "", `Wall time: ${elapsed()} s`, ""].join("\n");
+function publish(lines: string[], title = "Effect lint differential"): void {
+  const markdown = [`# ${title}`, "", ...lines, "", `Wall time: ${elapsed()} s`, ""].join("\n");
   writeFileSync(summary, markdown);
   if (process.env.GITHUB_STEP_SUMMARY) appendFileSync(process.env.GITHUB_STEP_SUMMARY, markdown + "\n");
 }
@@ -125,8 +126,6 @@ function project(mode: Mode, cases: Case[]): Fixture {
     json(join(fixture.directory, "tsconfig.base.json"), { compilerOptions: config.compilerOptions });
     config.extends = "./tsconfig.base.json";
     config.compilerOptions = { plugins: [{ name: plugin.name }] };
-  } else if (mode === "null-severity") {
-    plugin.diagnosticSeverity = null;
   }
   json(fixture.tsconfig, config);
   return fixture;
@@ -156,19 +155,55 @@ function compare(reference: Diagnostic[], candidate: Diagnostic[]) {
   return { agreements: exact.matched.map(({ actual }) => actual), differences };
 }
 
-function documentedMechanisms(): Map<string, string[]> {
+function documentedMechanisms(): DocumentedTag[] {
   const path = join(import.meta.dir, "../bun/effect-port-differences.md");
-  const tags = new Map<string, string[]>();
+  const tags: DocumentedTag[] = [];
   for (const line of readFileSync(path, "utf8").split("\n")) {
     const anchor = /^\| <a name="([^"]+)"/.exec(line)?.[1];
     if (!anchor) continue;
     const cell = /\|([^|]+)\|\s*$/.exec(line)?.[1] ?? "";
-    const names = Array.from(cell.matchAll(/`([a-zA-Z0-9:-]+)`/g), ([, tag]) => tag);
+    const names = Array.from(cell.matchAll(/`([^`]+)`/g), ([, tag]) => tag);
     if (!names.includes(anchor)) throw new Error(`Missing differential tag on documented difference ${anchor}.`);
-    for (const name of names) tags.set(name, [...(tags.get(name) ?? []), anchor]);
+    for (const name of names) {
+      const match = /^([a-z][a-z0-9-]*)(?::(\*|[a-zA-Z][a-zA-Z0-9]*)(?::(missing|extra|severity (?:error|warning)→(?:error|warning)))?)?$/.exec(name);
+      if (!match) throw new Error(`Invalid differential tag on documented difference ${anchor}: ${name}`);
+      const [, mechanism, rule = "*", outcome] = match;
+      tags.push({ anchor, mechanism, rule, outcome });
+    }
   }
-  if (!tags.size) throw new Error("No differential tags found on the documented differences.");
+  if (!tags.length) throw new Error("No differential tags found on the documented differences.");
   return tags;
+}
+
+function matchingTags(tags: DocumentedTag[], mechanism: string, rule: string): DocumentedTag[] {
+  return tags.filter((tag) => tag.mechanism === mechanism && (tag.rule === rule || tag.rule === "*"));
+}
+
+function classify(tags: DocumentedTag[], mechanism: string, { reference, candidate }: Difference) {
+  const { rule } = (reference ?? candidate)!;
+  const outcome = !candidate ? "missing" : !reference ? "extra" : `severity ${reference.severity}→${candidate.severity}`;
+  const listedBy = matchingTags(tags, mechanism, rule)
+    .filter((tag) => tag.outcome === outcome)
+    .map(({ anchor }) => anchor);
+  const classification = listedBy.length ? "listed" : "new";
+  return { classification, listedBy } as const;
+}
+
+class ClassifierSelfTestError extends Error {}
+
+function checkClassifier(tags: DocumentedTag[]): void {
+  const warning: Diagnostic = {
+    fixture: "self-test", file: "example.ts", line: 1, col: 1, rule: "floatingEffect", severity: "warning", message: "",
+  };
+  const mismatch = { reference: warning, candidate: { ...warning, severity: "error" } };
+  if (!matchingTags(tags, "import-namespace", warning.rule).some(({ anchor }) => anchor === "package-manifest")
+    || classify(tags, "import-namespace", mismatch).classification !== "new") {
+    throw new ClassifierSelfTestError("Expected a namespace-import severity mismatch with package-manifest coverage to be new.");
+  }
+  const inherited = classify(tags, "extends-plugin", mismatch);
+  if (inherited.classification !== "listed" || !inherited.listedBy.includes("extends-severity-merge")) {
+    throw new ClassifierSelfTestError("Expected the inherited floatingEffect warning-to-error mismatch to be listed.");
+  }
 }
 
 function writeRepro(finding: Finding, sample: Case, fixture: Fixture): string {
@@ -191,6 +226,7 @@ function writeRepro(finding: Finding, sample: Case, fixture: Fixture): string {
 
 try {
   const tags = documentedMechanisms();
+  checkClassifier(tags);
   const cases = generateCases();
   const byFile = new Map(cases.map((item) => [`/.src/${item.file}`, item]));
   const projects = modes.map((mode) => project(mode, cases));
@@ -244,16 +280,11 @@ try {
       const key = disagreementKey(difference);
       if (mode === "single-config") controlDifferences.add(key);
       const mechanism = controlDifferences.has(key) ? sample.kind : mode;
-      // Match the inheritance row only when the explicit warning becomes the
-      // default error. Other effects of changing the config remain new.
-      const matchesExtends = mechanism !== "extends-plugin"
-        || (difference.reference?.severity === "warning" && difference.candidate?.severity === "error");
-      const listedBy = matchesExtends ? [...(tags.get(mechanism) ?? []), ...(tags.get(`${mechanism}:${rule}`) ?? [])] : [];
-      const classification = listedBy.length ? "listed" : "new";
-      const finding: Finding = { ...difference, mode, mechanism, seed: sample.fixture, classification, listedBy };
+      const result = classify(tags, mechanism, difference);
+      const finding: Finding = { ...difference, mode, mechanism, seed: sample.fixture, ...result };
       findings.push(finding);
-      tally(mechanism, rule, classification);
-      if (classification === "listed") continue;
+      tally(mechanism, rule, finding.classification);
+      if (finding.classification === "listed") continue;
       const existing = smallest.get(mechanism);
       if (!existing || Buffer.byteLength(sample.source) < Buffer.byteLength(existing.sample.source)) {
         smallest.set(mechanism, { finding, sample });
@@ -272,10 +303,12 @@ try {
   );
   const rows = mechanisms.flatMap((mechanism) => [...gatedBunRules].map((rule) => {
     const row = counts.get(mechanism)?.get(rule);
-    return `| ${mechanism} | ${rule} | ${row?.new ?? 0} | ${row?.listed ?? 0} | ${row?.agreements ?? 0} |`;
+    const coverage = [...new Set(matchingTags(tags, mechanism, rule).map(({ anchor }) => anchor))].join(", ");
+    return `| ${mechanism} | ${rule} | ${row?.new ?? 0} | ${row?.listed ?? 0} | ${row?.agreements ?? 0} | ${coverage} |`;
   }));
   json(join(artifactDirectory, "differential-differences.json"), findings);
   publish([
+    "Classifier self-test passed.", "",
     `Corpus: ${kindCounts.get("single-config")!.length} seed files and ${cases.length - kindCounts.get("single-config")!.length} mutations, plus ${cases.filter(({ reexport }) => reexport).length} local re-export files, in each of ${projects.length} projects.`,
     `Mutation cap: ${maxPerMutation} per kind. Candidate build run: ${process.env.BUN_BUILD_RUN ?? "unspecified"}.`, "",
     `Pass times: Oxlint ${oxlint.wallSeconds.toFixed(2)} s, Bun ${bun.wallSeconds.toFixed(2)} s, compiler severity lookup ${compiler.wallSeconds.toFixed(2)} s.`, "",
@@ -283,18 +316,23 @@ try {
       `Oxlint emitted ${severity.extra.length} diagnostics without matching compiler locations. Those use the Unix output severity.`, "",
     ] : []),
     "Agreements count identical visible diagnostic tuples. A severity change at one location counts as one disagreement.",
+    "A listed difference matches a documented prediction for its mechanism, rule, and outcome.",
     "An unchanged disagreement in another config is counted under its original mechanism. Agreements in those configs appear under the config name.", "",
-    "| Mechanism | Rule | New | Listed | Agreements |",
-    "| --- | --- | ---: | ---: | ---: |",
+    "| Mechanism | Rule | New | Listed | Agreements | Documented coverage |",
+    "| --- | --- | ---: | ---: | ---: | --- |",
     ...rows,
-    `| **Total** | | **${totals.new}** | **${totals.listed}** | **${totals.agreements}** |`, "",
+    `| **Total** | | **${totals.new}** | **${totals.listed}** | **${totals.agreements}** | |`, "",
     "## Smallest reproductions for new differences", "",
     ...(repros.length ? repros : ["None."]), "",
     "See `differential-differences.json` for each disagreement, its configuration, and the matching difference-list row, if any.",
   ]);
   console.log(`Effect differential completed in ${elapsed()} s: ${totals.new} new, ${totals.listed} listed, ${totals.agreements} agreements.`);
 } catch (error) {
-  publish(["Report incomplete. See the workflow step log and any `differential-failures.json` in the artifact."]);
+  if (error instanceof ClassifierSelfTestError) {
+    publish([error.message, "The differential stopped before running the linters."], "Classifier self-test failed");
+  } else {
+    publish(["Report incomplete. See the workflow step log and any `differential-failures.json` in the artifact."]);
+  }
   throw error;
 } finally {
   rmSync(root, { recursive: true, force: true });
