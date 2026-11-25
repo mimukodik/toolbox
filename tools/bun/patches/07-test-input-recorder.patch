@@ -11,10 +11,10 @@ index ba5d65e0c..7a81297ac 100644
   "bun_http",
   "bun_http_types",
 diff --git a/src/bun_core/env_var.rs b/src/bun_core/env_var.rs
-index 945fc49da..bd06f094c 100644
+index 945fc49da..75a5bb6d7 100644
 --- a/src/bun_core/env_var.rs
 +++ b/src/bun_core/env_var.rs
-@@ -53,6 +53,18 @@ new!(pub BUN_BYTECODE_DIGEST_OUT: string, "BUN_BYTECODE_DIGEST_OUT", {});
+@@ -53,6 +53,20 @@ new!(pub BUN_BYTECODE_DIGEST_OUT: string, "BUN_BYTECODE_DIGEST_OUT", {});
  new!(pub BUN_BYTECODE_ORDER_NAMES_OUT: string, "BUN_BYTECODE_ORDER_NAMES_OUT", {});
  // A compiled executable writes the payload order file of this run here at exit; `%p` in the path becomes the pid.
  new!(pub BUN_BYTECODE_ORDER_OUT: string, "BUN_BYTECODE_ORDER_OUT", {});
@@ -26,6 +26,8 @@ index 945fc49da..bd06f094c 100644
 +new!(pub BUN_TEST_INPUT_REUSE_REPORT: string, "BUN_TEST_INPUT_REUSE_REPORT", {});
 +// Part of the fingerprint of every record, for what the caller knows changes outcomes, such as the version of a database.
 +new!(pub BUN_TEST_INPUT_RECORD_SALT: string, "BUN_TEST_INPUT_RECORD_SALT", {});
++// With a record directory: "1" also writes each record as JSON beside the store, to read.
++new!(pub BUN_TEST_INPUT_RECORD_JSON: string, "BUN_TEST_INPUT_RECORD_JSON", {});
 +// Comma-separated names of environment variables whose values are part of the fingerprint of every record.
 +new!(pub BUN_TEST_INPUT_RECORD_ENV: string, "BUN_TEST_INPUT_RECORD_ENV", {});
 +// Internal: what a `--parallel` coordinator hands its workers, so they record its fingerprint.
@@ -129,10 +131,10 @@ index 44f4aa4ab..dad45f9d1 100644
          // `VirtualMachine::use_isolation_source_provider_cache` to avoid forming
 diff --git a/src/jsc/TestInputRecorder.rs b/src/jsc/TestInputRecorder.rs
 new file mode 100644
-index 000000000..e9788a1e1
+index 000000000..5770a7514
 --- /dev/null
 +++ b/src/jsc/TestInputRecorder.rs
-@@ -0,0 +1,994 @@
+@@ -0,0 +1,1141 @@
 +//! `BUN_TEST_INPUT_RECORD_DIR=<dir>` with `bun test --isolate`: for every test file, write
 +//! `<dir>/<path relative to the project root, URI-component-encoded>.json` with what the file
 +//! depended on: every resolution made while it was the current file (question and answer), every
@@ -160,6 +162,7 @@ index 000000000..e9788a1e1
 +use bun_core::String as BunString;
 +use bun_resolver::Result as ResolverResult;
 +
++use crate::test_input_store::{self as store, Entry, Segment};
 +use crate::test_own_reads::{Look, OwnReads};
 +use crate::virtual_machine::{ResolveMode, VirtualMachine};
 +use crate::{JSGlobalObject, JSValue};
@@ -175,6 +178,8 @@ index 000000000..e9788a1e1
 +    fingerprint: Box<[u8]>,
 +    fingerprint_hash: [u8; 32],
 +    state: RefCell<State>,
++    /// Opened at the first record; `Some(None)` when it could not be.
++    segment: RefCell<Option<Option<Segment>>>,
 +}
 +
 +#[derive(Default)]
@@ -200,7 +205,8 @@ index 000000000..e9788a1e1
 +
 +#[derive(Default)]
 +struct FileState {
-+    resolutions: Vec<Box<[u8]>>,
++    /// As a JSON record writes them, and as the store keeps them.
++    resolutions: Vec<(Box<[u8]>, Entry)>,
 +    seen_resolutions: StringHashMap<()>,
 +    modules: Vec<(Box<[u8]>, bool)>,
 +    module_index: StringHashMap<usize>,
@@ -235,6 +241,7 @@ index 000000000..e9788a1e1
 +        fingerprint: Box::from(fingerprint),
 +        fingerprint_hash: source_hash(fingerprint),
 +        state: RefCell::default(),
++        segment: RefCell::default(),
 +    };
 +    let _ = vm
 +        .test_isolation_state
@@ -602,9 +609,9 @@ index 000000000..e9788a1e1
 +}
 +
 +impl FileState {
-+    fn add_resolution(&mut self, line: Box<[u8]>, answer: Option<&[u8]>) {
-+        if !self.seen_resolutions.contains_key(&*line) {
-+            bun_core::handle_oom(self.seen_resolutions.put(&line, ()));
++    fn add_resolution(&mut self, line: (Box<[u8]>, Entry), answer: Option<&[u8]>) {
++        if !self.seen_resolutions.contains_key(&*line.0) {
++            bun_core::handle_oom(self.seen_resolutions.put(&line.0, ()));
 +            self.resolutions.push(line);
 +        }
 +        if let Some(answer) = answer.filter(|it| bun_paths::is_absolute(it))
@@ -670,6 +677,28 @@ index 000000000..e9788a1e1
 +/// Where the record of the test file at `file_path` is; `None` when not recording.
 +pub fn record_path(vm: &VirtualMachine, file_path: &[u8]) -> Option<Vec<u8>> {
 +    Some(recorder_of(vm)?.record_path(file_path))
++}
++
++/// The record directory; `None` when not recording.
++pub fn record_dir(vm: &VirtualMachine) -> Option<&[u8]> {
++    Some(&recorder_of(vm)?.dir)
++}
++
++/// The fingerprint of this run; `None` when not recording.
++pub fn fingerprint_hash(vm: &VirtualMachine) -> Option<[u8; 32]> {
++    Some(recorder_of(vm)?.fingerprint_hash)
++}
++
++/// A path as records write it: relative to the root when under it.
++pub fn written_path(vm: &VirtualMachine, path: &[u8]) -> Option<Box<[u8]>> {
++    Some(recorder_of(vm)?.written(path).0)
++}
++
++/// Closes this process's segment of the store, so a merge in this process can take it.
++pub fn close_segment(vm: &VirtualMachine) {
++    if let Some(recorder) = recorder_of(vm) {
++        recorder.segment.borrow_mut().take();
++    }
 +}
 +
 +/// The fingerprint of this run as records write it; `None` when not recording.
@@ -856,14 +885,15 @@ index 000000000..e9788a1e1
 +        })
 +    }
 +
-+    /// One entry of `resolutions`: the question, the answer with its details, and the `check` of the answer.
++    /// One entry of `resolutions`: the question, the answer with its details, and the `check` of the
++    /// answer; as JSON, and as the store keeps it.
 +    fn resolution_line(
 +        &self,
 +        question: &Question,
 +        answer: Option<&[u8]>,
 +        by_plugin: bool,
 +        found: Option<&Found>,
-+    ) -> Box<[u8]> {
++    ) -> (Box<[u8]>, Entry) {
 +        let mut line = Vec::with_capacity(320);
 +        self.write_question(&mut line, question);
 +        let start = line.len();
@@ -872,7 +902,29 @@ index 000000000..e9788a1e1
 +        line.extend_from_slice(b",\"check\":\"");
 +        write_hex(&mut line, &check);
 +        line.extend_from_slice(b"\"}");
-+        line.into_boxed_slice()
++        let (specifier, specifier_from_root) = self.written(&question.specifier);
++        let (importer, importer_from_root) = self.written(&question.importer);
++        let flags = if question.importer_is_file { store::IMPORTER_IS_FILE } else { 0 }
++            | if specifier_from_root { store::SPECIFIER_FROM_ROOT } else { 0 }
++            | if importer_from_root { store::IMPORTER_FROM_ROOT } else { 0 }
++            | if by_plugin { store::PLUGIN } else { 0 };
++        let entry = Entry::Resolution {
++            flags,
++            kind: Box::from(question.kind.as_bytes()),
++            specifier,
++            importer,
++            paths: question.paths.iter().map(|it| self.written(it)).collect(),
++            check: Some(check),
++        };
++        (line.into_boxed_slice(), entry)
++    }
++
++    /// A path as records write it, and whether it was made relative to the root.
++    fn written(&self, path: &[u8]) -> (Box<[u8]>, bool) {
++        match self.relative(path) {
++            Some(relative) => (Box::from(relative), true),
++            None => (Box::from(path), false),
++        }
 +    }
 +
 +    fn write_answer(
@@ -966,9 +1018,114 @@ index 000000000..e9788a1e1
 +        file_path: &[u8],
 +        counts: Option<(&Counts, &Counts)>,
 +    ) {
-+        let Some(file) = self.state.borrow_mut().file.take() else {
++        let Some(mut file) = self.state.borrow_mut().file.take() else {
 +            return;
 +        };
++        let mut own = core::mem::take(&mut file.own);
++        own.finish(&self.root);
++        // An answer that was never loaded, such as an `import()` the file did not wait for: hashed as it is now.
++        let answers: Vec<(&[u8], Option<[u8; 32]>)> = (file.answers.iter())
++            .filter(|answer| !file.module_index.contains_key(&***answer))
++            .map(|answer| {
++                let contents = bun_sys::File::read_from(bun_sys::Fd::cwd(), answer).ok();
++                (&**answer, contents.map(|it| source_hash(&it)))
++            })
++            .collect();
++        let aot: Vec<Option<[u8; 32]>> = (file.modules.iter())
++            .map(|(path, _)| aot_config_check(vm, path))
++            .collect();
++        let outcome = counts.map(|(before, after)| {
++            let mut out = [0u32; 6];
++            for (out, ((_, before), (_, after))) in out.iter_mut().zip(before.iter().zip(after)) {
++                *out = after.wrapping_sub(*before);
++            }
++            out
++        });
++        if bun_core::env_var::BUN_TEST_INPUT_RECORD_JSON
++            .get_not_empty()
++            .is_some_and(|it| it != b"0")
++        {
++            self.write_json(file_path, counts, &file, &own, &answers, &aot);
++        }
++        let state = self.state.borrow();
++        let mut entries = Vec::with_capacity(
++            file.resolutions.len() + file.modules.len() + answers.len() + own.reads.len(),
++        );
++        for ((path, _), aot) in file.modules.iter().zip(aot) {
++            let source = state.sources.get(&**path);
++            let flags = source.map_or(0, |source| {
++                (if source.is_virtual { store::VIRTUAL } else { 0 })
++                    | (if source.changed_during_run { store::CHANGED_DURING_RUN } else { 0 })
++            });
++            entries.push(Entry::Module {
++                flags,
++                path: self.written(path).0,
++                sha256: source.map(|it| it.sha256),
++                aot,
++            });
++        }
++        drop(state);
++        for (path, sha256) in answers {
++            entries.push(Entry::Answer {
++                path: self.written(path).0,
++                sha256,
++            });
++        }
++        for read in &own.reads {
++            entries.push(Entry::Read {
++                look: read.look.name(),
++                path: self.written(&read.path).0,
++                extra: read.extra.clone(),
++                value: read.value.clone().unwrap_or_default(),
++            });
++        }
++        entries.extend(file.resolutions.into_iter().map(|(_, entry)| entry));
++        let header = store::Header {
++            outcome,
++            unattributed_before: file.unattributed_before,
++            late_from_earlier_files: file.late_from_earlier_files,
++            marks: file.marks,
++        };
++        let written_file = self.written(file_path).0;
++        let new = store::NewState {
++            file: &written_file,
++            fingerprint: self.fingerprint_hash,
++            header,
++            entries: &entries,
++        };
++        let mut segment = self.segment.borrow_mut();
++        let segment = segment.get_or_insert_with(|| match Segment::open(&self.dir) {
++            Ok(segment) => Some(segment),
++            Err(err) => {
++                bun_core::pretty_errorln!(
++                    "<r><yellow>warn<r><d>:<r> test input records can't be written to {}: {}",
++                    bstr::BStr::new(&self.dir),
++                    err
++                );
++                None
++            }
++        });
++        if let Some(segment) = segment
++            && let Err(err) = segment.append(&new)
++        {
++            bun_core::pretty_errorln!(
++                "<r><yellow>warn<r><d>:<r> the test input record of {} could not be written: {}",
++                bstr::BStr::new(file_path),
++                err
++            );
++        }
++    }
++
++    /// The record of one file as JSON, to read: `BUN_TEST_INPUT_RECORD_JSON=1`.
++    fn write_json(
++        &self,
++        file_path: &[u8],
++        counts: Option<(&Counts, &Counts)>,
++        file: &FileState,
++        own: &OwnReads,
++        answers: &[(&[u8], Option<[u8; 32]>)],
++        aot: &[Option<[u8; 32]>],
++    ) {
 +        let state = self.state.borrow();
 +        let mut out = Vec::with_capacity(4096);
 +        let _ = write!(out, "{{\"version\":{RECORD_VERSION},\"file\":");
@@ -1006,12 +1163,12 @@ index 000000000..e9788a1e1
 +            );
 +        }
 +        out.extend_from_slice(b"],\"resolutions\":[");
-+        for (i, line) in file.resolutions.iter().enumerate() {
++        for (i, (line, _)) in file.resolutions.iter().enumerate() {
 +            out.extend_from_slice(if i > 0 { b",\n" } else { b"\n" });
 +            out.extend_from_slice(line);
 +        }
 +        out.extend_from_slice(b"],\"modules\":[");
-+        for (i, (path, cached)) in file.modules.iter().enumerate() {
++        for (i, ((path, cached), aot)) in file.modules.iter().zip(aot).enumerate() {
 +            out.extend_from_slice(if i > 0 { b",\n" } else { b"\n" });
 +            out.extend_from_slice(b"{\"path\":");
 +            self.write_path(&mut out, path);
@@ -1030,9 +1187,9 @@ index 000000000..e9788a1e1
 +                }
 +                None => out.extend_from_slice(b",\"sha256\":null"),
 +            }
-+            if let Some(own) = aot_config_check(vm, path) {
++            if let Some(own) = aot {
 +                out.extend_from_slice(b",\"aotConfig\":\"");
-+                write_hex(&mut out, &own);
++                write_hex(&mut out, own);
 +                out.push(b'"');
 +            }
 +            if *cached {
@@ -1040,29 +1197,21 @@ index 000000000..e9788a1e1
 +            }
 +            out.push(b'}');
 +        }
-+        // An answer that was never loaded, such as an `import()` the file did not wait for: hashed as it is now.
 +        out.extend_from_slice(b"],\"answerFiles\":[");
-+        let mut first = true;
-+        for answer in &file.answers {
-+            if file.module_index.contains_key(&**answer) {
-+                continue;
-+            }
-+            out.extend_from_slice(if first { b"\n" } else { b",\n" });
-+            first = false;
++        for (i, (answer, sha256)) in answers.iter().enumerate() {
++            out.extend_from_slice(if i > 0 { b",\n" } else { b"\n" });
 +            out.extend_from_slice(b"{\"path\":");
 +            self.write_path(&mut out, answer);
-+            match bun_sys::File::read_from(bun_sys::Fd::cwd(), answer) {
-+                Ok(contents) => {
++            match sha256 {
++                Some(sha256) => {
 +                    out.extend_from_slice(b",\"sha256\":\"");
-+                    write_hex(&mut out, &source_hash(&contents));
++                    write_hex(&mut out, sha256);
 +                    out.extend_from_slice(b"\"}");
 +                }
-+                Err(_) => out.extend_from_slice(b",\"sha256\":null}"),
++                None => out.extend_from_slice(b",\"sha256\":null}"),
 +            }
 +        }
 +        out.extend_from_slice(b"],\"reads\":[");
-+        let mut own = file.own;
-+        own.finish(&self.root);
 +        for (i, read) in own.reads.iter().enumerate() {
 +            out.extend_from_slice(if i > 0 { b",\n" } else { b"\n" });
 +            let _ = write!(out, "{{\"look\":\"{}\",\"path\":", read.look.name());
@@ -1126,6 +1275,893 @@ index 000000000..e9788a1e1
 +            );
 +        }
 +    }
++}
+diff --git a/src/jsc/TestInputStore.rs b/src/jsc/TestInputStore.rs
+new file mode 100644
+index 000000000..05b3f4195
+--- /dev/null
++++ b/src/jsc/TestInputStore.rs
+@@ -0,0 +1,881 @@
++//! The store of test input records: one per record directory, so a suite's records are tens of
++//! megabytes instead of one JSON file per test file that repeats the same resolutions and modules.
++//!
++//! What a test file's pass depended on is a list of entries: resolutions (the question and the
++//! `check` of its answer), modules and answer files (path and content hash) and own reads (look,
++//! path, what else the look needs, value). Test files of one suite share most of them, so the store
++//! keeps one table of strings and one of entries, and per test file a few states: the fingerprint of
++//! the run, the outcome and what else the record says, and one list of entry ids per kind.
++//!
++//! Lookup is in two steps. The first key, the fingerprint of the run and the test file's path, gives
++//! the candidate states. Every entry carries its recorded value, so a state's lists are its second
++//! key: they hold on the current tree when looking at each entry again gives the value it carries,
++//! and then the state names the result. Each entry is looked at again once per run, however many
++//! states list it. A file keeps its last [`STATES_PER_FILE`] distinct states, so going to a failing
++//! state and back finds the old pass.
++//!
++//! On disk, `<dir>/store.btis` is the merged store, and `<dir>/segments/` holds one file per process
++//! that recorded since. A process appends one chunk per test file to its own segment and holds an
++//! exclusive `flock` on it while it lives. At the end of a run, the process that started it merges:
++//! under an exclusive lock of `<dir>/store.lock` it reads the store and every segment it can lock
++//! (its writer has exited, or crashed), writes the merged store to a temporary file, renames it over
++//! `store.btis`, and only then removes those segments. Loading takes the same lock shared, so it sees
++//! the store and segments of one moment. A torn chunk at the end of a segment fails its length or
++//! checksum and is ignored with what follows it, so a killed writer loses only its last file.
++//!
++//! Every file starts with `BTIS` and [`STORE_VERSION`]; a file of another version is ignored, and
++//! the next merge replaces it.
++
++use std::collections::HashMap;
++use std::io::{Read as _, Write as _};
++
++pub const STORE_VERSION: u32 = 1;
++const MAGIC: &[u8; 4] = b"BTIS";
++/// How many distinct input states of one test file the store keeps, newest first.
++pub const STATES_PER_FILE: usize = 4;
++pub const STORE_FILE: &str = "store.btis";
++const LOCK_FILE: &str = "store.lock";
++const SEGMENTS: &str = "segments";
++
++/// The kinds of entries, in the order a state lists them.
++pub const RESOLUTION: u8 = 0;
++pub const MODULE: u8 = 1;
++pub const ANSWER: u8 = 2;
++pub const READ: u8 = 3;
++
++pub const IMPORTER_IS_FILE: u32 = 1;
++pub const SPECIFIER_FROM_ROOT: u32 = 2;
++pub const IMPORTER_FROM_ROOT: u32 = 4;
++pub const PLUGIN: u32 = 8;
++pub const HAS_CHECK: u32 = 16;
++
++pub const HAS_SHA: u32 = 1;
++pub const VIRTUAL: u32 = 2;
++pub const CHANGED_DURING_RUN: u32 = 4;
++pub const HAS_AOT: u32 = 8;
++
++/// An entry as the recorder hands it over: strings as records write them, paths under the root
++/// relative to it.
++pub enum Entry {
++    Resolution {
++        flags: u32,
++        kind: Box<[u8]>,
++        specifier: Box<[u8]>,
++        importer: Box<[u8]>,
++        /// With whether each was made relative to the root.
++        paths: Vec<(Box<[u8]>, bool)>,
++        check: Option<[u8; 32]>,
++    },
++    Module {
++        flags: u32,
++        path: Box<[u8]>,
++        sha256: Option<[u8; 32]>,
++        aot: Option<[u8; 32]>,
++    },
++    Answer {
++        path: Box<[u8]>,
++        sha256: Option<[u8; 32]>,
++    },
++    Read {
++        look: &'static str,
++        path: Box<[u8]>,
++        extra: Box<[u8]>,
++        value: Box<[u8]>,
++    },
++}
++
++impl Entry {
++    fn kind(&self) -> u8 {
++        match self {
++            Entry::Resolution { .. } => RESOLUTION,
++            Entry::Module { .. } => MODULE,
++            Entry::Answer { .. } => ANSWER,
++            Entry::Read { .. } => READ,
++        }
++    }
++}
++
++/// What a record says besides its inputs.
++#[derive(Clone, Default)]
++pub struct Header<S> {
++    /// pass, fail, skip, todo, expectations, unhandledErrors; `None` when the file failed before its tests.
++    pub outcome: Option<[u32; 6]>,
++    pub unattributed_before: u32,
++    pub late_from_earlier_files: u32,
++    pub marks: Vec<S>,
++}
++
++/// One test file's pass, as the recorder appends it.
++pub struct NewState<'a> {
++    pub file: &'a [u8],
++    pub fingerprint: [u8; 32],
++    pub header: Header<Box<[u8]>>,
++    pub entries: &'a [Entry],
++}
++
++/// A state in the store: strings and entries by id.
++#[derive(Clone)]
++pub struct State {
++    pub file: u32,
++    pub fingerprint: [u8; 32],
++    /// Nanoseconds since the epoch when it was written.
++    pub time: u64,
++    pub header: Header<u32>,
++    /// Entry ids by kind: [`RESOLUTION`], [`MODULE`], [`ANSWER`], [`READ`].
++    pub lists: [Vec<u32>; 4],
++}
++
++/// An entry of the store, decoded.
++pub enum EntryView<'a> {
++    Resolution {
++        flags: u32,
++        kind: &'a [u8],
++        specifier: &'a [u8],
++        importer: &'a [u8],
++        paths: Vec<(&'a [u8], bool)>,
++        check: Option<&'a [u8; 32]>,
++    },
++    Module {
++        flags: u32,
++        path: &'a [u8],
++        sha256: Option<&'a [u8; 32]>,
++        aot: Option<&'a [u8; 32]>,
++    },
++    Answer {
++        path: &'a [u8],
++        sha256: Option<&'a [u8; 32]>,
++    },
++    Read {
++        look: &'a [u8],
++        path: &'a [u8],
++        extra: &'a [u8],
++        value: &'a [u8],
++    },
++}
++
++#[derive(Default)]
++pub struct Store {
++    pub strings: Vec<Box<[u8]>>,
++    string_ids: HashMap<Box<[u8]>, u32>,
++    /// Encoded with ids of `strings`.
++    pub entries: Vec<Box<[u8]>>,
++    entry_ids: HashMap<Box<[u8]>, u32>,
++    pub states: Vec<State>,
++    /// Bytes read from disk, and how many segments.
++    pub bytes: u64,
++    pub segments: usize,
++    /// Files of another store version: ignored.
++    pub other_format: usize,
++}
++
++// ── Encoding ──
++
++fn put_varint(out: &mut Vec<u8>, mut value: u64) {
++    while value >= 0x80 {
++        out.push((value as u8) | 0x80);
++        value >>= 7;
++    }
++    out.push(value as u8);
++}
++
++fn varint(input: &mut &[u8]) -> Option<u64> {
++    let mut value = 0u64;
++    for shift in (0..64).step_by(7) {
++        let (&byte, rest) = input.split_first()?;
++        *input = rest;
++        value |= u64::from(byte & 0x7f) << shift;
++        if byte < 0x80 {
++            return Some(value);
++        }
++    }
++    None
++}
++
++fn id(input: &mut &[u8]) -> Option<u32> {
++    u32::try_from(varint(input)?).ok()
++}
++
++fn take<'a>(input: &mut &'a [u8], n: usize) -> Option<&'a [u8]> {
++    if input.len() < n {
++        return None;
++    }
++    let (head, rest) = input.split_at(n);
++    *input = rest;
++    Some(head)
++}
++
++fn hash32<'a>(input: &mut &'a [u8]) -> Option<&'a [u8; 32]> {
++    take(input, 32)?.try_into().ok()
++}
++
++/// Reads one encoded entry from `input` and writes it to `out` with every string id passed through `map`.
++fn remap_entry(input: &mut &[u8], out: &mut Vec<u8>, map: &mut impl FnMut(u32) -> Option<u32>) -> Option<()> {
++    let mut sid = |input: &mut &[u8], out: &mut Vec<u8>| -> Option<()> {
++        put_varint(out, u64::from(map(id(input)?)?));
++        Some(())
++    };
++    let (&kind, rest) = input.split_first()?;
++    *input = rest;
++    out.push(kind);
++    match kind {
++        RESOLUTION => {
++            let flags = id(input)?;
++            put_varint(out, u64::from(flags));
++            for _ in 0..3 {
++                sid(input, out)?;
++            }
++            let n = id(input)?;
++            put_varint(out, u64::from(n));
++            for _ in 0..n {
++                sid(input, out)?;
++                out.extend_from_slice(take(input, 1)?);
++            }
++            if flags & HAS_CHECK != 0 {
++                out.extend_from_slice(take(input, 32)?);
++            }
++        }
++        MODULE | ANSWER => {
++            let flags = id(input)?;
++            put_varint(out, u64::from(flags));
++            sid(input, out)?;
++            if flags & HAS_SHA != 0 {
++                out.extend_from_slice(take(input, 32)?);
++            }
++            if flags & HAS_AOT != 0 {
++                out.extend_from_slice(take(input, 32)?);
++            }
++        }
++        READ => {
++            for _ in 0..4 {
++                sid(input, out)?;
++            }
++        }
++        _ => return None,
++    }
++    Some(())
++}
++
++fn put_state(out: &mut Vec<u8>, state: &State) {
++    put_varint(out, u64::from(state.file));
++    out.extend_from_slice(&state.fingerprint);
++    put_varint(out, state.time);
++    match state.header.outcome {
++        Some(counts) => {
++            out.push(1);
++            for count in counts {
++                put_varint(out, u64::from(count));
++            }
++        }
++        None => out.push(0),
++    }
++    put_varint(out, u64::from(state.header.unattributed_before));
++    put_varint(out, u64::from(state.header.late_from_earlier_files));
++    put_varint(out, state.header.marks.len() as u64);
++    for &mark in &state.header.marks {
++        put_varint(out, u64::from(mark));
++    }
++    for list in &state.lists {
++        put_varint(out, list.len() as u64);
++        for &entry in list {
++            put_varint(out, u64::from(entry));
++        }
++    }
++}
++
++/// Reads a state with its string and entry ids passed through the maps.
++fn get_state(
++    input: &mut &[u8],
++    strings: &mut impl FnMut(u32) -> Option<u32>,
++    entries: &mut impl FnMut(u32) -> Option<u32>,
++) -> Option<State> {
++    let file = strings(id(input)?)?;
++    let fingerprint = *hash32(input)?;
++    let time = varint(input)?;
++    let outcome = match take(input, 1)?[0] {
++        0 => None,
++        _ => {
++            let mut counts = [0u32; 6];
++            for count in &mut counts {
++                *count = id(input)?;
++            }
++            Some(counts)
++        }
++    };
++    let unattributed_before = id(input)?;
++    let late_from_earlier_files = id(input)?;
++    let mut marks = Vec::new();
++    for _ in 0..id(input)? {
++        marks.push(strings(id(input)?)?);
++    }
++    let mut lists: [Vec<u32>; 4] = Default::default();
++    for list in &mut lists {
++        let n = id(input)? as usize;
++        list.reserve(n.min(input.len()));
++        for _ in 0..n {
++            list.push(entries(id(input)?)?);
++        }
++    }
++    Some(State {
++        file,
++        fingerprint,
++        time,
++        header: Header {
++            outcome,
++            unattributed_before,
++            late_from_earlier_files,
++            marks,
++        },
++        lists,
++    })
++}
++
++/// A chunk: length and checksum of the payload, then the payload.
++fn put_chunk(out: &mut Vec<u8>, payload: &[u8]) {
++    out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
++    out.extend_from_slice(&bun_wyhash::hash32(payload).to_le_bytes());
++    out.extend_from_slice(payload);
++}
++
++fn file_header(out: &mut Vec<u8>) {
++    out.extend_from_slice(MAGIC);
++    out.extend_from_slice(&STORE_VERSION.to_le_bytes());
++}
++
++// ── Files and locks ──
++
++#[cfg(unix)]
++fn os_path(path: &[u8]) -> std::path::PathBuf {
++    use std::os::unix::ffi::OsStrExt as _;
++    std::path::PathBuf::from(std::ffi::OsStr::from_bytes(path))
++}
++
++#[cfg(not(unix))]
++fn os_path(path: &[u8]) -> std::path::PathBuf {
++    std::path::PathBuf::from(String::from_utf8_lossy(path).into_owned())
++}
++
++/// `flock`; `false` when `nonblocking` and it is held elsewhere, or on an error.
++#[cfg(unix)]
++fn lock(file: &std::fs::File, exclusive: bool, nonblocking: bool) -> bool {
++    use std::os::fd::AsRawFd as _;
++    let op = if exclusive { libc::LOCK_EX } else { libc::LOCK_SH }
++        | if nonblocking { libc::LOCK_NB } else { 0 };
++    loop {
++        // SAFETY: `file` is open.
++        if unsafe { libc::flock(file.as_raw_fd(), op) } == 0 {
++            return true;
++        }
++        if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
++            return false;
++        }
++    }
++}
++
++/// Without `flock`, two runs at once in one directory are not safe.
++#[cfg(not(unix))]
++fn lock(_file: &std::fs::File, _exclusive: bool, _nonblocking: bool) -> bool {
++    true
++}
++
++fn open_lock(dir: &std::path::Path) -> Option<std::fs::File> {
++    std::fs::OpenOptions::new()
++        .create(true)
++        .write(true)
++        .truncate(false)
++        .open(dir.join(LOCK_FILE))
++        .ok()
++}
++
++fn now_ns() -> u64 {
++    std::time::SystemTime::now()
++        .duration_since(std::time::UNIX_EPOCH)
++        .map_or(0, |it| it.as_nanos() as u64)
++}
++
++// ── Writing ──
++
++/// The segment this process appends to. Ids are local to it and grow with each chunk.
++pub struct Segment {
++    file: std::fs::File,
++    strings: HashMap<Box<[u8]>, u32>,
++    entries: HashMap<Box<[u8]>, u32>,
++    /// A write failed: what follows would refer to ids a reader never sees.
++    broken: bool,
++}
++
++impl Segment {
++    pub fn open(dir: &[u8]) -> std::io::Result<Segment> {
++        let segments = os_path(dir).join(SEGMENTS);
++        std::fs::create_dir_all(&segments)?;
++        let name = format!("{}-{}", std::process::id(), now_ns());
++        let new = segments.join(format!("{name}.new"));
++        let file = std::fs::OpenOptions::new()
++            .create_new(true)
++            .append(true)
++            .open(&new)?;
++        // Held until the process exits, so a merge leaves the segment alone while it can still grow.
++        // Taken before the segment has the name a merge looks for.
++        lock(&file, true, true);
++        let mut header = Vec::with_capacity(8);
++        file_header(&mut header);
++        (&file).write_all(&header)?;
++        std::fs::rename(&new, segments.join(format!("{name}.seg")))?;
++        Ok(Segment {
++            file,
++            strings: HashMap::new(),
++            entries: HashMap::new(),
++            broken: false,
++        })
++    }
++
++    /// One chunk: the strings and entries this segment has not had yet, and the state.
++    pub fn append(&mut self, state: &NewState<'_>) -> std::io::Result<()> {
++        if self.broken {
++            return Ok(());
++        }
++        let mut new_strings = Vec::new();
++        let mut n_strings = 0u64;
++        let strings = &mut self.strings;
++        let mut sid = |bytes: &[u8]| -> u32 {
++            if let Some(&id) = strings.get(bytes) {
++                return id;
++            }
++            let id = strings.len() as u32;
++            strings.insert(Box::from(bytes), id);
++            put_varint(&mut new_strings, bytes.len() as u64);
++            new_strings.extend_from_slice(bytes);
++            n_strings += 1;
++            id
++        };
++        let mut new_entries = Vec::new();
++        let mut n_entries = 0u64;
++        let mut lists: [Vec<u32>; 4] = Default::default();
++        let mut encoded = Vec::with_capacity(128);
++        for entry in state.entries {
++            encoded.clear();
++            encoded.push(entry.kind());
++            match entry {
++                Entry::Resolution {
++                    flags,
++                    kind,
++                    specifier,
++                    importer,
++                    paths,
++                    check,
++                } => {
++                    let flags = flags | if check.is_some() { HAS_CHECK } else { 0 };
++                    put_varint(&mut encoded, u64::from(flags));
++                    for part in [kind, specifier, importer] {
++                        put_varint(&mut encoded, u64::from(sid(&part[..])));
++                    }
++                    put_varint(&mut encoded, paths.len() as u64);
++                    for (path, from_root) in paths {
++                        put_varint(&mut encoded, u64::from(sid(&path[..])));
++                        encoded.push(*from_root as u8);
++                    }
++                    if let Some(check) = check {
++                        encoded.extend_from_slice(check);
++                    }
++                }
++                Entry::Module {
++                    flags,
++                    path,
++                    sha256,
++                    aot,
++                } => {
++                    let flags = flags
++                        | if sha256.is_some() { HAS_SHA } else { 0 }
++                        | if aot.is_some() { HAS_AOT } else { 0 };
++                    put_varint(&mut encoded, u64::from(flags));
++                    put_varint(&mut encoded, u64::from(sid(&path[..])));
++                    for hash in [sha256, aot].into_iter().flatten() {
++                        encoded.extend_from_slice(hash);
++                    }
++                }
++                Entry::Answer { path, sha256 } => {
++                    put_varint(&mut encoded, u64::from(if sha256.is_some() { HAS_SHA } else { 0 }));
++                    put_varint(&mut encoded, u64::from(sid(&path[..])));
++                    if let Some(sha256) = sha256 {
++                        encoded.extend_from_slice(sha256);
++                    }
++                }
++                Entry::Read {
++                    look,
++                    path,
++                    extra,
++                    value,
++                } => {
++                    for part in [look.as_bytes(), &path[..], &extra[..], &value[..]] {
++                        put_varint(&mut encoded, u64::from(sid(part)));
++                    }
++                }
++            }
++            let id = match self.entries.get(&encoded[..]) {
++                Some(&id) => id,
++                None => {
++                    let id = self.entries.len() as u32;
++                    self.entries.insert(Box::from(&encoded[..]), id);
++                    new_entries.extend_from_slice(&encoded);
++                    n_entries += 1;
++                    id
++                }
++            };
++            lists[usize::from(entry.kind())].push(id);
++        }
++        let stored = State {
++            file: sid(state.file),
++            fingerprint: state.fingerprint,
++            time: now_ns(),
++            header: Header {
++                outcome: state.header.outcome,
++                unattributed_before: state.header.unattributed_before,
++                late_from_earlier_files: state.header.late_from_earlier_files,
++                marks: state.header.marks.iter().map(|it| sid(&it[..])).collect(),
++            },
++            lists,
++        };
++        let mut payload = Vec::with_capacity(new_strings.len() + new_entries.len() + 1024);
++        put_varint(&mut payload, n_strings);
++        payload.extend_from_slice(&new_strings);
++        put_varint(&mut payload, n_entries);
++        payload.extend_from_slice(&new_entries);
++        put_varint(&mut payload, 1);
++        put_state(&mut payload, &stored);
++        let mut chunk = Vec::with_capacity(payload.len() + 8);
++        put_chunk(&mut chunk, &payload);
++        let written = (&self.file).write_all(&chunk);
++        self.broken = written.is_err();
++        written
++    }
++}
++
++// ── Reading ──
++
++impl Store {
++    fn intern_string(&mut self, bytes: &[u8]) -> u32 {
++        if let Some(&id) = self.string_ids.get(bytes) {
++            return id;
++        }
++        let id = self.strings.len() as u32;
++        self.strings.push(Box::from(bytes));
++        self.string_ids.insert(Box::from(bytes), id);
++        id
++    }
++
++    fn intern_entry(&mut self, encoded: &[u8]) -> u32 {
++        if let Some(&id) = self.entry_ids.get(encoded) {
++            return id;
++        }
++        let id = self.entries.len() as u32;
++        self.entries.push(Box::from(encoded));
++        self.entry_ids.insert(Box::from(encoded), id);
++        id
++    }
++
++    /// Adds what a store or segment file holds. `false` when it is of another version.
++    fn add_file(&mut self, bytes: &[u8]) -> bool {
++        let mut input = bytes;
++        let Some(header) = take(&mut input, 8) else {
++            // An empty segment: its writer had not written its header yet.
++            return true;
++        };
++        if &header[..4] != MAGIC || header[4..] != STORE_VERSION.to_le_bytes() {
++            self.other_format += 1;
++            return false;
++        }
++        self.bytes += bytes.len() as u64;
++        let mut local_strings: Vec<u32> = Vec::new();
++        let mut local_entries: Vec<u32> = Vec::new();
++        while let Some(chunk) = Self::next_chunk(&mut input) {
++            if self.add_chunk(chunk, &mut local_strings, &mut local_entries).is_none() {
++                break;
++            }
++        }
++        true
++    }
++
++    fn next_chunk<'a>(input: &mut &'a [u8]) -> Option<&'a [u8]> {
++        let len = u32::from_le_bytes(take(input, 4)?.try_into().ok()?) as usize;
++        let sum = u32::from_le_bytes(take(input, 4)?.try_into().ok()?);
++        let payload = take(input, len)?;
++        (bun_wyhash::hash32(payload) == sum).then_some(payload)
++    }
++
++    fn add_chunk(
++        &mut self,
++        mut input: &[u8],
++        local_strings: &mut Vec<u32>,
++        local_entries: &mut Vec<u32>,
++    ) -> Option<()> {
++        let input = &mut input;
++        for _ in 0..varint(input)? {
++            let len = varint(input)? as usize;
++            let bytes = take(input, len)?;
++            let id = self.intern_string(bytes);
++            local_strings.push(id);
++        }
++        let mut encoded = Vec::with_capacity(128);
++        for _ in 0..varint(input)? {
++            encoded.clear();
++            remap_entry(input, &mut encoded, &mut |it| local_strings.get(it as usize).copied())?;
++            let id = self.intern_entry(&encoded);
++            local_entries.push(id);
++        }
++        for _ in 0..varint(input)? {
++            let state = get_state(
++                input,
++                &mut |it| local_strings.get(it as usize).copied(),
++                &mut |it| local_entries.get(it as usize).copied(),
++            )?;
++            self.states.push(state);
++        }
++        Some(())
++    }
++
++    fn read_into(&mut self, path: &std::path::Path) -> Option<bool> {
++        let mut bytes = Vec::new();
++        std::fs::File::open(path).ok()?.read_to_end(&mut bytes).ok()?;
++        Some(self.add_file(&bytes))
++    }
++
++    /// The store and every segment of `dir`, as one moment of them.
++    pub fn load(dir: &[u8]) -> Store {
++        let dir = os_path(dir);
++        let mut store = Store::default();
++        let Some(lock_file) = open_lock(&dir) else {
++            return store;
++        };
++        lock(&lock_file, false, false);
++        store.read_into(&dir.join(STORE_FILE));
++        for path in segment_paths(&dir) {
++            if store.read_into(&path).is_some() {
++                store.segments += 1;
++            }
++        }
++        store
++    }
++
++    pub fn string(&self, id: u32) -> &[u8] {
++        self.strings.get(id as usize).map_or(b"", |it| &**it)
++    }
++
++    pub fn entry(&self, entry_id: u32) -> Option<EntryView<'_>> {
++        let mut input: &[u8] = self.entries.get(entry_id as usize)?;
++        let input = &mut input;
++        let (&kind, rest) = input.split_first()?;
++        *input = rest;
++        let strings = &self.strings[..];
++        let s = |input: &mut &[u8]| string_at(strings, input);
++        Some(match kind {
++            RESOLUTION => {
++                let flags = id(input)?;
++                let kind = s(input)?;
++                let specifier = s(input)?;
++                let importer = s(input)?;
++                let n = id(input)?;
++                let mut paths = Vec::with_capacity(n as usize);
++                for _ in 0..n {
++                    let path = s(input)?;
++                    paths.push((path, take(input, 1)?[0] != 0));
++                }
++                let check = if flags & HAS_CHECK != 0 { Some(hash32(input)?) } else { None };
++                EntryView::Resolution {
++                    flags,
++                    kind,
++                    specifier,
++                    importer,
++                    paths,
++                    check,
++                }
++            }
++            MODULE | ANSWER => {
++                let flags = id(input)?;
++                let path = s(input)?;
++                let sha256 = if flags & HAS_SHA != 0 { Some(hash32(input)?) } else { None };
++                if kind == ANSWER {
++                    EntryView::Answer { path, sha256 }
++                } else {
++                    let aot = if flags & HAS_AOT != 0 { Some(hash32(input)?) } else { None };
++                    EntryView::Module {
++                        flags,
++                        path,
++                        sha256,
++                        aot,
++                    }
++                }
++            }
++            READ => EntryView::Read {
++                look: s(input)?,
++                path: s(input)?,
++                extra: s(input)?,
++                value: s(input)?,
++            },
++            _ => return None,
++        })
++    }
++
++    /// State indexes by the test file's path as records write it, newest first.
++    pub fn by_file(&self) -> HashMap<&[u8], Vec<usize>> {
++        let mut out: HashMap<&[u8], Vec<usize>> = HashMap::new();
++        for (i, state) in self.states.iter().enumerate() {
++            out.entry(self.string(state.file)).or_default().push(i);
++        }
++        for list in out.values_mut() {
++            list.sort_by_key(|&i| core::cmp::Reverse(self.states[i].time));
++        }
++        out
++    }
++
++    /// The bytes of the merged store: the newest distinct states of each file, and only the strings
++    /// and entries they use.
++    fn merged(&self) -> (Vec<u8>, usize) {
++        let mut kept: Vec<&State> = Vec::new();
++        for list in self.by_file().values() {
++            let mut seen: Vec<&State> = Vec::new();
++            for &i in list {
++                let state = &self.states[i];
++                if seen
++                    .iter()
++                    .any(|it| it.fingerprint == state.fingerprint && it.lists == state.lists)
++                {
++                    continue;
++                }
++                seen.push(state);
++                if seen.len() == STATES_PER_FILE {
++                    break;
++                }
++            }
++            kept.extend(seen);
++        }
++        kept.sort_by_key(|it| (it.file, it.time));
++        let mut string_map: Vec<u32> = vec![u32::MAX; self.strings.len()];
++        let mut entry_map: Vec<u32> = vec![u32::MAX; self.entries.len()];
++        let mut strings = Vec::new();
++        let mut n_strings = 0u64;
++        let mut entries = Vec::new();
++        let mut n_entries = 0u64;
++        let mut states = Vec::new();
++        let mut new_string = |old: u32, strings: &mut Vec<u8>| -> Option<u32> {
++            let slot = string_map.get_mut(old as usize)?;
++            if *slot == u32::MAX {
++                *slot = n_strings as u32;
++                n_strings += 1;
++                let bytes = &self.strings[old as usize];
++                put_varint(strings, bytes.len() as u64);
++                strings.extend_from_slice(bytes);
++            }
++            Some(*slot)
++        };
++        for state in &kept {
++            let mut lists: [Vec<u32>; 4] = Default::default();
++            for (list, old) in lists.iter_mut().zip(&state.lists) {
++                for &entry in old {
++                    let slot = &mut entry_map[entry as usize];
++                    if *slot == u32::MAX {
++                        *slot = n_entries as u32;
++                        n_entries += 1;
++                        let mut input: &[u8] = &self.entries[entry as usize];
++                        let _ = remap_entry(&mut input, &mut entries, &mut |it| new_string(it, &mut strings));
++                    }
++                    list.push(*slot);
++                }
++            }
++            let state = State {
++                file: new_string(state.file, &mut strings).unwrap_or(0),
++                header: Header {
++                    marks: (state.header.marks.iter())
++                        .filter_map(|&it| new_string(it, &mut strings))
++                        .collect(),
++                    ..state.header.clone()
++                },
++                lists,
++                ..(*state).clone()
++            };
++            put_state(&mut states, &state);
++        }
++        let mut payload = Vec::with_capacity(strings.len() + entries.len() + states.len() + 32);
++        put_varint(&mut payload, n_strings);
++        payload.extend_from_slice(&strings);
++        put_varint(&mut payload, n_entries);
++        payload.extend_from_slice(&entries);
++        put_varint(&mut payload, kept.len() as u64);
++        payload.extend_from_slice(&states);
++        let mut out = Vec::with_capacity(payload.len() + 16);
++        file_header(&mut out);
++        put_chunk(&mut out, &payload);
++        (out, kept.len())
++    }
++}
++
++fn string_at<'a>(strings: &'a [Box<[u8]>], input: &mut &[u8]) -> Option<&'a [u8]> {
++    Some(&**strings.get(id(input)? as usize)?)
++}
++
++fn segment_paths(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
++    let Ok(items) = std::fs::read_dir(dir.join(SEGMENTS)) else {
++        return Vec::new();
++    };
++    let mut out: Vec<_> = items
++        .filter_map(|it| it.ok())
++        .map(|it| it.path())
++        .filter(|it| it.extension().is_some_and(|ext| ext == "seg"))
++        .collect();
++    out.sort();
++    out
++}
++
++/// What [`merge`] did.
++pub struct Merged {
++    pub segments: usize,
++    pub states: usize,
++    pub bytes: usize,
++}
++
++/// Merges the segments whose writers have exited into the store of `dir`. Segments of processes
++/// still running stay as they are; a later merge takes them.
++pub fn merge(dir: &[u8]) -> std::io::Result<Option<Merged>> {
++    let dir = os_path(dir);
++    let paths = segment_paths(&dir);
++    if paths.is_empty() {
++        return Ok(None);
++    }
++    let Some(lock_file) = open_lock(&dir) else {
++        return Ok(None);
++    };
++    lock(&lock_file, true, false);
++    let mut store = Store::default();
++    store.read_into(&dir.join(STORE_FILE));
++    let mut taken = Vec::new();
++    for path in segment_paths(&dir) {
++        let Ok(file) = std::fs::File::open(&path) else {
++            continue;
++        };
++        if !lock(&file, true, true) {
++            continue;
++        }
++        let mut bytes = Vec::new();
++        if (&file).read_to_end(&mut bytes).is_ok() {
++            store.add_file(&bytes);
++        }
++        taken.push((path, file));
++    }
++    if taken.is_empty() {
++        return Ok(None);
++    }
++    let (bytes, states) = store.merged();
++    let dest = dir.join(STORE_FILE);
++    let tmp = dir.join(format!("{STORE_FILE}.{}.tmp", std::process::id()));
++    let written = std::fs::write(&tmp, &bytes).and_then(|()| std::fs::rename(&tmp, &dest));
++    if let Err(err) = written {
++        let _ = std::fs::remove_file(&tmp);
++        return Err(err);
++    }
++    for (path, _) in &taken {
++        let _ = std::fs::remove_file(path);
++    }
++    Ok(Some(Merged {
++        segments: taken.len(),
++        states,
++        bytes: bytes.len(),
++    }))
 +}
 diff --git a/src/jsc/TestOwnReads.rs b/src/jsc/TestOwnReads.rs
 new file mode 100644
@@ -1552,7 +2588,7 @@ index 0e61e9871..27d950035 100644
          specifier: &bun_core::String,
          source: &bun_core::String,
 diff --git a/src/jsc/bindings/BunProcess.cpp b/src/jsc/bindings/BunProcess.cpp
-index 13ca10372..4a1328f77 100644
+index 13ca10372..97f7870c9 100644
 --- a/src/jsc/bindings/BunProcess.cpp
 +++ b/src/jsc/bindings/BunProcess.cpp
 @@ -483,6 +483,7 @@ extern "C" size_t Bun__process_dlopen_count;
@@ -1563,14 +2599,15 @@ index 13ca10372..4a1328f77 100644
  extern "C" int32_t Bun__addonNeedsGlibcOnMusl(const char* path, size_t len, char* soname_out, size_t soname_cap);
  
  // Drops only this load's reference. A library that registered modules on an earlier load is still referenced by that load.
-@@ -507,6 +508,7 @@ JSC_DEFINE_HOST_FUNCTION_WITH_ATTRIBUTES(Process_functionDlopen, __attribute__((
-     auto scope = DECLARE_THROW_SCOPE(JSC::getVM(globalObject));
-     auto& vm = JSC::getVM(globalObject);
+@@ -622,6 +623,8 @@ JSC_DEFINE_HOST_FUNCTION_WITH_ATTRIBUTES(Process_functionDlopen, __attribute__((
+         globalObject->napiModuleRegisterCallCount = outerRegisterCallCount;
+     });
  
++    // Marked only when it loads: a refusal above depends on nothing but the file name and the run's settings.
 +    Bun__TestInputRecorder__mark(globalObject->bunVM(), "native-addon");
-     if (!Bun__VM__allowAddons(globalObject->bunVM())) {
-         return ERR::DLOPEN_DISABLED(scope, globalObject, "Cannot load native addon because loading addons is disabled."_s);
-     }
+     Bun__process_dlopen_count++;
+ 
+ #if OS(WINDOWS)
 diff --git a/src/jsc/bindings/IsolatedModuleCache.cpp b/src/jsc/bindings/IsolatedModuleCache.cpp
 index c4b307258..c1105f6e1 100644
 --- a/src/jsc/bindings/IsolatedModuleCache.cpp
@@ -1664,10 +2701,10 @@ index 5d80f694b..d331664a9 100644
      int r = sqlite3_open_v2(utf8.legacyCStringPointer(), outPtr(db), flags, nullptr);
      if (r != SQLITE_OK) {
 diff --git a/src/jsc/lib.rs b/src/jsc/lib.rs
-index 55e099bd2..b8846e5b5 100644
+index 55e099bd2..f09a75f92 100644
 --- a/src/jsc/lib.rs
 +++ b/src/jsc/lib.rs
-@@ -479,6 +479,10 @@ pub mod jsc_scheduler;
+@@ -479,6 +479,12 @@ pub mod jsc_scheduler;
  pub mod process_auto_killer;
  #[path = "ScriptExecutionContext.rs"]
  pub mod script_execution_context;
@@ -1675,6 +2712,8 @@ index 55e099bd2..b8846e5b5 100644
 +pub mod test_input_recorder;
 +#[path = "TestOwnReads.rs"]
 +pub mod test_own_reads;
++#[path = "TestInputStore.rs"]
++pub mod test_input_store;
  
  /// Flags for `JSCInitialize` in ZigGlobalObject.cpp. JSC is set up once per process: the first call's flags win.
  #[derive(Clone, Copy, Default)]
@@ -1825,10 +2864,10 @@ index 440dbe094..55ec86ac9 100644
      pub(crate) mod shards_by_reach;
 diff --git a/src/runtime/cli/test/InputReuse.rs b/src/runtime/cli/test/InputReuse.rs
 new file mode 100644
-index 000000000..c3a4be322
+index 000000000..6ca632ec3
 --- /dev/null
 +++ b/src/runtime/cli/test/InputReuse.rs
-@@ -0,0 +1,995 @@
+@@ -0,0 +1,1114 @@
 +//! `BUN_TEST_INPUT_REUSE=1` with `BUN_TEST_INPUT_RECORD_DIR` under `bun test --isolate`: before the
 +//! run, a test file whose record still holds is not run, and its recorded counts go into the summary.
 +//!
@@ -1840,18 +2879,44 @@ index 000000000..c3a4be322
 +//! run, however many records list it. `BUN_TEST_INPUT_REUSE=explain` says why each other file runs.
 +//! `BUN_TEST_INPUT_REUSE=check` runs every file anyway and fails the run when a file whose record
 +//! held ends with other counts than its record has: a miss of the records, found in one run.
++//! `BUN_TEST_INPUT_REUSE=list` validates, says for each file whether it would run and why, and exits
++//! without running any.
++//!
++//! Records are states in the store of the record directory (`bun_jsc::test_input_store`); a file
++//! has up to a few, and the newest one whose inputs hold on the current tree decides.
 +
 +use std::collections::HashMap;
 +use std::io::Write as _;
 +
 +use bun_core::{Global, env, pretty_error};
 +use bun_jsc::test_input_recorder as recorder;
++use bun_jsc::test_input_store::{self as store, EntryView, Store};
 +use bun_jsc::test_own_reads::Look;
 +use bun_jsc::virtual_machine::VirtualMachine;
 +use bun_options_types::context::{ContextData, MacroOptions, TestGlobals};
-+use bun_parsers::json as bun_json;
 +use bun_ptr::Interned;
 +use bun_sys::{Fd, File};
++
++/// What tells two builds of the recorder apart when `bun=` is the same: every build of a patched
++/// Bun reports its base revision. The recorder's and validator's own sources, as compiled in, and
++/// `BUN_TEST_INPUT_BUILD_ID` from the build's environment, for a packager to pass its patch level.
++/// A change to a hook outside these files alone does not change it; such a change bumps
++/// `RECORD_VERSION` or comes with a new build id.
++fn recorder_build() -> [u8; 32] {
++    const SOURCES: [&[u8]; 4] = [
++        include_bytes!("../../../jsc/TestInputRecorder.rs"),
++        include_bytes!("../../../jsc/TestInputStore.rs"),
++        include_bytes!("../../../jsc/TestOwnReads.rs"),
++        include_bytes!("InputReuse.rs"),
++    ];
++    let mut all = Vec::with_capacity(SOURCES.iter().map(|it| it.len()).sum::<usize>() + 64);
++    for source in SOURCES {
++        all.extend_from_slice(&(source.len() as u64).to_le_bytes());
++        all.extend_from_slice(source);
++    }
++    all.extend_from_slice(option_env!("BUN_TEST_INPUT_BUILD_ID").unwrap_or("").as_bytes());
++    recorder::source_hash(&all)
++}
 +
 +/// What the run was started with that can change a test file's outcome, one `name=value` per line.
 +/// Paths under the project root are relative to it.
@@ -1880,6 +2945,14 @@ index 000000000..c3a4be322
 +
 +    let test = &ctx.test_options;
 +    let _ = writeln!(out, "bun={}", Global::package_json_version_with_revision);
++    let _ = write!(
++        out,
++        "recorder={}.{}.",
++        recorder::RECORD_VERSION,
++        bun_jsc::test_input_store::STORE_VERSION
++    );
++    recorder::write_hex(&mut out, &recorder_build());
++    out.push(b'\n');
 +    let _ = writeln!(
 +        out,
 +        "platform={}-{}",
@@ -2220,6 +3293,8 @@ index 000000000..c3a4be322
 +    Explain,
 +    /// `check`: run every file, and compare the outcome of each file whose record held with the record.
 +    Check,
++    /// `list`: validate, say which files would run and why, and exit without running any.
++    List,
 +}
 +
 +/// Why a file runs: a short kind, and what it is about (a path, a question, a mark), if anything.
@@ -2246,12 +3321,13 @@ index 000000000..c3a4be322
 +
 +thread_local! {
 +    /// Files `check` runs although their record held, until the run ends. Test files run on one thread.
-+    static CHECKING: core::cell::RefCell<Option<Vec<WouldReuse>>> = const { core::cell::RefCell::new(None) };
++    /// With when the run started, in nanoseconds since the epoch: the states written since are this run's.
++    static CHECKING: core::cell::RefCell<Option<(Vec<WouldReuse>, u64)>> = const { core::cell::RefCell::new(None) };
 +}
 +
 +/// With `BUN_TEST_INPUT_REUSE` set, moves the files to run to the front of `files` and returns how
 +/// many there are, with the files whose record holds. `None` when reuse is off. Under `check`, every
-+/// file runs and none is returned as reused; [`finish_check`] compares them after the run.
++/// file runs and none is returned as reused; [`finish_run`] compares them after the run.
 +///
 +/// `BUN_TEST_INPUT_REUSE_REPORT=<path>` writes one JSON line per file: whether its record held, and
 +/// if not, why (`why`, and `detail` when there is one).
@@ -2263,22 +3339,30 @@ index 000000000..c3a4be322
 +        b"0" => return None,
 +        b"explain" => Mode::Explain,
 +        b"check" => Mode::Check,
++        b"list" => Mode::List,
 +        _ => Mode::Reuse,
 +    };
-+    let Some(fingerprint) = recorder::fingerprint_hex(vm) else {
++    let (Some(fingerprint), Some(dir)) = (recorder::fingerprint_hash(vm), recorder::record_dir(vm))
++    else {
 +        pretty_error!(
 +            "<r><yellow>warn<r><d>:<r> BUN_TEST_INPUT_REUSE needs BUN_TEST_INPUT_RECORD_DIR and --isolate; every file runs\n"
 +        );
 +        return None;
 +    };
-+    let mut validator = Validator {
-+        vm,
-+        fingerprint,
-+        hashes: HashMap::new(),
-+        aot: HashMap::new(),
-+        checks: HashMap::new(),
-+        looks: HashMap::new(),
-+    };
++    let run_started = now_ns();
++    let loading = std::time::Instant::now();
++    let store = Store::load(dir);
++    let load_ms = loading.elapsed().as_micros() as f64 / 1000.0;
++    if store.other_format > 0 {
++        pretty_error!(
++            "<r><d>reuse:<r> {} {} of another record store format ignored; this run's records replace {}\n",
++            store.other_format,
++            if store.other_format == 1 { "file" } else { "files" },
++            if store.other_format == 1 { "it" } else { "them" },
++        );
++    }
++    let mut validator = Validator::new(vm, fingerprint, &store);
++    let mut listed = Vec::new();
 +    let mut report = Vec::new();
 +    let mut reused = Vec::new();
 +    let mut checking = Vec::new();
@@ -2296,7 +3380,16 @@ index 000000000..c3a4be322
 +            match validator.holds(file.as_bytes()) {
 +                Ok(outcome) => {
 +                    report.extend_from_slice(b",\"held\":true}\n");
-+                    if mode == Mode::Check {
++                    if mode == Mode::List {
++                        let _ = write!(listed, "{}: would be reused\n", bstr::BStr::new(&title));
++                        reused.push(Reused {
++                            file,
++                            pass: outcome[0],
++                            skip: outcome[2],
++                            todo: outcome[3],
++                            expectations: outcome[4],
++                        });
++                    } else if mode == Mode::Check {
 +                        checking.push(WouldReuse { file, recorded: outcome });
 +                        files[kept] = file;
 +                        kept += 1;
@@ -2311,8 +3404,18 @@ index 000000000..c3a4be322
 +                    }
 +                }
 +                Err(why) => {
-+                    if why.kind == "fingerprint" || why.kind == "record-version" {
++                    if why.kind == "fingerprint" {
 +                        ignored += 1;
++                    }
++                    if mode == Mode::List {
++                        let _ = write!(
++                            listed,
++                            "{}: runs: {}{}{}\n",
++                            bstr::BStr::new(&title),
++                            why.kind,
++                            if why.detail.is_empty() { "" } else { " " },
++                            bstr::BStr::new(&why.detail)
++                        );
 +                    }
 +                    let _ = write!(report, ",\"held\":false,\"why\":\"{}\"", why.kind);
 +                    if !why.detail.is_empty() {
@@ -2349,7 +3452,7 @@ index 000000000..c3a4be322
 +            "<r><d>reuse: {} of {} files {}; {} paths hashed, {} questions asked, {} looks repeated, in {} ms<r>\n",
 +            held,
 +            files.len(),
-+            if mode == Mode::Check { "would be reused" } else { "reused" },
++            if mode == Mode::Reuse || mode == Mode::Explain { "reused" } else { "would be reused" },
 +            validator.hashes.len(),
 +            validator.checks.len(),
 +            validator.looks.len(),
@@ -2357,31 +3460,69 @@ index 000000000..c3a4be322
 +        );
 +    }
 +    write_report(&report, false);
++    if mode == Mode::List {
++        let _ = std::io::Write::write_all(&mut std::io::stdout(), &listed);
++        pretty_error!(
++            "<r><d>reuse list: store of {} states, {} entries and {} strings, {:.1} MB in the store and {} {}, loaded in {} ms; fingerprint {}<r>\n",
++            store.states.len(),
++            store.entries.len(),
++            store.strings.len(),
++            store.bytes as f64 / 1e6,
++            store.segments,
++            if store.segments == 1 { "segment" } else { "segments" },
++            load_ms,
++            bstr::BStr::new(&recorder::fingerprint_hex(vm).unwrap_or_default())
++        );
++        bun_core::Output::flush();
++        Global::exit(0);
++    }
 +    if mode == Mode::Check {
-+        CHECKING.with_borrow_mut(|it| *it = Some(checking));
++        CHECKING.with_borrow_mut(|it| *it = Some((checking, run_started)));
 +    }
 +    Some((kept, reused))
 +}
 +
-+/// After a `check` run: compares each file whose record held with the record this run wrote for it,
-+/// prints a line per file whose outcome differs and a summary line, and returns how many differ.
-+/// `None` when this run was not a `check`.
-+pub(crate) fn finish_check(vm: &VirtualMachine) -> Option<usize> {
-+    let checking = CHECKING.with_borrow_mut(|it| it.take())?;
-+    let fingerprint = recorder::fingerprint_hex(vm)?;
-+    let validator = Validator {
-+        vm,
-+        fingerprint,
-+        hashes: HashMap::new(),
-+        aot: HashMap::new(),
-+        checks: HashMap::new(),
-+        looks: HashMap::new(),
-+    };
++/// At the end of a recording run, in the process that started it: merges this run's records into the
++/// store. After a `check` run, then compares each file whose record held with the record this run
++/// wrote for it, prints a line per file whose outcome differs and a summary line, and returns how many
++/// differ. `None` when this run was not a `check`.
++pub(crate) fn finish_run(vm: &VirtualMachine) -> Option<usize> {
++    let dir = recorder::record_dir(vm)?;
++    recorder::close_segment(vm);
++    if let Err(err) = store::merge(dir) {
++        pretty_error!(
++            "<r><yellow>warn<r><d>:<r> the test input records could not be merged into the store in {}: {}\n",
++            bstr::BStr::new(dir),
++            err
++        );
++    }
++    finish_check(vm, dir)
++}
++
++fn now_ns() -> u64 {
++    std::time::SystemTime::now()
++        .duration_since(std::time::UNIX_EPOCH)
++        .map_or(0, |it| it.as_nanos() as u64)
++}
++
++fn finish_check(vm: &VirtualMachine, dir: &[u8]) -> Option<usize> {
++    let (checking, run_started) = CHECKING.with_borrow_mut(|it| it.take())?;
++    let fingerprint = recorder::fingerprint_hash(vm)?;
++    let store = Store::load(dir);
++    let validator = Validator::new(vm, fingerprint, &store);
 +    let mut report = Vec::new();
 +    let mut mismatches = 0;
 +    for it in &checking {
 +        let title = validator.shown(it.file.as_bytes());
-+        let fresh = validator.read(it.file.as_bytes()).ok().and_then(|record| record.outcome);
++        // The state this run wrote for the file.
++        let fresh = recorder::written_path(vm, it.file.as_bytes())
++            .and_then(|path| validator.by_file.get(&*path))
++            .and_then(|states| {
++                states.iter().map(|&i| &store.states[i]).find(|state| {
++                    state.fingerprint == fingerprint && state.time >= run_started
++                })
++            })
++            .and_then(|state| state.header.outcome);
 +        report.extend_from_slice(b"{\"file\":");
 +        json_string(&mut report, &title);
 +        if fresh == Some(it.recorded) {
@@ -2487,15 +3628,20 @@ index 000000000..c3a4be322
 +
 +struct Validator<'a> {
 +    vm: &'a VirtualMachine,
-+    fingerprint: Vec<u8>,
-+    /// By absolute path: the hex SHA-256 of the file now, `None` if it can't be read.
-+    hashes: HashMap<Vec<u8>, Option<Vec<u8>>>,
-+    /// By absolute path: the hex `aotConfig` of the module now.
-+    aot: HashMap<Vec<u8>, Option<Vec<u8>>>,
-+    /// By question: the hex `check` of its answer now, `None` if it can't be asked again.
-+    checks: HashMap<Vec<u8>, Option<Vec<u8>>>,
++    fingerprint: [u8; 32],
++    store: &'a Store,
++    /// State indexes by the test file's path as records write it, newest first.
++    by_file: HashMap<&'a [u8], Vec<usize>>,
++    /// By absolute path: the SHA-256 of the file now, `None` if it can't be read.
++    hashes: HashMap<Vec<u8>, Option<[u8; 32]>>,
++    /// By absolute path: the `aotConfig` of the module now.
++    aot: HashMap<Vec<u8>, Option<[u8; 32]>>,
++    /// By question: the `check` of its answer now, `None` if it can't be asked again.
++    checks: HashMap<Vec<u8>, Option<[u8; 32]>>,
 +    /// By look, path and extra: what looking again gives now.
 +    looks: HashMap<Vec<u8>, Box<[u8]>>,
++    /// By entry id, two bits per step of [`Validator::inputs_why`]: the entry passed that step.
++    passed: Vec<u8>,
 +}
 +
 +/// pass, fail, skip, todo, expectations, unhandledErrors.
@@ -2508,33 +3654,27 @@ index 000000000..c3a4be322
 +    b"unhandledErrors",
 +];
 +
-+struct Record {
-+    fingerprint: Vec<u8>,
-+    outcome: Option<[u32; 6]>,
-+    unattributed_before: u32,
-+    marks: Vec<Vec<u8>>,
-+    resolutions: Vec<Resolution>,
-+    /// Modules and answer files: absolute path and the recorded hex hash.
-+    files: Vec<(Vec<u8>, Option<Vec<u8>>)>,
-+    /// Modules: absolute path and the recorded `aotConfig`.
-+    aot: Vec<(Vec<u8>, Option<Vec<u8>>)>,
-+    /// Why a module can't be compared by its bytes, if one can't.
-+    unhashable: Option<Why>,
-+    /// What the file's own code looked at: how, the absolute path, what else the look needs, the value.
-+    reads: Vec<(Look, Vec<u8>, Vec<u8>, Vec<u8>)>,
-+}
++/// The steps of [`Validator::inputs_why`], as bits of [`Validator::passed`].
++const STATIC: u8 = 1;
++const CONTENTS: u8 = 2;
++const AOT: u8 = 4;
++const AGAIN: u8 = 8;
 +
-+struct Resolution {
-+    kind: Vec<u8>,
-+    specifier: Vec<u8>,
-+    importer: Vec<u8>,
-+    importer_is_file: bool,
-+    paths: Vec<Box<[u8]>>,
-+    plugin: bool,
-+    check: Option<Vec<u8>>,
-+}
++impl<'a> Validator<'a> {
++    fn new(vm: &'a VirtualMachine, fingerprint: [u8; 32], store: &'a Store) -> Validator<'a> {
++        Validator {
++            vm,
++            fingerprint,
++            store,
++            by_file: store.by_file(),
++            hashes: HashMap::new(),
++            aot: HashMap::new(),
++            checks: HashMap::new(),
++            looks: HashMap::new(),
++            passed: vec![0; store.entries.len()],
++        }
++    }
 +
-+impl Validator<'_> {
 +    /// A path as reasons show it: relative to the root when under it.
 +    fn shown(&self, path: &[u8]) -> Vec<u8> {
 +        let root = self.vm.top_level_dir();
@@ -2545,283 +3685,301 @@ index 000000000..c3a4be322
 +    }
 +
 +    /// A question as reasons show it: `kind specifier from importer`.
-+    fn question(&self, resolution: &Resolution) -> Vec<u8> {
-+        let mut out = resolution.kind.clone();
++    fn question(&self, kind: &[u8], specifier: &[u8], importer: &[u8]) -> Vec<u8> {
++        let mut out = kind.to_vec();
 +        out.push(b' ');
-+        out.extend_from_slice(&self.shown(&resolution.specifier));
++        out.extend_from_slice(&self.shown(specifier));
 +        out.extend_from_slice(b" from ");
-+        out.extend_from_slice(&self.shown(&resolution.importer));
++        out.extend_from_slice(&self.shown(importer));
 +        out
 +    }
 +
-+    /// The recorded outcome, or why the file runs.
-+    fn holds(&mut self, file: &[u8]) -> Result<[u32; 6], Why> {
-+        let record = self.read(file)?;
-+        if record.fingerprint != self.fingerprint {
-+            return Err(Why::new("fingerprint"));
++    /// A file's path as a record writes it, made absolute: relative ones are under the root.
++    fn file(&self, path: &[u8]) -> Vec<u8> {
++        if bun_paths::is_absolute(path) {
++            path.to_vec()
++        } else {
++            recorder::from_root(self.vm, path)
 +        }
-+        let Some(outcome) = record.outcome else {
-+            return Err(Why::new("error-before-tests"));
++    }
++
++    /// A specifier or importer as a record writes it: made absolute when it was made relative to the root.
++    fn asked(&self, path: &[u8], from_root: bool) -> Vec<u8> {
++        if from_root {
++            recorder::from_root(self.vm, path)
++        } else {
++            path.to_vec()
++        }
++    }
++
++    /// The recorded outcome, or why the file runs. The newest state whose inputs hold decides; when
++    /// none does, the reason is the newest state's.
++    fn holds(&mut self, file: &[u8]) -> Result<[u32; 6], Why> {
++        let Some(path) = recorder::written_path(self.vm, file) else {
++            return Err(Why::new("not-recording"));
++        };
++        let Some(states) = self.by_file.get(&*path) else {
++            return Err(Why::new("no-record"));
++        };
++        let store = self.store;
++        let states: Vec<&'a store::State> = states
++            .iter()
++            .map(|&i| &store.states[i])
++            .filter(|state| state.fingerprint == self.fingerprint)
++            .collect();
++        let mut newest = None;
++        for state in states {
++            let header = self.header_why(state);
++            match self.inputs_why(state) {
++                None => return header.map_or(Ok(state.header.outcome.unwrap_or_default()), Err),
++                Some(why) => {
++                    if newest.is_none() {
++                        newest = Some(header.unwrap_or(why));
++                    }
++                }
++            }
++        }
++        Err(newest.unwrap_or_else(|| Why::new("fingerprint")))
++    }
++
++    /// What the record says that makes it not reusable even when its inputs hold.
++    fn header_why(&self, state: &store::State) -> Option<Why> {
++        let Some(outcome) = state.header.outcome else {
++            return Some(Why::new("error-before-tests"));
 +        };
 +        if outcome[1] > 0 {
-+            return Err(Why::new("failed"));
++            return Some(Why::new("failed"));
 +        }
 +        if outcome[5] > 0 {
-+            return Err(Why::new("unhandled-error"));
++            return Some(Why::new("unhandled-error"));
 +        }
-+        if record.unattributed_before > 0 {
-+            return Err(Why::new("earlier-file-work"));
++        if state.header.unattributed_before > 0 {
++            return Some(Why::new("earlier-file-work"));
 +        }
-+        if let Some(name) = record.marks.first() {
-+            return Err(Why::with("mark", name.clone()));
++        if let Some(&name) = state.header.marks.first() {
++            return Some(Why::with("mark", self.store.string(name).to_vec()));
 +        }
-+        if let Some(why) = record.unhashable {
-+            return Err(why);
++        None
++    }
++
++    /// Runs `step` on entry `id` unless it passed that step before in this run.
++    fn step(
++        &mut self,
++        id: u32,
++        bit: u8,
++        step: impl FnOnce(&mut Self, EntryView<'a>) -> Option<Why>,
++    ) -> Option<Why> {
++        if self.passed[id as usize] & bit != 0 {
++            return None;
 +        }
-+        for resolution in &record.resolutions {
-+            if resolution.plugin {
-+                return Err(Why::with("plugin", self.question(resolution)));
-+            }
-+            if resolution.check.is_none() {
-+                return Err(Why::with("no-check", self.question(resolution)));
-+            }
++        let store = self.store;
++        let Some(entry) = store.entry(id) else {
++            return Some(Why::new("unreadable-record"));
++        };
++        let why = step(self, entry);
++        if why.is_none() {
++            self.passed[id as usize] |= bit;
 +        }
-+        for (path, sha256) in &record.files {
-+            let Some(sha256) = sha256 else {
-+                return Err(Why::with("no-hash", self.shown(path)));
-+            };
-+            if self.hash(path) != Some(sha256) {
-+                return Err(Why::with("changed", self.shown(path)));
-+            }
-+        }
-+        let vm = self.vm;
-+        for (path, recorded) in &record.aot {
-+            let now = self.aot.entry(path.clone()).or_insert_with(|| {
-+                let check = recorder::aot_config_check(vm, path)?;
-+                let mut hex = Vec::with_capacity(64);
-+                recorder::write_hex(&mut hex, &check);
-+                Some(hex)
++        why
++    }
++
++    /// Why the state's inputs do not hold on the current tree, if they don't.
++    fn inputs_why(&mut self, state: &store::State) -> Option<Why> {
++        let [resolutions, modules, answers, reads] = &state.lists;
++        for &id in modules {
++            let why = self.step(id, STATIC, |this, entry| {
++                let EntryView::Module { flags, path, .. } = entry else {
++                    return None;
++                };
++                if flags & store::VIRTUAL != 0 {
++                    return Some(Why::with("virtual", this.shown(&this.file(path))));
++                }
++                if flags & store::CHANGED_DURING_RUN != 0 {
++                    let path = this.shown(&this.file(path));
++                    return Some(Why::with("changed-during-run", path));
++                }
++                None
 +            });
-+            if now != recorded {
-+                return Err(Why::with("package-config", self.shown(path)));
++            if why.is_some() {
++                return why;
 +            }
 +        }
-+        for (look, path, extra, value) in &record.reads {
-+            let mut key = look.name().as_bytes().to_vec();
-+            for part in [&path[..], &extra[..]] {
-+                key.push(0);
-+                key.extend_from_slice(part);
-+            }
-+            let vm = self.vm;
-+            let now = self
-+                .looks
-+                .entry(key)
-+                .or_insert_with(|| recorder::observe_again(vm, *look, path, extra));
-+            if **now != **value {
-+                let mut detail = look.name().as_bytes().to_vec();
-+                detail.push(b' ');
-+                detail.extend_from_slice(&self.shown(path));
-+                return Err(Why::with("own-read", detail));
++        for &id in resolutions {
++            let why = self.step(id, STATIC, |this, entry| {
++                let EntryView::Resolution {
++                    flags,
++                    kind,
++                    specifier,
++                    importer,
++                    check,
++                    ..
++                } = entry
++                else {
++                    return None;
++                };
++                if flags & store::PLUGIN == 0 && check.is_some() {
++                    return None;
++                }
++                let specifier = this.asked(specifier, flags & store::SPECIFIER_FROM_ROOT != 0);
++                let importer = this.asked(importer, flags & store::IMPORTER_FROM_ROOT != 0);
++                let question = this.question(kind, &specifier, &importer);
++                Some(Why::with(
++                    if flags & store::PLUGIN != 0 { "plugin" } else { "no-check" },
++                    question,
++                ))
++            });
++            if why.is_some() {
++                return why;
 +            }
 +        }
-+        for resolution in &record.resolutions {
-+            if self.check(resolution) != resolution.check.as_ref() {
-+                return Err(Why::with("answer", self.question(resolution)));
++        for &id in modules.iter().chain(answers) {
++            let why = self.step(id, CONTENTS, |this, entry| {
++                let (path, sha256) = match entry {
++                    EntryView::Module { path, sha256, .. } | EntryView::Answer { path, sha256 } => {
++                        (path, sha256)
++                    }
++                    _ => return None,
++                };
++                let path = this.file(path);
++                let Some(sha256) = sha256 else {
++                    return Some(Why::with("no-hash", this.shown(&path)));
++                };
++                if this.hash(&path) != Some(*sha256) {
++                    return Some(Why::with("changed", this.shown(&path)));
++                }
++                None
++            });
++            if why.is_some() {
++                return why;
 +            }
 +        }
-+        Ok(outcome)
++        for &id in modules {
++            let why = self.step(id, AOT, |this, entry| {
++                let EntryView::Module { path, aot, .. } = entry else {
++                    return None;
++                };
++                let path = this.file(path);
++                let vm = this.vm;
++                let now = *this
++                    .aot
++                    .entry(path.clone())
++                    .or_insert_with(|| recorder::aot_config_check(vm, &path));
++                if now.as_ref() != aot {
++                    return Some(Why::with("package-config", this.shown(&path)));
++                }
++                None
++            });
++            if why.is_some() {
++                return why;
++            }
++        }
++        for &id in reads {
++            let why = self.step(id, AGAIN, |this, entry| {
++                let EntryView::Read {
++                    look,
++                    path,
++                    extra,
++                    value,
++                } = entry
++                else {
++                    return None;
++                };
++                let Some(look) = Look::from_name(look) else {
++                    return Some(Why::new("unreadable-record"));
++                };
++                let path = this.file(path);
++                let mut key = look.name().as_bytes().to_vec();
++                for part in [&path[..], extra] {
++                    key.push(0);
++                    key.extend_from_slice(part);
++                }
++                let vm = this.vm;
++                let now = this
++                    .looks
++                    .entry(key)
++                    .or_insert_with(|| recorder::observe_again(vm, look, &path, extra));
++                if **now != *value {
++                    let mut detail = look.name().as_bytes().to_vec();
++                    detail.push(b' ');
++                    detail.extend_from_slice(&this.shown(&path));
++                    return Some(Why::with("own-read", detail));
++                }
++                None
++            });
++            if why.is_some() {
++                return why;
++            }
++        }
++        for &id in resolutions {
++            let why = self.step(id, AGAIN, |this, entry| {
++                let EntryView::Resolution {
++                    flags,
++                    kind,
++                    specifier,
++                    importer,
++                    paths,
++                    check,
++                } = entry
++                else {
++                    return None;
++                };
++                let specifier = this.asked(specifier, flags & store::SPECIFIER_FROM_ROOT != 0);
++                let importer = this.asked(importer, flags & store::IMPORTER_FROM_ROOT != 0);
++                let paths: Vec<Box<[u8]>> = paths
++                    .iter()
++                    .map(|&(path, from_root)| {
++                        if from_root {
++                            recorder::from_root(this.vm, path).into_boxed_slice()
++                        } else {
++                            Box::from(path)
++                        }
++                    })
++                    .collect();
++                let asked = recorder::Asked {
++                    kind,
++                    specifier: &specifier,
++                    importer: &importer,
++                    importer_is_file: flags & store::IMPORTER_IS_FILE != 0,
++                    paths: &paths,
++                };
++                if this.check(&asked) != check.copied() {
++                    return Some(Why::with(
++                        "answer",
++                        this.question(kind, &specifier, &importer),
++                    ));
++                }
++                None
++            });
++            if why.is_some() {
++                return why;
++            }
++        }
++        None
 +    }
 +
-+    fn hash(&mut self, path: &[u8]) -> Option<&Vec<u8>> {
-+        self.hashes
-+            .entry(path.to_vec())
-+            .or_insert_with(|| {
-+                let contents = File::read_from(Fd::cwd(), path).ok()?;
-+                let mut hex = Vec::with_capacity(64);
-+                recorder::write_hex(&mut hex, &recorder::source_hash(&contents));
-+                Some(hex)
-+            })
-+            .as_ref()
++    fn hash(&mut self, path: &[u8]) -> Option<[u8; 32]> {
++        *self.hashes.entry(path.to_vec()).or_insert_with(|| {
++            let contents = File::read_from(Fd::cwd(), path).ok()?;
++            Some(recorder::source_hash(&contents))
++        })
 +    }
 +
-+    fn check(&mut self, resolution: &Resolution) -> Option<&Vec<u8>> {
++    fn check(&mut self, asked: &recorder::Asked<'_>) -> Option<[u8; 32]> {
 +        let mut key = Vec::with_capacity(256);
-+        for part in [
-+            &resolution.kind,
-+            &resolution.specifier,
-+            &resolution.importer,
-+        ] {
++        for part in [asked.kind, asked.specifier, asked.importer] {
 +            key.extend_from_slice(part);
 +            key.push(0);
 +        }
-+        key.push(resolution.importer_is_file as u8);
-+        for path in &resolution.paths {
++        key.push(asked.importer_is_file as u8);
++        for path in asked.paths {
 +            key.push(0);
 +            key.extend_from_slice(path);
 +        }
 +        let vm = self.vm;
-+        self.checks
++        *self
++            .checks
 +            .entry(key)
-+            .or_insert_with(|| {
-+                let asked = recorder::Asked {
-+                    kind: &resolution.kind,
-+                    specifier: &resolution.specifier,
-+                    importer: &resolution.importer,
-+                    importer_is_file: resolution.importer_is_file,
-+                    paths: &resolution.paths,
-+                };
-+                let check = recorder::check_again(vm, &asked)?;
-+                let mut hex = Vec::with_capacity(64);
-+                recorder::write_hex(&mut hex, &check);
-+                Some(hex)
-+            })
-+            .as_ref()
-+    }
-+
-+    fn read(&self, file: &[u8]) -> Result<Record, Why> {
-+        let Some(path) = recorder::record_path(self.vm, file) else {
-+            return Err(Why::new("not-recording"));
-+        };
-+        let contents = match File::read_from(Fd::cwd(), &path) {
-+            Ok(contents) => contents,
-+            Err(_) => return Err(Why::new("no-record")),
-+        };
-+        bun_ast::initialize_store();
-+        let record = self.parse(&path, &contents);
-+        bun_ast::Expr::data_store_reset();
-+        bun_ast::Stmt::data_store_reset();
-+        record
-+    }
-+
-+    fn parse(&self, path: &[u8], contents: &[u8]) -> Result<Record, Why> {
-+        let source = bun_ast::Source::init_path_string(path, contents);
-+        let mut log = bun_ast::Log::init();
-+        let Ok(parsed) = bun_json::ParsedJson::parse_json(&source, &mut log) else {
-+            return Err(Why::new("unreadable-record"));
-+        };
-+        let root = &parsed.root;
-+        let version = root.get(b"version").and_then(|it| it.as_number());
-+        if version != Some(f64::from(recorder::RECORD_VERSION)) {
-+            return Err(Why::new("record-version"));
-+        }
-+        self.parse_root(root).ok_or_else(|| Why::new("unreadable-record"))
-+    }
-+
-+    fn parse_root(&self, root: &bun_ast::Expr) -> Option<Record> {
-+        let string = |expr: &bun_ast::Expr, name: &[u8]| -> Option<Vec<u8>> {
-+            Some(expr.get(name)?.as_utf8_string_literal()?.to_vec())
-+        };
-+        let flag = |expr: &bun_ast::Expr, name: &[u8]| -> bool {
-+            expr.get(name).and_then(|it| it.as_bool()).unwrap_or(false)
-+        };
-+        let vm = self.vm;
-+        let absolute = |path: Vec<u8>, from_root: bool| -> Vec<u8> {
-+            if from_root {
-+                recorder::from_root(vm, &path)
-+            } else {
-+                path
-+            }
-+        };
-+        let outcome = match root.get(b"outcome") {
-+            Some(outcome) if outcome.get(b"pass").is_some() => {
-+                let mut counts = [0u32; 6];
-+                for (count, name) in counts.iter_mut().zip(OUTCOME) {
-+                    *count = outcome.get(name)?.as_number()? as u32;
-+                }
-+                Some(counts)
-+            }
-+            _ => None,
-+        };
-+        let mut marks = Vec::new();
-+        if let Some(mut items) = root.get_array(b"marks") {
-+            while let Some(item) = items.next() {
-+                marks.push(item.as_utf8_string_literal()?.to_vec());
-+            }
-+        }
-+        let mut resolutions = Vec::new();
-+        if let Some(mut items) = root.get_array(b"resolutions") {
-+            while let Some(item) = items.next() {
-+                let mut paths = Vec::new();
-+                if let Some(mut items) = item.get_array(b"paths") {
-+                    while let Some(path) = items.next() {
-+                        paths.push(Box::<[u8]>::from(path.as_utf8_string_literal()?));
-+                    }
-+                }
-+                if let Some(mut indexes) = item.get_array(b"pathsFromRoot") {
-+                    while let Some(index) = indexes.next() {
-+                        let path = paths.get_mut(index.as_number()? as usize)?;
-+                        *path = recorder::from_root(vm, path).into_boxed_slice();
-+                    }
-+                }
-+                resolutions.push(Resolution {
-+                    kind: string(&item, b"kind")?,
-+                    specifier: absolute(
-+                        string(&item, b"specifier")?,
-+                        flag(&item, b"specifierFromRoot"),
-+                    ),
-+                    importer: absolute(
-+                        string(&item, b"importer")?,
-+                        flag(&item, b"importerFromRoot"),
-+                    ),
-+                    importer_is_file: !flag(&item, b"importerIsDir"),
-+                    paths,
-+                    plugin: flag(&item, b"plugin"),
-+                    check: string(&item, b"check"),
-+                });
-+            }
-+        }
-+        let mut files = Vec::new();
-+        let mut aot = Vec::new();
-+        let mut unhashable = None;
-+        for list in [&b"modules"[..], b"answerFiles"] {
-+            let Some(mut items) = root.get_array(list) else {
-+                continue;
-+            };
-+            while let Some(item) = items.next() {
-+                let path = string(&item, b"path")?;
-+                let path = if bun_paths::is_absolute(&path) {
-+                    path
-+                } else {
-+                    recorder::from_root(vm, &path)
-+                };
-+                if unhashable.is_none() {
-+                    if flag(&item, b"virtual") {
-+                        unhashable = Some(Why::with("virtual", self.shown(&path)));
-+                    } else if flag(&item, b"changedDuringRun") {
-+                        unhashable = Some(Why::with("changed-during-run", self.shown(&path)));
-+                    }
-+                }
-+                if list == b"modules" {
-+                    aot.push((path.clone(), string(&item, b"aotConfig")));
-+                }
-+                files.push((path, string(&item, b"sha256")));
-+            }
-+        }
-+        let mut reads = Vec::new();
-+        if let Some(mut items) = root.get_array(b"reads") {
-+            while let Some(item) = items.next() {
-+                let look = Look::from_name(&string(&item, b"look")?)?;
-+                let path = string(&item, b"path")?;
-+                let path = if bun_paths::is_absolute(&path) {
-+                    path
-+                } else {
-+                    recorder::from_root(vm, &path)
-+                };
-+                let extra = string(&item, b"extra").unwrap_or_default();
-+                reads.push((look, path, extra, string(&item, b"value")?));
-+            }
-+        }
-+        Some(Record {
-+            reads,
-+            fingerprint: string(root, b"fingerprint")?,
-+            outcome,
-+            unattributed_before: root.get(b"unattributedBefore")?.as_number()? as u32,
-+            marks,
-+            resolutions,
-+            files,
-+            aot,
-+            unhashable,
-+        })
++            .or_insert_with(|| recorder::check_again(vm, asked))
 +    }
 +}
 diff --git a/src/runtime/cli/test/parallel/Frame.rs b/src/runtime/cli/test/parallel/Frame.rs
@@ -2855,7 +4013,7 @@ index c7c428215..be5bb6bd6 100644
      for i in 0..k {
          let mut id = Vec::new();
 diff --git a/src/runtime/cli/test_command.rs b/src/runtime/cli/test_command.rs
-index 79e9440b5..0d3b36808 100644
+index 79e9440b5..ead54af1b 100644
 --- a/src/runtime/cli/test_command.rs
 +++ b/src/runtime/cli/test_command.rs
 @@ -5,6 +5,7 @@ use bun_io::Write as _;
@@ -2954,18 +4112,19 @@ index 79e9440b5..0d3b36808 100644
                  if unhandled_errors > 0 {
                      pretty_error!(
                          "{}<r><red>{:5>} error{}<r>\n",
-@@ -3681,6 +3742,10 @@ impl TestCommand {
+@@ -3681,6 +3742,11 @@ impl TestCommand {
          if vm.hot_reload.get() == jsc::virtual_machine::HotReload::Watch {
              vm.run_with_api_lock(|| Self::run_event_loop_for_watch(vm));
          }
-+        // `BUN_TEST_INPUT_REUSE=check`: a file whose record held but whose outcome now differs fails the run.
-+        if InputReuse::finish_check(vm).is_some_and(|mismatches| mismatches > 0) {
++        // This run's records go into the store. `BUN_TEST_INPUT_REUSE=check`: a file whose record held
++        // but whose outcome now differs fails the run.
++        if InputReuse::finish_run(vm).is_some_and(|mismatches| mismatches > 0) {
 +            vm.exit_handler.exit_code.set(1);
 +        }
          let summary = reporter.summary();
  
          let should_fail_on_no_tests = !ctx.test_options.pass_with_no_tests
-@@ -3809,6 +3874,13 @@ impl TestCommand {
+@@ -3809,6 +3875,13 @@ impl TestCommand {
          let resolution = vm
              .transpiler
              .with_mut(|t| t.resolve_entry_point(file_name, &dot_slash))?;
@@ -2979,7 +4138,7 @@ index 79e9440b5..0d3b36808 100644
          // `append_slice` interns into the process-static `FilenameStore` and
          // returns `&'static [u8]`.
          Ok(FileSystem::get()
-@@ -3901,6 +3973,8 @@ impl TestCommand {
+@@ -3901,6 +3974,8 @@ impl TestCommand {
          first_last: bun_test::FirstLast,
      ) -> crate::Result<()> {
          let _print_log = PrintLogAfterFile(vm.log.get());
@@ -2988,7 +4147,7 @@ index 79e9440b5..0d3b36808 100644
  
          let file_path = Self::resolve_test_file(vm, file_name)?;
          vm.clear_entry_point()?;
-@@ -4165,6 +4239,7 @@ impl TestCommand {
+@@ -4165,6 +4240,7 @@ impl TestCommand {
                  environment.teardown(vm);
              }
          }
@@ -3555,10 +4714,10 @@ index c707b7554..4ebe0102f 100644
  
      let event_loop = EventLoopHandle::init(vm.event_loop_ptr());
 diff --git a/test/cli/test/isolation.test.ts b/test/cli/test/isolation.test.ts
-index 6d0d65721..382edc2e6 100644
+index 6d0d65721..96eab4068 100644
 --- a/test/cli/test/isolation.test.ts
 +++ b/test/cli/test/isolation.test.ts
-@@ -3510,3 +3510,436 @@ describe.concurrent("mocks and spies do not outlive their test file", () => {
+@@ -3510,3 +3510,540 @@ describe.concurrent("mocks and spies do not outlive their test file", () => {
      });
    });
  });
@@ -3587,7 +4746,7 @@ index 6d0d65721..382edc2e6 100644
 +
 +  function readRecords(dir: string) {
 +    const records = join(dir, "records");
-+    const names = fs.existsSync(records) ? fs.readdirSync(records).sort() : [];
++    const names = fs.existsSync(records) ? fs.readdirSync(records).filter(name => name.endsWith(".json")).sort() : [];
 +    return names.map(name => {
 +      const record = JSON.parse(fs.readFileSync(join(records, name), "utf8"));
 +      const local = (p: string) =>
@@ -3636,7 +4795,7 @@ index 6d0d65721..382edc2e6 100644
 +
 +  test("--isolate records resolutions, hashed sources and outcomes, including sources served from the cache", async () => {
 +    using dir = tempDir("input-record", recorderFixtures);
-+    const env = { ...bunEnv, BUN_TEST_INPUT_RECORD_DIR: "records" };
++    const env = { ...bunEnv, BUN_TEST_INPUT_RECORD_DIR: "records", BUN_TEST_INPUT_RECORD_JSON: "1" };
 +    const { stderr, exitCode } = await runTests(String(dir), ["--isolate"], ["./a.test.ts", "./b.test.ts"], env);
 +    expect({ records: readRecords(String(dir)), exitCode }).toEqual({
 +      records: expected(String(dir), true),
@@ -3647,7 +4806,7 @@ index 6d0d65721..382edc2e6 100644
 +
 +  test("--parallel=2 records the same questions and sources from every worker", async () => {
 +    using dir = tempDir("input-record-parallel", recorderFixtures);
-+    const env = { ...bunEnv, BUN_TEST_INPUT_RECORD_DIR: "records" };
++    const env = { ...bunEnv, BUN_TEST_INPUT_RECORD_DIR: "records", BUN_TEST_INPUT_RECORD_JSON: "1" };
 +    const { exitCode } = await runTests(String(dir), ["--parallel=2"], ["./a.test.ts", "./b.test.ts"], env);
 +    const records = readRecords(String(dir)).map(r => ({ ...r, modules: r.modules.map(({ cached, ...m }: any) => m) }));
 +    expect({ records, exitCode }).toEqual({ records: expected(String(dir), false), exitCode: 0 });
@@ -3669,7 +4828,7 @@ index 6d0d65721..382edc2e6 100644
 +        });
 +      `,
 +    });
-+    const env = { ...bunEnv, BUN_TEST_INPUT_RECORD_DIR: "records" };
++    const env = { ...bunEnv, BUN_TEST_INPUT_RECORD_DIR: "records", BUN_TEST_INPUT_RECORD_JSON: "1" };
 +    const { exitCode } = await runTests(String(dir), ["--isolate"], ["./a.test.ts", "./b.test.ts"], env);
 +    const records = readRecords(String(dir));
 +    expect({
@@ -3681,7 +4840,7 @@ index 6d0d65721..382edc2e6 100644
 +
 +  test("without --isolate nothing is recorded", async () => {
 +    using dir = tempDir("input-record-off", recorderFixtures);
-+    const env = { ...bunEnv, BUN_TEST_INPUT_RECORD_DIR: "records" };
++    const env = { ...bunEnv, BUN_TEST_INPUT_RECORD_DIR: "records", BUN_TEST_INPUT_RECORD_JSON: "1" };
 +    const { exitCode } = await runTests(String(dir), [], ["./a.test.ts", "./b.test.ts"], env);
 +    expect({ exists: fs.existsSync(join(String(dir), "records")), exitCode }).toEqual({ exists: false, exitCode: 0 });
 +  });
@@ -3895,21 +5054,125 @@ index 6d0d65721..382edc2e6 100644
 +    }).toEqual({ unchanged: ["factory.test.ts", "manual.test.ts"], appeared: [["factory.test.ts"], 1] });
 +  });
 +
-+  test("records of another format or fingerprint are ignored, and the run says so once without explain", async () => {
++  test("a store of another format or records of another fingerprint are ignored, and the run says so once without explain", async () => {
 +    using dir = tempDir("input-reuse-ignored", files);
 +    const two = ["./a.test.ts", "./c.test.ts"];
 +    const plain = { ...record, BUN_TEST_INPUT_REUSE: "1" };
 +    await runTests(String(dir), ["--isolate"], two, record);
-+    const recordFile = join(String(dir), "records", "a.test.ts.json");
-+    fs.writeFileSync(recordFile, fs.readFileSync(recordFile, "utf8").replace(/^\{"version":\d+/, '{"version":2'));
++    const storeFile = join(String(dir), "records", "store.btis");
++    const bytes = fs.readFileSync(storeFile);
++    bytes.writeUInt32LE(0, 4);
++    fs.writeFileSync(storeFile, bytes);
 +    const format = await runTests(String(dir), ["--isolate"], two, plain);
++    const replaced = await runTests(String(dir), ["--isolate"], two, plain);
 +    const salted = await runTests(String(dir), ["--isolate"], two, { ...plain, BUN_TEST_INPUT_RECORD_SALT: "other" });
-+    expect({ format: reusedFiles(format.stderr), salted: reusedFiles(salted.stderr) }).toEqual({
-+      format: ["c.test.ts"],
++    expect({
++      format: reusedFiles(format.stderr),
++      replaced: reusedFiles(replaced.stderr),
++      salted: reusedFiles(salted.stderr),
++    }).toEqual({
++      format: [],
++      replaced: ["a.test.ts", "c.test.ts"],
 +      salted: [],
 +    });
-+    expect(format.stderr).toContain("1 record ignored: written by another build or with other settings");
++    expect(format.stderr).toContain("reuse: 1 file of another record store format ignored; this run's records replace it");
++    expect(replaced.stderr).not.toContain("ignored");
 +    expect(salted.stderr).toContain("2 records ignored: written by another build or with other settings");
++  });
++
++  test("an addon that Bun refuses to load is no mark, and its file is an input", async () => {
++    using dir = tempDir("input-reuse-refused-addon", {
++      ...files,
++      "build/better_sqlite3.node": "not an addon v1",
++      "refused.test.ts": `
++        import { expect, test } from "bun:test";
++        test("falls back", () => {
++          expect(() => require("./build/better_sqlite3.node")).toThrow("not yet supported in Bun");
++        });
++      `,
++    });
++    const these = ["./a.test.ts", "./refused.test.ts"];
++    await runTests(String(dir), ["--isolate"], these, record);
++    const unchanged = await runTests(String(dir), ["--isolate"], these, reuse);
++    fs.writeFileSync(join(String(dir), "build/better_sqlite3.node"), "not an addon v2");
++    const edited = await runTests(String(dir), ["--isolate"], these, reuse);
++    expect({
++      unchanged: reusedFiles(unchanged.stderr),
++      edited: [reusedFiles(edited.stderr), edited.exitCode],
++    }).toEqual({ unchanged: ["a.test.ts", "refused.test.ts"], edited: [["a.test.ts"], 0] });
++    expect(edited.stderr).toContain("reuse: refused.test.ts runs: changed build/better_sqlite3.node");
++  });
++
++  test("going to a failing state and back reuses the pass recorded before", async () => {
++    using dir = tempDir("input-reuse-back", files);
++    const three = ["./a.test.ts", "./b.test.ts", "./c.test.ts"];
++    await runTests(String(dir), ["--isolate"], three, record);
++    fs.writeFileSync(join(String(dir), "shared.ts"), `export const value = 2;\n`);
++    const failing = await runTests(String(dir), ["--isolate"], three, reuse);
++    const failingAgain = await runTests(String(dir), ["--isolate"], three, reuse);
++    fs.writeFileSync(join(String(dir), "shared.ts"), `export const value = 1;\n`);
++    const back = await runTests(String(dir), ["--isolate"], three, reuse);
++    expect({
++      failing: [reusedFiles(failing.stderr), failing.exitCode],
++      failingAgain: [reusedFiles(failingAgain.stderr), failingAgain.exitCode],
++      back: [reusedFiles(back.stderr), back.exitCode],
++    }).toEqual({
++      failing: [["c.test.ts"], 1],
++      failingAgain: [["c.test.ts"], 1],
++      back: [["a.test.ts", "b.test.ts", "c.test.ts"], 0],
++    });
++    expect(failing.stderr).toContain("reuse: a.test.ts runs: changed shared.ts");
++    expect(failingAgain.stderr).toContain("reuse: a.test.ts runs: failed");
++  });
++
++  test("list says which files would run and why, and runs none", async () => {
++    using dir = tempDir("input-reuse-list", {
++      ...files,
++      "preload.ts": `require("node:fs").writeFileSync(import.meta.dir + "/preloaded", "");\n`,
++    });
++    const flags = ["--isolate", "--preload", "./preload.ts"];
++    await runTests(String(dir), flags, names, record);
++    fs.rmSync(join(String(dir), "preloaded"));
++    fs.writeFileSync(join(String(dir), "only-c.ts"), `export const c = 2;\n`);
++    const store = fs.readFileSync(join(String(dir), "records", "store.btis"));
++    const list = await runTests(String(dir), flags, names, { ...record, BUN_TEST_INPUT_REUSE: "list" });
++    expect({
++      exitCode: list.exitCode,
++      lines: list.stdout
++        .trim()
++        .split("\n")
++        .filter(line => !line.startsWith("bun test"))
++        .sort(),
++      ran: /\d+ pass/.test(list.stderr) || fs.existsSync(join(String(dir), "preloaded")),
++      storeKept: fs.readFileSync(join(String(dir), "records", "store.btis")).equals(store),
++      segments: fs.readdirSync(join(String(dir), "records", "segments")),
++    }).toEqual({
++      exitCode: 0,
++      lines: [
++        "a.test.ts: would be reused",
++        "b.test.ts: would be reused",
++        "c.test.ts: runs: changed only-c.ts",
++        "spawns.test.ts: runs: mark spawn",
++      ],
++      ran: false,
++      storeKept: true,
++      segments: [],
++    });
++    expect(list.stderr).toMatch(/reuse list: store of 4 states, \d+ entries and \d+ strings/);
++  });
++
++  test("two runs at once in one record directory, one with --parallel workers, lose no records", async () => {
++    using dir = tempDir("input-reuse-concurrent", files);
++    const [both, alone] = await Promise.all([
++      runTests(String(dir), ["--parallel=2"], ["./a.test.ts", "./b.test.ts"], record),
++      runTests(String(dir), ["--isolate"], ["./c.test.ts"], record),
++    ]);
++    const later = await runTests(String(dir), ["--isolate"], names, reuse);
++    expect({
++      exits: [both.exitCode, alone.exitCode],
++      reused: reusedFiles(later.stderr),
++      segments: fs.readdirSync(join(String(dir), "records", "segments")),
++    }).toEqual({ exits: [0, 0], reused: ["a.test.ts", "b.test.ts", "c.test.ts"], segments: [] });
 +  });
 +
 +  test("the original of a mocked module, served from the cache, is the same input as its file", async () => {
@@ -3928,7 +5191,7 @@ index 6d0d65721..382edc2e6 100644
 +      "second.test.ts": mocking,
 +    });
 +    const these = ["./first.test.ts", "./second.test.ts"];
-+    await runTests(String(dir), ["--isolate"], these, record);
++    await runTests(String(dir), ["--isolate"], these, { ...record, BUN_TEST_INPUT_RECORD_JSON: "1" });
 +    const second = JSON.parse(fs.readFileSync(join(String(dir), "records", "second.test.ts.json"), "utf8"));
 +    const unchanged = await runTests(String(dir), ["--isolate"], these, reuse);
 +    fs.writeFileSync(join(String(dir), "dep.ts"), `export const dep = "edited";\n`);
