@@ -131,7 +131,7 @@ index 15110f74d..cc4c4e600 100644
          // `VirtualMachine::use_isolation_source_provider_cache` to avoid forming
 diff --git a/src/jsc/TestInputRecorder.rs b/src/jsc/TestInputRecorder.rs
 new file mode 100644
-index 000000000..222bc1b11
+index 000000000..b7464f3f4
 --- /dev/null
 +++ b/src/jsc/TestInputRecorder.rs
 @@ -0,0 +1,1164 @@
@@ -485,18 +485,18 @@ index 000000000..222bc1b11
 +    recorder.state.borrow_mut().note_module(module_file(key.slice()), true);
 +}
 +
-+/// The file a module key loads. The original of a mocked module is loaded under the file's path with
-+/// `?actual` (or `&actual`, any number of times, then maybe `&spy`; see `withoutOriginalModuleQuery`
-+/// in `BunPlugin.cpp`), and its source is the file's, so it is the same input as the plain import.
++/// The file a module key loads: the key without its query. A specifier with a query (`?raw`, `?url`)
++/// is loaded from the file without it, and its key keeps the query; the original of a mocked module
++/// is loaded under the file's path with `?actual` (or `&actual`, then maybe `&spy`; see
++/// `withoutOriginalModuleQuery` in `BunPlugin.cpp`). Either way the source is the file's bytes, so it
++/// is the same input as the plain import; how the query changes the loader is in the question,
++/// whose specifier carries it. A file whose name has a `?` in it gets the hash of another path,
++/// which makes its record never hold: a rerun, not a miss.
 +fn module_file(key: &[u8]) -> &[u8] {
-+    let mut path = key.strip_suffix(b"&spy").unwrap_or(key);
-+    while let Some(rest) = path
-+        .strip_suffix(b"?actual")
-+        .or_else(|| path.strip_suffix(b"&actual"))
-+    {
-+        path = rest;
++    match key.iter().position(|&c| c == b'?') {
++        Some(query) => &key[..query],
++        None => key,
 +    }
-+    path
 +}
 +
 +/// The current file did something whose effect a record can't replay, such as spawning a process:
@@ -2952,10 +2952,10 @@ index e523f3302..788966678 100644
      pub(crate) mod shards_by_reach;
 diff --git a/src/runtime/cli/test/InputReuse.rs b/src/runtime/cli/test/InputReuse.rs
 new file mode 100644
-index 000000000..0cf1e6c85
+index 000000000..2016070a9
 --- /dev/null
 +++ b/src/runtime/cli/test/InputReuse.rs
-@@ -0,0 +1,1114 @@
+@@ -0,0 +1,1141 @@
 +//! `BUN_TEST_INPUT_REUSE=1` with `BUN_TEST_INPUT_RECORD_DIR` under `bun test --isolate`: before the
 +//! run, a test file whose record still holds is not run, and its recorded counts go into the summary.
 +//!
@@ -3600,6 +3600,9 @@ index 000000000..0cf1e6c85
 +    let validator = Validator::new(vm, fingerprint, &store);
 +    let mut report = Vec::new();
 +    let mut mismatches = 0;
++    // The number of `expect()` calls is not deterministic in every test (a retry loop, a callback
++    // that runs a varying number of times), so a difference in it alone is said, not a mismatch.
++    let mut expectations_only = 0;
 +    for it in &checking {
 +        let title = validator.shown(it.file.as_bytes());
 +        // The state this run wrote for the file.
@@ -3615,6 +3618,24 @@ index 000000000..0cf1e6c85
 +        json_string(&mut report, &title);
 +        if fresh == Some(it.recorded) {
 +            report.extend_from_slice(b",\"check\":\"same\"}\n");
++            continue;
++        }
++        let without_expectations = |counts: &[u32; 6]| [counts[0], counts[1], counts[2], counts[3], counts[5]];
++        if let Some(fresh) = fresh
++            && without_expectations(&fresh) == without_expectations(&it.recorded)
++        {
++            expectations_only += 1;
++            pretty_error!(
++                "<r><d>reuse check: {} has the recorded outcome, with {} expect() calls where the record has {}<r>\n",
++                bstr::BStr::new(&title),
++                fresh[4],
++                it.recorded[4]
++            );
++            let _ = write!(
++                report,
++                ",\"check\":\"expectations\",\"recorded\":{},\"thisRun\":{}}}\n",
++                it.recorded[4], fresh[4]
++            );
 +            continue;
 +        }
 +        mismatches += 1;
@@ -3651,17 +3672,23 @@ index 000000000..0cf1e6c85
 +        report.extend_from_slice(b"}\n");
 +    }
 +    // The markup is read from the format string, so each color is its own literal.
++    let mut expectations = Vec::new();
++    if expectations_only > 0 {
++        let _ = write!(expectations, ", other expect() counts {expectations_only}");
++    }
 +    if mismatches > 0 {
 +        pretty_error!(
-+            "<r><red>reuse check:<r> would reuse {}, mismatches {}\n",
++            "<r><red>reuse check:<r> would reuse {}, mismatches {}{}\n",
 +            checking.len(),
-+            mismatches
++            mismatches,
++            bstr::BStr::new(&expectations)
 +        );
 +    } else {
 +        pretty_error!(
-+            "<r><d>reuse check:<r> would reuse {}, mismatches {}\n",
++            "<r><d>reuse check:<r> would reuse {}, mismatches {}{}\n",
 +            checking.len(),
-+            mismatches
++            mismatches,
++            bstr::BStr::new(&expectations)
 +        );
 +    }
 +    write_report(&report, true);
@@ -4807,10 +4834,10 @@ index de7a45703..d31843aae 100644
  
      let event_loop = EventLoopHandle::init(vm.event_loop_ptr());
 diff --git a/test/cli/test/isolation.test.ts b/test/cli/test/isolation.test.ts
-index 6d0d65721..1533eae79 100644
+index 6d0d65721..ff8c203a1 100644
 --- a/test/cli/test/isolation.test.ts
 +++ b/test/cli/test/isolation.test.ts
-@@ -3510,3 +3510,601 @@ describe.concurrent("mocks and spies do not outlive their test file", () => {
+@@ -3510,3 +3510,651 @@ describe.concurrent("mocks and spies do not outlive their test file", () => {
      });
    });
  });
@@ -5255,6 +5282,56 @@ index 6d0d65721..1533eae79 100644
 +    });
 +    expect(dep.stderr).toContain("reuse: temp.test.ts runs: changed dep.ts");
 +    expect(dep.stderr).toContain("reuse: inside.test.ts runs: changed dep.ts");
++  });
++
++  test("check says a different number of expect() calls alone, without failing the run", async () => {
++    using dir = tempDir("input-reuse-check-expectations", {
++      ...files,
++      "varies.test.ts": `
++        import { expect, test } from "bun:test";
++        test("varies", () => {
++          for (let i = 0; i < Number(process.env.EXPECTS ?? 1); i++) expect(i).toBe(i);
++        });
++      `,
++    });
++    const these = ["./a.test.ts", "./varies.test.ts"];
++    await runTests(String(dir), ["--isolate"], these, { ...record, EXPECTS: "1" });
++    const check = await runTests(String(dir), ["--isolate"], these, {
++      ...record,
++      BUN_TEST_INPUT_REUSE: "check",
++      EXPECTS: "3",
++    });
++    expect(check.exitCode).toBe(0);
++    expect(check.stderr).toContain(
++      "reuse check: varies.test.ts has the recorded outcome, with 3 expect() calls where the record has 1",
++    );
++    expect(check.stderr).toContain("reuse check: would reuse 2, mismatches 0, other expect() counts 1");
++    expect(check.stderr).not.toContain("would have been reused, but its outcome differs");
++  });
++
++  test("a text file imported with ?raw by several files, some from the cache, is reused and reruns them when edited", async () => {
++    const raw = `
++      import { expect, test } from "bun:test";
++      import changelog from "./CHANGELOG.md?raw";
++      test("raw", () => expect(String(changelog)).toContain("v1"));
++    `;
++    using dir = tempDir("input-reuse-raw", {
++      ...files,
++      "CHANGELOG.md": "# Changelog\n\nv1\n",
++      "r1.test.ts": raw,
++      "r2.test.ts": raw,
++      "r3.test.ts": raw,
++    });
++    const these = ["./r1.test.ts", "./r2.test.ts", "./r3.test.ts"];
++    await runTests(String(dir), ["--isolate"], these, record);
++    const unchanged = await runTests(String(dir), ["--isolate"], these, reuse);
++    fs.writeFileSync(join(String(dir), "CHANGELOG.md"), "# Changelog\n\nv2\n");
++    const edited = await runTests(String(dir), ["--isolate"], these, reuse);
++    expect({
++      unchanged: reusedFiles(unchanged.stderr),
++      edited: [reusedFiles(edited.stderr), edited.exitCode],
++    }).toEqual({ unchanged: ["r1.test.ts", "r2.test.ts", "r3.test.ts"], edited: [[], 1] });
++    expect(edited.stderr).toContain("reuse: r2.test.ts runs: changed CHANGELOG.md");
 +  });
 +
 +  test("going to a failing state and back reuses the pass recorded before", async () => {
