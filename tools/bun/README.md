@@ -88,16 +88,17 @@ patches at the new commit and run the Blacksmith proof for both variants.
 `bun test --isolate`. It is off unless you set a variable below, and then it
 only adds work around the resolver and the transpiler. It is the difference
 between this pin and the `native-recorder` branch of our Bun checkout
-(commit `00b1a7e4fc69229c9b74ac1aecdded03e45e896f`), which starts at this pin,
+(commit `45c891b09dcd138689af265337a3aa2247dacfce`), which starts at this pin,
 so it needs no fix-ups.
 
 | Variable | Effect |
 | --- | --- |
-| `BUN_TEST_INPUT_RECORD_DIR=<dir>` | Records what each test file's pass depended on into one store in `<dir>` (`store.btis`, with `segments/` for the processes still running). A record lists the file's resolutions (question and answer), the modules it loaded with a SHA-256 of their source, what its own code read through `node:fs`, `Bun.file`, `Bun.Glob`, snapshots and `Bun.mmap`, what it did that a record cannot replay (spawn, FFI, workers, SQLite, macros), and its outcome counts. A file keeps its last four distinct states. A module that the file's own code wrote before it imported it is not an input. A module loaded with a query such as `?raw` is hashed as its file. Records hold in another checkout of the same files. Needs `--isolate`; `--parallel` implies it. |
+| `BUN_TEST_INPUT_RECORD_DIR=<dir>` | Records what each test file's pass depended on into one store in `<dir>` (`store.btis`, with `segments/` for the processes still running). A record lists the file's resolutions (question and answer), the modules it loaded with a SHA-256 of their source, what its own code read through `node:fs`, `Bun.file`, `Bun.Glob`, snapshots and `Bun.mmap`, what it did that a record cannot replay (spawn, FFI, workers, SQLite, macros), and its outcome counts. A file keeps its last four distinct states. A module that the file's own code wrote before it imported it is not an input. A module loaded with a query such as `?raw` is hashed as its file. Paths in a record are relative to the repository root, so records hold in another checkout of the same files (store format version 2; an older store is ignored with a line saying so). Needs `--isolate`; `--parallel` implies it. |
 | `BUN_TEST_INPUT_REUSE=1` | With a record directory, skips every test file whose record still holds and counts its recorded results in the summary. `explain` also says why each other file runs. `check` runs every file anyway and fails the run when a file whose record held ends with other pass, skip or todo counts; a different number of `expect()` calls alone is only reported, because it is not deterministic in every test. `list` says for each file whether it would run and why, and runs none. `0` or unset is off. A run with coverage never reuses. |
 | `BUN_TEST_INPUT_REUSE_REPORT=<file>` | Writes one JSON line per file saying whether its record held and why not. |
 | `BUN_TEST_INPUT_RECORD_SALT=<text>` | Part of every record's fingerprint, for what you know changes outcomes, such as a database version. |
 | `BUN_TEST_INPUT_RECORD_ENV=<A,B>` | Environment variables whose values are part of the fingerprint. |
+| `BUN_TEST_INPUT_RECORD_ROOT=<dir>` | The record root that paths are relative to, resolved against the project directory. Default: the nearest directory at or above the project directory with `bun.lock`, `bun.lockb`, `pnpm-lock.yaml`, `pnpm-workspace.yaml`, `yarn.lock` or `package-lock.json`, else the project directory. The root is in no hash; the fingerprint holds the project directory relative to it, so two packages never share a fingerprint. A lockfile in a directory above the repository would make that the root; set this variable to override it. |
 | `BUN_TEST_INPUT_RECORD_JSON=1` | Also writes each record as JSON beside the store, to read. |
 
 `BUN_TEST_INPUT_RECORD_FINGERPRINT` is internal: a `--parallel` coordinator

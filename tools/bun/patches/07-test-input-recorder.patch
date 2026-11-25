@@ -11,10 +11,10 @@ index 141da8038..b2efe4a9b 100644
   "bun_http",
   "bun_http_types",
 diff --git a/src/bun_core/env_var.rs b/src/bun_core/env_var.rs
-index 6673aa83a..0c5bf2417 100644
+index 6673aa83a..19fec83cf 100644
 --- a/src/bun_core/env_var.rs
 +++ b/src/bun_core/env_var.rs
-@@ -53,6 +53,20 @@ new!(pub BUN_BYTECODE_DIGEST_OUT: string, "BUN_BYTECODE_DIGEST_OUT", {});
+@@ -53,6 +53,22 @@ new!(pub BUN_BYTECODE_DIGEST_OUT: string, "BUN_BYTECODE_DIGEST_OUT", {});
  new!(pub BUN_BYTECODE_ORDER_NAMES_OUT: string, "BUN_BYTECODE_ORDER_NAMES_OUT", {});
  // A compiled executable writes the payload order file of this run here at exit; `%p` in the path becomes the pid.
  new!(pub BUN_BYTECODE_ORDER_OUT: string, "BUN_BYTECODE_ORDER_OUT", {});
@@ -28,6 +28,8 @@ index 6673aa83a..0c5bf2417 100644
 +new!(pub BUN_TEST_INPUT_RECORD_SALT: string, "BUN_TEST_INPUT_RECORD_SALT", {});
 +// With a record directory: "1" also writes each record as JSON beside the store, to read.
 +new!(pub BUN_TEST_INPUT_RECORD_JSON: string, "BUN_TEST_INPUT_RECORD_JSON", {});
++// With a record directory: the directory record paths are relative to (default: the nearest directory with a lockfile at or above the project), so records hold in another checkout of the repository.
++new!(pub BUN_TEST_INPUT_RECORD_ROOT: string, "BUN_TEST_INPUT_RECORD_ROOT", {});
 +// Comma-separated names of environment variables whose values are part of the fingerprint of every record.
 +new!(pub BUN_TEST_INPUT_RECORD_ENV: string, "BUN_TEST_INPUT_RECORD_ENV", {});
 +// Internal: what a `--parallel` coordinator hands its workers, so they record its fingerprint.
@@ -131,17 +133,18 @@ index 15110f74d..cc4c4e600 100644
          // `VirtualMachine::use_isolation_source_provider_cache` to avoid forming
 diff --git a/src/jsc/TestInputRecorder.rs b/src/jsc/TestInputRecorder.rs
 new file mode 100644
-index 000000000..b7464f3f4
+index 000000000..3a6fd8d67
 --- /dev/null
 +++ b/src/jsc/TestInputRecorder.rs
-@@ -0,0 +1,1164 @@
+@@ -0,0 +1,1199 @@
 +//! `BUN_TEST_INPUT_RECORD_DIR=<dir>` with `bun test --isolate`: for every test file, write
-+//! `<dir>/<path relative to the project root, URI-component-encoded>.json` with what the file
++//! `<dir>/<path relative to the record root, URI-component-encoded>.json` with what the file
 +//! depended on: every resolution made while it was the current file (question and answer), every
 +//! module it loaded with a hash of the bytes this process transpiled for it, the files that answered
 +//! a resolution but were never loaded, what it did that a record can't replay, and its outcome counts.
 +//!
-+//! Paths under the project root are written relative to it, so a record holds in another checkout;
++//! Paths under the record root (the repository, see [`record_root`]) are written relative to it, so a
++//! record holds in another checkout, and a test file is named by its path from there;
 +//! a question's specifier, importer and `paths` say so with `specifierFromRoot`, `importerFromRoot`
 +//! and `pathsFromRoot`. Each resolution carries `check`, a hash of its answer as written: asking the
 +//! resolver the same question again gives the same `check` when the answer and its details are the same.
@@ -164,6 +167,7 @@ index 000000000..b7464f3f4
 +
 +use crate::test_input_store::{self as store, Entry, Segment};
 +pub use crate::test_own_reads::Wrote;
++pub use crate::test_own_reads::Root;
 +use crate::test_own_reads::{Look, OwnReads};
 +use crate::virtual_machine::{ResolveMode, VirtualMachine};
 +use crate::{JSGlobalObject, JSValue};
@@ -174,7 +178,8 @@ index 000000000..b7464f3f4
 +
 +pub struct TestInputRecorder {
 +    dir: Box<[u8]>,
-+    root: Box<[u8]>,
++    /// What paths in records are relative to: see [`record_root`].
++    root: Root,
 +    /// What the run was started with, one `name=value` per line; see `InputReuse::fingerprint`.
 +    fingerprint: Box<[u8]>,
 +    fingerprint_hash: [u8; 32],
@@ -236,11 +241,10 @@ index 000000000..b7464f3f4
 +    let Some(dir) = bun_core::env_var::BUN_TEST_INPUT_RECORD_DIR.get_not_empty() else {
 +        return;
 +    };
-+    let root = vm.top_level_dir();
-+    let dir = bun_paths::Path::resolve(&[root, dir]);
++    let dir = bun_paths::Path::resolve(&[vm.top_level_dir(), dir]);
 +    let recorder = TestInputRecorder {
 +        dir: Box::from(dir.as_bytes()),
-+        root: Box::from(root),
++        root: record_root(vm),
 +        fingerprint: Box::from(fingerprint),
 +        fingerprint_hash: source_hash(fingerprint),
 +        state: RefCell::default(),
@@ -250,6 +254,44 @@ index 000000000..b7464f3f4
 +        .test_isolation_state
 +        .input_recorder
 +        .set(Box::new(recorder));
++}
++
++/// What paths in records are relative to, so that a record holds in another checkout: the unit that
++/// moves is the repository, not the package. `BUN_TEST_INPUT_RECORD_ROOT` (resolved against the
++/// project directory), else the nearest directory at or above the project directory that has a
++/// lockfile or `pnpm-workspace.yaml`, which is where the install put `node_modules`, else the
++/// project directory. The root itself is in no record, hash or fingerprint.
++pub fn record_root(vm: &VirtualMachine) -> Root {
++    let top = vm.top_level_dir();
++    if let Some(given) = bun_core::env_var::BUN_TEST_INPUT_RECORD_ROOT.get_not_empty() {
++        return Root::new(bun_paths::Path::resolve(&[top, given]).as_bytes());
++    }
++    Root::new(install_root(top).unwrap_or(top))
++}
++
++fn install_root(top: &[u8]) -> Option<&[u8]> {
++    const MARKS: [&[u8]; 6] = [
++        b"bun.lock",
++        b"bun.lockb",
++        b"pnpm-lock.yaml",
++        b"pnpm-workspace.yaml",
++        b"yarn.lock",
++        b"package-lock.json",
++    ];
++    let mut dir = top.strip_suffix(&[bun_paths::SEP]).filter(|it| !it.is_empty()).unwrap_or(top);
++    loop {
++        for mark in MARKS {
++            let mut path = dir.to_vec();
++            if !path.last().is_some_and(|&c| bun_paths::is_sep(c)) {
++                path.push(bun_paths::SEP);
++            }
++            path.extend_from_slice(mark);
++            if bun_sys::exists(&path) {
++                return Some(dir);
++            }
++        }
++        dir = bun_paths::dirname(dir).filter(|it| *it != dir && !it.is_empty())?;
++    }
 +}
 +
 +/// When recording, the number of the current file (0 between files): asked on the JS thread when an async
@@ -558,7 +600,10 @@ index 000000000..b7464f3f4
 +
 +/// Looks at a path again the way a record says it was looked at, for validation.
 +pub fn observe_again(vm: &VirtualMachine, look: Look, path: &[u8], extra: &[u8]) -> Box<[u8]> {
-+    crate::test_own_reads::observe(vm.top_level_dir(), look, path, extra)
++    match recorder_of(vm) {
++        Some(recorder) => crate::test_own_reads::observe(&recorder.root, look, path, extra),
++        None => crate::test_own_reads::observe(&record_root(vm), look, path, extra),
++    }
 +}
 +
 +/// `path` made absolute against the working directory as it is now, without `.` and `..`.
@@ -737,10 +782,12 @@ index 000000000..b7464f3f4
 +    Some(&recorder_of(vm)?.fingerprint)
 +}
 +
-+/// A path as a record writes it, made absolute again: relative ones are under the project root.
++/// A path as a record writes it, made absolute again: relative ones are under the record root.
 +pub fn from_root(vm: &VirtualMachine, path: &[u8]) -> Vec<u8> {
-+    let root = vm.top_level_dir();
-+    let mut out = root.to_vec();
++    let mut out = match recorder_of(vm) {
++        Some(recorder) => recorder.root.given.to_vec(),
++        None => record_root(vm).given.into_vec(),
++    };
 +    match path {
 +        b"." => {}
 +        b"./" => out.push(bun_paths::SEP),
@@ -1023,17 +1070,7 @@ index 000000000..b7464f3f4
 +
 +    /// The root itself is `.`, and `./` with a separator after it.
 +    fn relative<'p>(&self, path: &'p [u8]) -> Option<&'p [u8]> {
-+        let rest = path.strip_prefix(&*self.root)?;
-+        if rest.is_empty() {
-+            return Some(b".");
-+        }
-+        if self.root.last().is_some_and(|&c| bun_paths::is_sep(c)) {
-+            return Some(rest);
-+        }
-+        if !bun_paths::is_sep(rest[0]) {
-+            return None;
-+        }
-+        Some(if rest.len() == 1 { b"./" } else { &rest[1..] })
++        self.root.relative(path)
 +    }
 +
 +    fn write_record(
@@ -1157,7 +1194,7 @@ index 000000000..b7464f3f4
 +        let _ = write!(
 +            out,
 +            ",\"root\":{},\"fingerprint\":\"",
-+            bun_core::fmt::format_json_string_utf8(&self.root, Default::default())
++            bun_core::fmt::format_json_string_utf8(&self.root.given, Default::default())
 +        );
 +        write_hex(&mut out, &self.fingerprint_hash);
 +        out.extend_from_slice(b"\",\"outcome\":");
@@ -1301,10 +1338,10 @@ index 000000000..b7464f3f4
 +}
 diff --git a/src/jsc/TestInputStore.rs b/src/jsc/TestInputStore.rs
 new file mode 100644
-index 000000000..05b3f4195
+index 000000000..f42771178
 --- /dev/null
 +++ b/src/jsc/TestInputStore.rs
-@@ -0,0 +1,881 @@
+@@ -0,0 +1,882 @@
 +//! The store of test input records: one per record directory, so a suite's records are tens of
 +//! megabytes instead of one JSON file per test file that repeats the same resolutions and modules.
 +//!
@@ -1336,7 +1373,8 @@ index 000000000..05b3f4195
 +use std::collections::HashMap;
 +use std::io::{Read as _, Write as _};
 +
-+pub const STORE_VERSION: u32 = 1;
++/// 2: paths are relative to the record root (the repository) instead of the project directory.
++pub const STORE_VERSION: u32 = 2;
 +const MAGIC: &[u8; 4] = b"BTIS";
 +/// How many distinct input states of one test file the store keeps, newest first.
 +pub const STATES_PER_FILE: usize = 4;
@@ -2188,10 +2226,10 @@ index 000000000..05b3f4195
 +}
 diff --git a/src/jsc/TestOwnReads.rs b/src/jsc/TestOwnReads.rs
 new file mode 100644
-index 000000000..e05317331
+index 000000000..e163093d0
 --- /dev/null
 +++ b/src/jsc/TestOwnReads.rs
-@@ -0,0 +1,391 @@
+@@ -0,0 +1,432 @@
 +//! What a test file's own code read from the file system, as part of its input record.
 +//!
 +//! The JavaScript-facing file APIs (`node:fs` in all three forms, `Bun.file` and `Bun.write`,
@@ -2311,6 +2349,46 @@ index 000000000..e05317331
 +    Some(out)
 +}
 +
++/// The directory a record's paths are relative to, as given and with its symbolic links resolved:
++/// a module's path is the resolved one, a path the test's code passes may be either.
++pub struct Root {
++    pub given: Box<[u8]>,
++    pub real: Box<[u8]>,
++}
++
++impl Root {
++    pub fn new(given: &[u8]) -> Root {
++        let zgiven = bun_core::ZBox::from_vec(given.to_vec());
++        let mut buf = bun_paths::path_buffer_pool::get();
++        let real: Box<[u8]> = match bun_sys::realpath(&zgiven, &mut buf) {
++            Ok(real) => Box::from(real),
++            Err(_) => Box::from(given),
++        };
++        Root {
++            given: Box::from(given),
++            real,
++        }
++    }
++
++    /// `path` relative to the root, if it is under it: the root itself is `.`, and `./` with a
++    /// separator after it.
++    pub fn relative<'p>(&self, path: &'p [u8]) -> Option<&'p [u8]> {
++        [&*self.given, &*self.real].into_iter().find_map(|root| {
++            let rest = path.strip_prefix(root)?;
++            if rest.is_empty() {
++                return Some(&b"."[..]);
++            }
++            if root.last().is_some_and(|&c| bun_paths::is_sep(c)) {
++                return Some(rest);
++            }
++            if !bun_paths::is_sep(rest[0]) {
++                return None;
++            }
++            Some(if rest.len() == 1 { &b"./"[..] } else { &rest[1..] })
++        })
++    }
++}
++
 +/// `inner` is `outer` or below it.
 +fn under(inner: &[u8], outer: &[u8]) -> bool {
 +    match inner.strip_prefix(outer) {
@@ -2359,7 +2437,7 @@ index 000000000..e05317331
 +
 +    /// Before the file writes to `path`: what it looked at there, below it, or above it is observed
 +    /// now, so the record keeps what was there before the write.
-+    pub fn write(&mut self, root: &[u8], path: &[u8], wrote: Wrote) {
++    pub fn write(&mut self, root: &Root, path: &[u8], wrote: Wrote) {
 +        let prefix = wrote == Wrote::Prefix;
 +        for read in self.reads.iter_mut().filter(|read| read.value.is_none()) {
 +            let touched = if prefix {
@@ -2387,7 +2465,7 @@ index 000000000..e05317331
 +    }
 +
 +    /// When the record is written: observes what was not observed yet.
-+    pub fn finish(&mut self, root: &[u8]) {
++    pub fn finish(&mut self, root: &Root) {
 +        for read in self.reads.iter_mut().filter(|read| read.value.is_none()) {
 +            read.value = Some(observe(root, read.look, &read.path, &read.extra));
 +        }
@@ -2397,7 +2475,7 @@ index 000000000..e05317331
 +/// Looks at `path` the way `look` says. The same call records and validates, so the two agree on
 +/// the encoding: a hex SHA-256 for bytes and listings, a short text for the rest, and the error's
 +/// name (such as `ENOENT`) when the look fails. Paths under `root` in a value are relative to it.
-+pub fn observe(root: &[u8], look: Look, path: &[u8], extra: &[u8]) -> Box<[u8]> {
++pub fn observe(root: &Root, look: Look, path: &[u8], extra: &[u8]) -> Box<[u8]> {
 +    let zpath = bun_core::ZBox::from_vec(path.to_vec());
 +    let error = |err: bun_sys::Error| -> Box<[u8]> { Box::from(err.name()) };
 +    let value: Vec<u8> = match look {
@@ -2480,15 +2558,16 @@ index 000000000..e05317331
 +    }
 +}
 +
-+fn from_root(root: &[u8], path: &[u8]) -> Vec<u8> {
-+    match path.strip_prefix(root) {
-+        Some(rest) if rest.is_empty() => b".".to_vec(),
-+        Some(rest) if bun_paths::is_sep(rest[0]) => {
-+            let mut out = b".".to_vec();
++fn from_root(root: &Root, path: &[u8]) -> Vec<u8> {
++    match root.relative(path) {
++        Some(b".") => b".".to_vec(),
++        Some(b"./") => b"./".to_vec(),
++        Some(rest) => {
++            let mut out = b"./".to_vec();
 +            out.extend_from_slice(rest);
 +            out
 +        }
-+        _ => path.to_vec(),
++        None => path.to_vec(),
 +    }
 +}
 +
@@ -2557,7 +2636,7 @@ index 000000000..e05317331
 +    extra
 +}
 +
-+fn glob(root: &[u8], cwd: &[u8], extra: &[u8]) -> Option<Vec<Vec<u8>>> {
++fn glob(root: &Root, cwd: &[u8], extra: &[u8]) -> Option<Vec<Vec<u8>>> {
 +    let split = extra.iter().position(|&c| c == 0)?;
 +    let (pattern, flags) = (&extra[..split], &extra[split + 1..]);
 +    let has = |letter: u8| flags.contains(&letter);
@@ -2952,10 +3031,10 @@ index e523f3302..788966678 100644
      pub(crate) mod shards_by_reach;
 diff --git a/src/runtime/cli/test/InputReuse.rs b/src/runtime/cli/test/InputReuse.rs
 new file mode 100644
-index 000000000..2016070a9
+index 000000000..35240ba41
 --- /dev/null
 +++ b/src/runtime/cli/test/InputReuse.rs
-@@ -0,0 +1,1141 @@
+@@ -0,0 +1,1143 @@
 +//! `BUN_TEST_INPUT_REUSE=1` with `BUN_TEST_INPUT_RECORD_DIR` under `bun test --isolate`: before the
 +//! run, a test file whose record still holds is not run, and its recorded counts go into the summary.
 +//!
@@ -3007,16 +3086,18 @@ index 000000000..2016070a9
 +}
 +
 +/// What the run was started with that can change a test file's outcome, one `name=value` per line.
-+/// Paths under the project root are relative to it.
++/// Paths under the record root (`recorder::record_root`) are relative to it, and the root itself is
++/// not in it, so the fingerprint is the same in another checkout of the repository.
 +pub(crate) fn fingerprint(ctx: &ContextData, vm: &VirtualMachine) -> Vec<u8> {
-+    let root = vm.top_level_dir();
-+    let relative = |path: &[u8]| -> Vec<u8> {
-+        match path.strip_prefix(root) {
-+            Some(rest) if rest.first().is_some_and(|&c| bun_paths::is_sep(c)) => rest[1..].to_vec(),
-+            _ => path.to_vec(),
-+        }
-+    };
++    let root = recorder::record_root(vm);
++    let relative = |path: &[u8]| -> Vec<u8> { root.relative(path).unwrap_or(path).to_vec() };
 +    let mut out = Vec::with_capacity(1024);
++    // Where in the repository the run starts: its working directory.
++    let _ = writeln!(
++        out,
++        "project={}",
++        bstr::BStr::new(&relative(vm.top_level_dir()))
++    );
 +    let list = |out: &mut Vec<u8>, name: &str, items: &mut dyn Iterator<Item = Vec<u8>>| {
 +        let _ = write!(out, "{name}=");
 +        for (i, item) in items.enumerate() {
@@ -4834,10 +4915,10 @@ index de7a45703..d31843aae 100644
  
      let event_loop = EventLoopHandle::init(vm.event_loop_ptr());
 diff --git a/test/cli/test/isolation.test.ts b/test/cli/test/isolation.test.ts
-index 6d0d65721..ff8c203a1 100644
+index 6d0d65721..f3bbacdf1 100644
 --- a/test/cli/test/isolation.test.ts
 +++ b/test/cli/test/isolation.test.ts
-@@ -3510,3 +3510,651 @@ describe.concurrent("mocks and spies do not outlive their test file", () => {
+@@ -3510,3 +3510,689 @@ describe.concurrent("mocks and spies do not outlive their test file", () => {
      });
    });
  });
@@ -5031,6 +5112,44 @@ index 6d0d65721..ff8c203a1 100644
 +      reused: ["a.test.ts", "b.test.ts", "c.test.ts"],
 +      exitCode: 0,
 +    });
++  });
++
++  test("paths are kept from the repository root, so imports and reads outside the package hold in another checkout", async () => {
++    using dir = tempDir("input-reuse-repo", {
++      here: {
++        "pnpm-workspace.yaml": "packages:\n  - packages/*\n",
++        "config.txt": "v1",
++        "node_modules/dep/package.json": `{ "name": "dep", "main": "index.js" }`,
++        "node_modules/dep/index.js": `module.exports = "dep";\n`,
++        "packages/lib/index.ts": `export const lib = "lib-v1";\n`,
++        "packages/app/package.json": `{ "name": "app" }`,
++        "packages/app/local.ts": `export const local = 1;\n`,
++        "packages/app/a.test.ts": `
++          import { expect, test } from "bun:test";
++          import { readFileSync } from "node:fs";
++          import { lib } from "../lib/index.ts";
++          import dep from "dep";
++          test("a", () => expect([lib, dep, readFileSync(import.meta.dir + "/../../config.txt", "utf8")]).toEqual(["lib-v1", "dep", "v1"]));
++        `,
++        "packages/app/b.test.ts": `
++          import { expect, test } from "bun:test";
++          import { local } from "./local";
++          test("b", () => expect(local).toBe(1));
++        `,
++      },
++    });
++    const pair = ["./a.test.ts", "./b.test.ts"];
++    await runTests(join(String(dir), "here", "packages", "app"), ["--isolate"], pair, record);
++    fs.cpSync(join(String(dir), "here"), join(String(dir), "there"), { recursive: true });
++    const there = join(String(dir), "there", "packages", "app");
++    const moved = await runTests(there, ["--isolate"], pair, reuse);
++    fs.writeFileSync(join(String(dir), "there", "config.txt"), "v2");
++    const edited = await runTests(there, ["--isolate"], pair, reuse);
++    expect({ moved: reusedFiles(moved.stderr), edited: reusedFiles(edited.stderr) }).toEqual({
++      moved: ["a.test.ts", "b.test.ts"],
++      edited: ["b.test.ts"],
++    });
++    expect(edited.stderr).toContain("reuse: a.test.ts runs: own-read content ");
 +  });
 +
 +  test("with every file reused the run passes, and a failed file is never reused", async () => {
