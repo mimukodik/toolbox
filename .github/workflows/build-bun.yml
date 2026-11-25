@@ -168,7 +168,8 @@ jobs:
           exit "$status"
 
       - name: Save tested release files
-        if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+        # A manual run of any branch keeps the tarball as an artifact. Only main publishes a release (see `release`).
+        if: github.event_name == 'workflow_dispatch' || (github.ref == 'refs/heads/main' && github.event_name == 'push')
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: bun-release
