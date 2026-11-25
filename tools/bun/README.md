@@ -3,17 +3,17 @@
 Toolbox adds nineteen Effect v4 rules to Bun's native `bun lint`.
 Bun 1.4.5 has no `bun lint` command, so the Linux x86-64 build uses
 Bun 1.4.6-canary.1 at
-[`b15f51302d72e1cd9038ecd0cf33782c02ee7681`](https://github.com/oven-sh/bun/commit/b15f51302d72e1cd9038ecd0cf33782c02ee7681).
+[`0966e99d8f357833a147af2a4bce7d66321829c1`](https://github.com/oven-sh/bun/commit/0966e99d8f357833a147af2a4bce7d66321829c1).
 Move the pin to the first Bun release that includes `bun lint`.
 
 ## Install
 
-Use the `bun-1.4.6-canary.1-b15f513-p7` release. Copy `sha256` from the
+Use the `bun-1.4.6-canary.1-0966e99-p1` release. Copy `sha256` from the
 release's `.tar.zst.sha256` file and run [the Toolbox installer](../../README.md)
 from the same tag.
 
 ```sh
-tag=bun-1.4.6-canary.1-b15f513-p7
+tag=bun-1.4.6-canary.1-0966e99-p1
 url="https://github.com/mimukodik/toolbox/releases/download/$tag/$tag-x86_64-linux.tar.zst"
 sudo sh ./install.sh "$url" "$sha256"
 bun --version
@@ -23,7 +23,7 @@ bun lint --help
 ## Build and use the rules
 
 Both packages use the same release build with LTO and AOT disabled. The
-patched package applies the patches in this directory at patch level `p7`.
+patched package applies the patches in this directory at patch level `p1`.
 The unpatched package is the control.
 
 ```sh

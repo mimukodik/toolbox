@@ -2,13 +2,13 @@
 
 let
   inherit (pkgs) lib;
-  rev = "b15f51302d72e1cd9038ecd0cf33782c02ee7681";
+  rev = "0966e99d8f357833a147af2a4bce7d66321829c1";
   version = "1.4.6-canary.1";
   patchlevel = lib.removeSuffix "\n" (builtins.readFile ./PATCHLEVEL);
   src = pkgs.fetchurl {
     url = "https://codeload.github.com/oven-sh/bun/tar.gz/${rev}";
     name = "bun-${rev}.tar.gz";
-    hash = "sha256-wC5xktYQt++/41T1D/8dA0MmEXL1s2WRIHSTDAdsTys=";
+    hash = "sha256-HR0sQuY75Av3mZ/yBVqAsoCpOy8Sodumgfa7cIW4QPo=";
   };
 
   # Match Bun's build pins (scripts/build/ci-images/spec.ts and rust-toolchain.toml).

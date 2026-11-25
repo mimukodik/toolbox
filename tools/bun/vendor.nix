@@ -63,7 +63,7 @@ let
   # Use Bun's existing bun.lock -> package-lock.json conversion. The adapter
   # called in place of npm copies the locked registry packages into a cache.
   npmDeps = pkgs.runCommand "bun-npm-cache" (
-    fixed "sha256-hqUhz3AyByDeCBrryDUR+KqreWm2ebQKWdEUrDrru0o="
+    fixed "sha256-9SlAzineT0rXMEv0XxeWUB5nZ9k6FsJ+aU5vVvwx9RQ="
     // {
       nativeBuildInputs = [ pkgs.python3 pkgs.bun pkgs.prefetch-npm-deps ];
     }
