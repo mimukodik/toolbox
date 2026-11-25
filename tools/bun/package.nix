@@ -90,7 +90,11 @@ let
         unzip
         rust
       ];
-      env = {
+      env = lib.optionalAttrs patched {
+        # Read by the recorder's option_env! when its crate is compiled: part of the fingerprint
+        # of every test input record, so a new release makes older records stale.
+        BUN_TEST_INPUT_BUILD_ID = patchlevel;
+      } // {
         BUN_TOOLCHAIN_LLVM = llvmTools;
         BUN_TOOLCHAIN_RUST = rust;
         BUN_BUILD_PREFETCH_DIR = prefetch;

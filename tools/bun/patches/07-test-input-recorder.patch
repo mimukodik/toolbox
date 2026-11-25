@@ -131,10 +131,10 @@ index 15110f74d..cc4c4e600 100644
          // `VirtualMachine::use_isolation_source_provider_cache` to avoid forming
 diff --git a/src/jsc/TestInputRecorder.rs b/src/jsc/TestInputRecorder.rs
 new file mode 100644
-index 000000000..ab8c2c704
+index 000000000..222bc1b11
 --- /dev/null
 +++ b/src/jsc/TestInputRecorder.rs
-@@ -0,0 +1,1135 @@
+@@ -0,0 +1,1164 @@
 +//! `BUN_TEST_INPUT_RECORD_DIR=<dir>` with `bun test --isolate`: for every test file, write
 +//! `<dir>/<path relative to the project root, URI-component-encoded>.json` with what the file
 +//! depended on: every resolution made while it was the current file (question and answer), every
@@ -163,6 +163,7 @@ index 000000000..ab8c2c704
 +use bun_resolver::Result as ResolverResult;
 +
 +use crate::test_input_store::{self as store, Entry, Segment};
++pub use crate::test_own_reads::Wrote;
 +use crate::test_own_reads::{Look, OwnReads};
 +use crate::virtual_machine::{ResolveMode, VirtualMachine};
 +use crate::{JSGlobalObject, JSValue};
@@ -220,6 +221,8 @@ index 000000000..ab8c2c704
 +    late_from_earlier_files: u32,
 +    /// What the file's own code looked at on the file system.
 +    own: OwnReads,
++    /// Modules and questions left out because the file's own code wrote them (see [`FileState::add_resolution`]).
++    generated: u32,
 +}
 +
 +/// What the resolver's result says about the module, beyond its path.
@@ -361,7 +364,7 @@ index 000000000..ab8c2c704
 +        let found = found.filter(|found| answer == Some(&*found.path));
 +        let line = recorder.resolution_line(&question, answer, by_plugin, found.as_ref());
 +        if let Some(file) = state.file.as_mut() {
-+            file.add_resolution(line, answer);
++            file.add_resolution(line, &question.importer, answer);
 +        }
 +        resolved
 +    }
@@ -411,7 +414,7 @@ index 000000000..ab8c2c704
 +    let line = recorder.resolution_line(&question, answer, false, found.as_ref());
 +    let mut state = recorder.state.borrow_mut();
 +    match state.file.as_mut() {
-+        Some(file) => file.add_resolution(line, answer),
++        Some(file) => file.add_resolution(line, b"", answer),
 +        None => state.unattributed += 1,
 +    }
 +}
@@ -539,17 +542,17 @@ index 000000000..ab8c2c704
 +    }
 +}
 +
-+/// The current file's own code is about to write, create or remove `path`, or, with `prefix`, any
-+/// path that starts with it (`fs.mkdtemp`). What it looked at there is observed first. A write while
++/// The current file's own code is about to write, create or remove `path`, as `wrote` says. What it
++/// looked at there is observed first. A write while
 +/// no file is current changes no record: every look of the last file was observed when its record
 +/// was written, and the next file's looks see what the write left.
-+pub fn own_write(vm: &VirtualMachine, path: &[u8], prefix: bool) {
++pub fn own_write(vm: &VirtualMachine, path: &[u8], wrote: Wrote) {
 +    let Some(recorder) = recorder_of(vm) else {
 +        return;
 +    };
 +    let mut state = recorder.state.borrow_mut();
 +    if let Some(file) = state.file.as_mut() {
-+        file.own.write(&recorder.root, &absolute_now(path), prefix);
++        file.own.write(&recorder.root, &absolute_now(path), wrote);
 +    }
 +}
 +
@@ -593,6 +596,10 @@ index 000000000..ab8c2c704
 +            self.unattributed += 1;
 +            return;
 +        };
++        if !file.module_index.contains_key(path) && file.own.generated(path) {
++            file.generated += 1;
++            return;
++        }
 +        match file.module_index.get(path) {
 +            Some(&index) => file.modules[index].1 &= cached,
 +            None => {
@@ -604,7 +611,29 @@ index 000000000..ab8c2c704
 +}
 +
 +impl FileState {
-+    fn add_resolution(&mut self, line: (Box<[u8]>, Entry), answer: Option<&[u8]>) {
++    /// A question asked from a module the file's own code wrote, or answered by one, is left out:
++    /// that module is the product of the file's code and recorded inputs, and its path may never
++    /// exist again (a temporary directory), so the question can't be asked again. What such a
++    /// question reaches that the file did not write is still an answer file, hashed.
++    fn add_resolution(
++        &mut self,
++        line: (Box<[u8]>, Entry),
++        importer: &[u8],
++        answer: Option<&[u8]>,
++    ) {
++        let own = &self.own;
++        let generated = |path: &[u8]| bun_paths::is_absolute(path) && own.generated(path);
++        let answer_generated = answer.is_some_and(generated);
++        if generated(importer) || answer_generated {
++            self.generated += 1;
++            if let Some(answer) = answer.filter(|it| bun_paths::is_absolute(it) && !answer_generated)
++                && !self.seen_answers.contains_key(answer)
++            {
++                bun_core::handle_oom(self.seen_answers.put(answer, ()));
++                self.answers.push(Box::from(answer));
++            }
++            return;
++        }
 +        if !self.seen_resolutions.contains_key(&*line.0) {
 +            bun_core::handle_oom(self.seen_resolutions.put(&line.0, ()));
 +            self.resolutions.push(line);
@@ -1146,8 +1175,8 @@ index 000000000..ab8c2c704
 +        }
 +        let _ = write!(
 +            out,
-+            ",\"unattributedBefore\":{},\"lateFromEarlierFiles\":{},\"marks\":[",
-+            file.unattributed_before, file.late_from_earlier_files
++            ",\"unattributedBefore\":{},\"lateFromEarlierFiles\":{},\"generated\":{},\"marks\":[",
++            file.unattributed_before, file.late_from_earlier_files, file.generated
 +        );
 +        for (i, name) in file.marks.iter().enumerate() {
 +            let _ = write!(
@@ -2159,10 +2188,10 @@ index 000000000..05b3f4195
 +}
 diff --git a/src/jsc/TestOwnReads.rs b/src/jsc/TestOwnReads.rs
 new file mode 100644
-index 000000000..47723e028
+index 000000000..e05317331
 --- /dev/null
 +++ b/src/jsc/TestOwnReads.rs
-@@ -0,0 +1,346 @@
+@@ -0,0 +1,391 @@
 +//! What a test file's own code read from the file system, as part of its input record.
 +//!
 +//! The JavaScript-facing file APIs (`node:fs` in all three forms, `Bun.file` and `Bun.write`,
@@ -2240,13 +2269,46 @@ index 000000000..47723e028
 +    pub value: Option<Box<[u8]>>,
 +}
 +
++/// What a write did to a path, which decides what is there afterwards because of the file's own code.
++#[derive(Clone, Copy, PartialEq, Eq, Debug)]
++pub enum Wrote {
++    /// Wrote or created the file at the path: its bytes are the file's own product.
++    File,
++    /// Removed the path, made it a new directory, or moved or copied a tree to it: whatever is at
++    /// or below it afterwards is the file's own product.
++    Tree,
++    /// `fs.mkdtemp`: every path that starts with these bytes is new.
++    Prefix,
++    /// Changed only metadata, or made a directory that may have been there already: what is at or
++    /// below it is not the file's product.
++    Meta,
++}
++
 +#[derive(Default)]
 +pub struct OwnReads {
 +    pub reads: Vec<Read>,
 +    keys: StringHashMap<()>,
-+    /// Absolute paths the file wrote, created or removed; `true` when every path that starts with
-+    /// these bytes counts (the prefix of `fs.mkdtemp`).
-+    written: Vec<(Box<[u8]>, bool)>,
++    /// Absolute paths the file wrote, created or removed, as given and with the symbolic links of
++    /// their parent resolved (a module's path is the resolved one, as `/private/tmp` on macOS).
++    written: Vec<(Box<[u8]>, Wrote)>,
++}
++
++/// `path` with the symbolic links of its parent directory resolved, when that changes it.
++fn real_parent(path: &[u8]) -> Option<Vec<u8>> {
++    let split = path.iter().rposition(|&c| bun_paths::is_sep(c))?;
++    let (parent, name) = (&path[..split.max(1)], &path[split + 1..]);
++    let zparent = bun_core::ZBox::from_vec(parent.to_vec());
++    let mut buf = bun_paths::path_buffer_pool::get();
++    let real: &[u8] = bun_sys::realpath(&zparent, &mut buf).ok()?;
++    if real == parent {
++        return None;
++    }
++    let mut out = real.to_vec();
++    if !out.last().is_some_and(|&c| bun_paths::is_sep(c)) {
++        out.push(bun_paths::SEP);
++    }
++    out.extend_from_slice(name);
++    Some(out)
 +}
 +
 +/// `inner` is `outer` or below it.
@@ -2262,14 +2324,19 @@ index 000000000..47723e028
 +}
 +
 +impl OwnReads {
++    /// Whether what is at `path` now is the product of the file's own writes so far: a file it
++    /// wrote, or a path in a tree it removed, made new or replaced.
++    pub fn generated(&self, path: &[u8]) -> bool {
++        self.written.iter().any(|(written, wrote)| match wrote {
++            Wrote::File => **written == *path,
++            Wrote::Tree => under(path, written),
++            Wrote::Prefix => path.starts_with(written),
++            Wrote::Meta => false,
++        })
++    }
++
 +    pub fn read(&mut self, look: Look, path: &[u8], extra: &[u8]) {
-+        if self.written.iter().any(|(written, prefix)| {
-+            if *prefix {
-+                path.starts_with(written)
-+            } else {
-+                under(path, written)
-+            }
-+        }) {
++        if self.generated(path) {
 +            return;
 +        }
 +        let mut key = Vec::with_capacity(path.len() + extra.len() + 16);
@@ -2292,7 +2359,8 @@ index 000000000..47723e028
 +
 +    /// Before the file writes to `path`: what it looked at there, below it, or above it is observed
 +    /// now, so the record keeps what was there before the write.
-+    pub fn write(&mut self, root: &[u8], path: &[u8], prefix: bool) {
++    pub fn write(&mut self, root: &[u8], path: &[u8], wrote: Wrote) {
++        let prefix = wrote == Wrote::Prefix;
 +        for read in self.reads.iter_mut().filter(|read| read.value.is_none()) {
 +            let touched = if prefix {
 +                read.path.starts_with(path) || under(path, &read.path)
@@ -2303,12 +2371,18 @@ index 000000000..47723e028
 +                read.value = Some(observe(root, read.look, &read.path, &read.extra));
 +            }
 +        }
-+        if !self
-+            .written
-+            .iter()
-+            .any(|(written, was_prefix)| *was_prefix == prefix && **written == *path)
-+        {
-+            self.written.push((Box::from(path), prefix));
++        if wrote == Wrote::Meta {
++            return;
++        }
++        let real = real_parent(path);
++        for path in core::iter::once(path).chain(real.as_deref()) {
++            if !self
++                .written
++                .iter()
++                .any(|(written, was)| *was == wrote && **written == *path)
++            {
++                self.written.push((Box::from(path), wrote));
++            }
 +        }
 +    }
 +
@@ -2736,22 +2810,30 @@ index 7b1d3b011..15fa62de9 100644
          let spec_slice = specifier_str.to_utf8();
          // The transpiler holds its address: it is neither moved nor named until the guard below has run.
 diff --git a/src/runtime/api/Archive.rs b/src/runtime/api/Archive.rs
-index b2ae15663..d48f71e66 100644
+index b2ae15663..6bb15a2e4 100644
 --- a/src/runtime/api/Archive.rs
 +++ b/src/runtime/api/Archive.rs
-@@ -322,6 +322,7 @@ impl Archive {
+@@ -322,6 +322,11 @@ impl Archive {
          }
  
          let path_slice = path_arg.to_utf8(global)?;
-+        bun_jsc::test_input_recorder::own_write(global.bun_vm(), path_slice.slice(), false);
++        bun_jsc::test_input_recorder::own_write(
++            global.bun_vm(),
++            path_slice.slice(),
++            bun_jsc::test_input_recorder::Wrote::File,
++        );
  
          // Parse options for compression override
          let options_compress = parse_compression_options(global, options.to_js())?;
-@@ -391,6 +392,7 @@ impl Archive {
+@@ -391,6 +396,11 @@ impl Archive {
          }
  
          let path_slice = path_arg.to_utf8(global)?;
-+        bun_jsc::test_input_recorder::own_write(global.bun_vm(), path_slice.slice(), false);
++        bun_jsc::test_input_recorder::own_write(
++            global.bun_vm(),
++            path_slice.slice(),
++            bun_jsc::test_input_recorder::Wrote::Tree,
++        );
  
          // Parse options
          let mut glob_patterns: Option<Vec<GlobPattern>> = None;
@@ -4260,10 +4342,10 @@ index 5779aacff..6fdc55c33 100644
          graph.note_process_start();
      }
 diff --git a/src/runtime/node/node_fs_binding.rs b/src/runtime/node/node_fs_binding.rs
-index 30e3de54e..af3ab04a2 100644
+index 30e3de54e..89e265571 100644
 --- a/src/runtime/node/node_fs_binding.rs
 +++ b/src/runtime/node/node_fs_binding.rs
-@@ -20,15 +20,145 @@ use crate::node::fs::{
+@@ -20,15 +20,150 @@ use crate::node::fs::{
  /// Returns bindings to call jsc.Node.fs.NodeFS.<function>.
  /// Async calls use a thread pool.
  
@@ -4285,9 +4367,10 @@ index 30e3de54e..af3ab04a2 100644
 +            recorder::own_read(vm, look, path);
 +        }
 +    };
-+    let write = |path: Option<&[u8]>| {
++    use bun_jsc::test_input_recorder::Wrote;
++    let write = |path: Option<&[u8]>, wrote: Wrote| {
 +        if let Some(path) = path {
-+            recorder::own_write(vm, path, false);
++            recorder::own_write(vm, path, wrote);
 +        }
 +    };
 +    let any: &dyn core::any::Any = args;
@@ -4302,7 +4385,7 @@ index 30e3de54e..af3ab04a2 100644
 +            read(Look::Exists, path);
 +        }
 +        if access != O::RDONLY || flags & (O::CREAT | O::TRUNC | O::APPEND) != 0 {
-+            write(path);
++            write(path, Wrote::File);
 +        }
 +    };
 +    match function {
@@ -4341,12 +4424,12 @@ index 30e3de54e..af3ab04a2 100644
 +            if exclusive {
 +                read(Look::Exists, second);
 +            }
-+            write(second);
++            write(second, Wrote::File);
 +        }
 +        F::Rename => {
 +            read(Look::Exists, first);
-+            write(first);
-+            write(second);
++            write(first, Wrote::Tree);
++            write(second, Wrote::Tree);
 +        }
 +        F::Link | F::Symlink => {
 +            if function == F::Link {
@@ -4355,21 +4438,22 @@ index 30e3de54e..af3ab04a2 100644
 +            // The new name must not be there yet.
 +            let new = if function == F::Link { second } else { first };
 +            read(Look::Exists, new);
-+            write(new);
++            write(new, Wrote::File);
 +        }
 +        F::Mkdtemp => {
 +            if let Some(prefix) = first {
-+                recorder::own_write(vm, prefix, true);
++                recorder::own_write(vm, prefix, Wrote::Prefix);
 +            }
 +        }
 +        F::Mkdir => {
 +            let recursive = any
 +                .downcast_ref::<args::Mkdir<'static>>()
 +                .is_some_and(|it| it.recursive);
++            // Without `recursive` it fails unless the directory is new.
 +            if !recursive {
 +                read(Look::Exists, first);
 +            }
-+            write(first);
++            write(first, if recursive { Wrote::Meta } else { Wrote::Tree });
 +        }
 +        F::Rm => {
 +            let force = any
@@ -4378,18 +4462,21 @@ index 30e3de54e..af3ab04a2 100644
 +            if !force {
 +                read(Look::Exists, first);
 +            }
-+            write(first);
++            write(first, Wrote::Tree);
 +        }
 +        F::Truncate => {
 +            // What is left of the bytes is still there afterwards.
 +            read(Look::Content, first);
-+            write(first);
++            write(first, Wrote::File);
 +        }
-+        F::Unlink | F::Rmdir | F::Chmod | F::Chown | F::Lchmod | F::Lchown | F::Utimes
-+        | F::Lutimes => {
++        F::Unlink | F::Rmdir => {
 +            // These fail when the path is missing.
 +            read(Look::Exists, first);
-+            write(first);
++            write(first, Wrote::Tree);
++        }
++        F::Chmod | F::Chown | F::Lchmod | F::Lchown | F::Utimes | F::Lutimes => {
++            read(Look::Exists, first);
++            write(first, Wrote::Meta);
 +        }
 +        F::Statfs | F::Close | F::Fchmod | F::Fchown | F::Fdatasync | F::Fstat | F::Fsync
 +        | F::Ftruncate | F::Futimes | F::Read | F::Readv | F::Write | F::Writev => {}
@@ -4410,7 +4497,7 @@ index 30e3de54e..af3ab04a2 100644
      move_waiting_descriptors();
      match dispatch(&args) {
          Err(err) => Err(global.throw_value(err.to_js(global))),
-@@ -37,7 +167,7 @@ fn run_sync_with<R: FsReturn, A: FsArgument>(
+@@ -37,7 +172,7 @@ fn run_sync_with<R: FsReturn, A: FsArgument>(
  }
  
  /// `Bindings(FunctionEnum).runSync`.
@@ -4419,7 +4506,7 @@ index 30e3de54e..af3ab04a2 100644
      this: &Binding,
      cx: &mut JsScope<'_>,
      args: &[JsLocal<'_>],
-@@ -48,14 +178,14 @@ where
+@@ -48,14 +183,14 @@ where
      // R-2: `JsCell::with_mut` scopes the `&mut NodeFS` to the blocking
      // syscall; `dispatch` never re-enters JS, and `Maybe<R>` is fully owned
      // (`sys::Error.path` is `Box<[u8]>`, not a borrow into `sync_error_buf`).
@@ -4436,7 +4523,7 @@ index 30e3de54e..af3ab04a2 100644
      cx: &mut JsScope<'_>,
      args: &[JsLocal<'_>],
  ) -> JsResult<JSValue>
-@@ -63,7 +193,7 @@ where
+@@ -63,7 +198,7 @@ where
      Op<{ F }>: NodeFSDispatch<R, A>,
  {
      let vm = cx.global().bun_vm();
@@ -4445,7 +4532,7 @@ index 30e3de54e..af3ab04a2 100644
          crate::jsc_hooks::with_node_fs(vm, |node_fs| {
              node_fs.vm = Some(vm);
              NodeFS::dispatch::<R, A, F>(node_fs, args, Flavor::Sync)
-@@ -125,10 +255,11 @@ fn split_callback<'a>(
+@@ -125,10 +260,11 @@ fn split_callback<'a>(
  /// Windows path picks `UVFSRequest` for a handful of fds-only ops while
  /// everything else uses `AsyncFSTask`, and that choice is encoded in the
  /// `async_::*` type aliases rather than derivable from `F` alone.
@@ -4458,7 +4545,7 @@ index 30e3de54e..af3ab04a2 100644
      arm: AsyncArm,
      create_task: fn(
          &bun_jsc::JsThread<'_>,
-@@ -146,6 +277,7 @@ fn run_async<A: FsArgument>(
+@@ -146,6 +282,7 @@ fn run_async<A: FsArgument>(
          ParsedAsyncArgs::Rejected(error) => return reject_before_schedule(global, callback, error),
      };
      let vm: &VirtualMachine = global.bun_vm();
@@ -4466,7 +4553,7 @@ index 30e3de54e..af3ab04a2 100644
      move_waiting_descriptors();
      Ok(create_task(&cx, this, args, vm, callback))
  }
-@@ -230,6 +362,7 @@ impl Binding {
+@@ -230,6 +367,7 @@ impl Binding {
              ParsedAsyncArgs::Rejected(error) => return reject_before_schedule(global, None, error),
          };
          let vm: &VirtualMachine = global.bun_vm();
@@ -4474,7 +4561,7 @@ index 30e3de54e..af3ab04a2 100644
          Ok(AsyncCpTask::create(&cx, self, cp_args, vm))
      }
  
-@@ -241,6 +374,7 @@ impl Binding {
+@@ -241,6 +379,7 @@ impl Binding {
  
          // `defer args.deinit()` → `Drop` on `cp_args` (its `PathLike` fields).
          let cp_args = args::Cp::from_js(global, &mut slice)?;
@@ -4482,7 +4569,7 @@ index 30e3de54e..af3ab04a2 100644
  
          // R-2: blocking syscall — `&mut NodeFS` scoped to the call, no JS re-entry.
          match self.node_fs.with_mut(|nfs| nfs.cp(&cp_args, Flavor::Sync)) {
-@@ -279,6 +413,7 @@ impl Binding {
+@@ -279,6 +418,7 @@ impl Binding {
              }
          };
          let vm: &VirtualMachine = global.bun_vm();
@@ -4490,7 +4577,7 @@ index 30e3de54e..af3ab04a2 100644
          // /$bunfs/ is in-memory; readdir_inner handles it (recursive included).
          let is_bunfs = bun_standalone_graph::Graph::get_ref()
              .is_some_and(|graph| graph.owns_directory(rd_args.path.slice()));
-@@ -298,6 +433,11 @@ impl Binding {
+@@ -298,6 +438,11 @@ impl Binding {
          let mut slice = ArgumentsSlice::init(cx.vm(), JsLocal::to_js_slice(args));
  
          let watch_args = fs::Watcher::Arguments::from_js(&cx, &mut slice)?;
@@ -4502,7 +4589,7 @@ index 30e3de54e..af3ab04a2 100644
  
          // R-2: `NodeFS::watch` only reads `self.vm` (no scratch-buffer write);
          // scoped via `with_mut` so the borrow cannot outlive the call.
-@@ -321,6 +461,11 @@ impl Binding {
+@@ -321,6 +466,11 @@ impl Binding {
          let mut slice = ArgumentsSlice::init(cx.vm(), JsLocal::to_js_slice(args));
  
          let wf_args = fs::StatWatcher::Arguments::from_js(&cx, &mut slice)?;
@@ -4514,7 +4601,7 @@ index 30e3de54e..af3ab04a2 100644
  
          match self
              .node_fs
-@@ -350,14 +495,14 @@ macro_rules! node_fs_bindings {
+@@ -350,14 +500,14 @@ macro_rules! node_fs_bindings {
                      cx: &mut JsScope<'_>,
                      args: &[JsLocal<'_>],
                  ) -> JsResult<JSValue> {
@@ -4531,7 +4618,7 @@ index 30e3de54e..af3ab04a2 100644
                  }
              )*
          }
-@@ -424,6 +569,21 @@ impl Binding {
+@@ -424,6 +574,21 @@ impl Binding {
      // pub const statfsSync = callSync(.statfs);
  }
  
@@ -4547,7 +4634,7 @@ index 30e3de54e..af3ab04a2 100644
 +    if args.flags.error_on_exist && !args.flags.force {
 +        recorder::own_read(vm, Look::Exists, args.dest.slice());
 +    }
-+    recorder::own_write(vm, args.dest.slice(), false);
++    recorder::own_write(vm, args.dest.slice(), recorder::Wrote::Tree);
 +}
 +
  pub(crate) fn binding<'a>(cx: &mut JsScope<'a>) -> JsWrapper<'a, Binding> {
@@ -4580,7 +4667,7 @@ index a6c2bd744..a22578af4 100644
  
  impl Summary {
 diff --git a/src/runtime/test_runner/snapshot.rs b/src/runtime/test_runner/snapshot.rs
-index d54b74dc7..8ebe4a55f 100644
+index d54b74dc7..053b431ad 100644
 --- a/src/runtime/test_runner/snapshot.rs
 +++ b/src/runtime/test_runner/snapshot.rs
 @@ -321,6 +321,9 @@ impl Snapshots {
@@ -4608,7 +4695,7 @@ index d54b74dc7..8ebe4a55f 100644
          }
  
 +        if let Some(vm) = VirtualMachine::get_or_null() {
-+            bun_jsc::test_input_recorder::own_write(vm, path, false);
++            bun_jsc::test_input_recorder::own_write(vm, path, bun_jsc::test_input_recorder::Wrote::File);
 +        }
          let flags = bun_sys::O::WRONLY | bun_sys::O::CREAT | bun_sys::O::TRUNC;
          match bun_sys::File::make_open(path, flags, 0o644).and_then(|file| file.write_all(received)) {
@@ -4618,7 +4705,7 @@ index d54b74dc7..8ebe4a55f 100644
      fn write_sorted(&self, file: &File) -> Result<(), Error> {
          let path: &ZStr = &snapshot_file_path(file.test_file);
 +        if let Some(vm) = VirtualMachine::get_or_null() {
-+            bun_jsc::test_input_recorder::own_write(vm, path.as_bytes(), false);
++            bun_jsc::test_input_recorder::own_write(vm, path.as_bytes(), bun_jsc::test_input_recorder::Wrote::File);
 +        }
          if self.values.is_empty() {
              return match bun_sys::unlink(path) {
@@ -4628,13 +4715,13 @@ index d54b74dc7..8ebe4a55f 100644
          }
  
 +        if let Some(vm) = VirtualMachine::get_or_null() {
-+            bun_jsc::test_input_recorder::own_write(vm, path.as_bytes(), false);
++            bun_jsc::test_input_recorder::own_write(vm, path.as_bytes(), bun_jsc::test_input_recorder::Wrote::File);
 +        }
          // Not O_TRUNC: a run that exits before `write_snapshot_file` must leave the old contents.
          let flags: i32 = bun_sys::O::CREAT | bun_sys::O::RDWR;
          let fd = bun_sys::open(&path, flags, 0o644)?;
 diff --git a/src/runtime/webcore/Blob.rs b/src/runtime/webcore/Blob.rs
-index e51dc6d98..119c15847 100644
+index e51dc6d98..c2861f7a9 100644
 --- a/src/runtime/webcore/Blob.rs
 +++ b/src/runtime/webcore/Blob.rs
 @@ -1105,6 +1105,7 @@ impl BlobExt for Blob {
@@ -4674,7 +4761,7 @@ index e51dc6d98..119c15847 100644
          return Ok(JSPromise::rejected_promise(cx.global(), err.to_js(cx.global())).to_js());
      }
 +    if let Some(PathOrFileDescriptor::Path(path)) = destination {
-+        bun_jsc::test_input_recorder::own_write(cx.global().bun_vm(), path.slice(), false);
++        bun_jsc::test_input_recorder::own_write(cx.global().bun_vm(), path.slice(), bun_jsc::test_input_recorder::Wrote::File);
 +    }
  
      if let Some(mkdir) = options.mkdirp_if_not_exists {
@@ -4688,7 +4775,7 @@ index e51dc6d98..119c15847 100644
 +    if let store::Data::File(file) = &store.data
 +        && let PathOrFileDescriptor::Path(path) = &file.pathlike
 +    {
-+        bun_jsc::test_input_recorder::own_write(global_this.bun_vm(), path.slice(), false);
++        bun_jsc::test_input_recorder::own_write(global_this.bun_vm(), path.slice(), bun_jsc::test_input_recorder::Wrote::File);
 +    }
 +}
 +
@@ -4720,10 +4807,10 @@ index de7a45703..d31843aae 100644
  
      let event_loop = EventLoopHandle::init(vm.event_loop_ptr());
 diff --git a/test/cli/test/isolation.test.ts b/test/cli/test/isolation.test.ts
-index 6d0d65721..96eab4068 100644
+index 6d0d65721..1533eae79 100644
 --- a/test/cli/test/isolation.test.ts
 +++ b/test/cli/test/isolation.test.ts
-@@ -3510,3 +3510,540 @@ describe.concurrent("mocks and spies do not outlive their test file", () => {
+@@ -3510,3 +3510,601 @@ describe.concurrent("mocks and spies do not outlive their test file", () => {
      });
    });
  });
@@ -5107,6 +5194,67 @@ index 6d0d65721..96eab4068 100644
 +      edited: [reusedFiles(edited.stderr), edited.exitCode],
 +    }).toEqual({ unchanged: ["a.test.ts", "refused.test.ts"], edited: [["a.test.ts"], 0] });
 +    expect(edited.stderr).toContain("reuse: refused.test.ts runs: changed build/better_sqlite3.node");
++  });
++
++  test("a module the file wrote before importing it is no input, and what it imports still is", async () => {
++    using dir = tempDir("input-reuse-generated", {
++      ...files,
++      "dep.ts": `export const dep = "v1";\n`,
++      "late.ts": `export const late = "late-v1";\n`,
++      "temp.test.ts": `
++        import { expect, test } from "bun:test";
++        import { mkdtempSync, writeFileSync } from "node:fs";
++        import { tmpdir } from "node:os";
++        import { join } from "node:path";
++        test("temp", async () => {
++          const file = join(mkdtempSync(join(tmpdir(), "generated-")), "m.mjs");
++          writeFileSync(file, "export { dep } from " + JSON.stringify(join(import.meta.dir, "dep.ts")) + ";");
++          expect((await import(file)).dep).toBe("v1");
++        });
++      `,
++      "inside.test.ts": `
++        import { expect, test } from "bun:test";
++        import { mkdirSync, writeFileSync } from "node:fs";
++        test("inside", async () => {
++          mkdirSync(import.meta.dir + "/gen", { recursive: true });
++          const file = import.meta.dir + "/gen/m" + Math.random().toString(36).slice(2) + ".mjs";
++          writeFileSync(file, "export { dep } from '../dep.ts';");
++          expect((await import(file)).dep).toBe("v1");
++        });
++      `,
++      "late.test.ts": `
++        import { expect, test } from "bun:test";
++        import { readFileSync, writeFileSync } from "node:fs";
++        import { late } from "./late";
++        test("late", () => {
++          writeFileSync(import.meta.dir + "/late.ts", readFileSync(import.meta.dir + "/late.ts", "utf8"));
++          expect(late).toBe("late-v1");
++        });
++      `,
++    });
++    const these = ["./a.test.ts", "./temp.test.ts", "./inside.test.ts", "./late.test.ts"];
++    await runTests(String(dir), ["--isolate"], these, record);
++    const first = await runTests(String(dir), ["--isolate"], these, reuse);
++    const second = await runTests(String(dir), ["--isolate"], these, reuse);
++    fs.writeFileSync(join(String(dir), "dep.ts"), `export const dep = "v2";\n`);
++    const dep = await runTests(String(dir), ["--isolate"], these, reuse);
++    fs.writeFileSync(join(String(dir), "dep.ts"), `export const dep = "v1";\n`);
++    fs.writeFileSync(join(String(dir), "late.ts"), `export const late = "late-v2";\n`);
++    const late = await runTests(String(dir), ["--isolate"], these, reuse);
++    const all = ["a.test.ts", "inside.test.ts", "late.test.ts", "temp.test.ts"];
++    expect({
++      first: reusedFiles(first.stderr),
++      second: reusedFiles(second.stderr),
++      dep: [reusedFiles(dep.stderr), dep.exitCode],
++      late: [reusedFiles(late.stderr), late.exitCode],
++    }).toEqual({
++      first: all,
++      second: all,
++      dep: [["a.test.ts", "late.test.ts"], 1],
++      late: [["a.test.ts", "inside.test.ts", "temp.test.ts"], 1],
++    });
++    expect(dep.stderr).toContain("reuse: temp.test.ts runs: changed dep.ts");
++    expect(dep.stderr).toContain("reuse: inside.test.ts runs: changed dep.ts");
 +  });
 +
 +  test("going to a failing state and back reuses the pass recorded before", async () => {
