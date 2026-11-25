@@ -3,6 +3,9 @@ cli/lint/type-services.test.ts
 cli/lint/glob.test.ts
 cli/lint/rule-docs.test.ts
 cli/lint/rules.test.ts
+# Restrict format: only <listed file> :: <test name regex> runs the tests whose full name matches.
+# The test input recorder's cases in a file that holds 200 other upstream tests, which the patches do not touch.
+only cli/test/isolation.test.ts :: ^BUN_TEST_INPUT_
 # Exclude format: exclude <listed file> :: <exact test name> (one per file).
 # The CPU-time ratio varies on shared runners and does not cover our patches.
 # Owner: lane:nix. Remove this exclusion if a patch touches module resolution.

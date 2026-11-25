@@ -1,6 +1,7 @@
 # Patched Bun
 
-Toolbox adds nineteen Effect v4 rules to Bun's native `bun lint`.
+Toolbox adds nineteen Effect v4 rules to Bun's native `bun lint`, and a
+test input recorder to `bun test --isolate` (patch 07, below).
 Bun 1.4.5 has no `bun lint` command, so the Linux x86-64 build uses
 Bun 1.4.6-canary.1 at
 [`b15f51302d72e1cd9038ecd0cf33782c02ee7681`](https://github.com/oven-sh/bun/commit/b15f51302d72e1cd9038ecd0cf33782c02ee7681).
@@ -8,12 +9,12 @@ Move the pin to the first Bun release that includes `bun lint`.
 
 ## Install
 
-Use the `bun-1.4.6-canary.1-b15f513-p7` release. Copy `sha256` from the
+Use the `bun-1.4.6-canary.1-b15f513-p8` release. Copy `sha256` from the
 release's `.tar.zst.sha256` file and run [the Toolbox installer](../../README.md)
 from the same tag.
 
 ```sh
-tag=bun-1.4.6-canary.1-b15f513-p7
+tag=bun-1.4.6-canary.1-b15f513-p8
 url="https://github.com/mimukodik/toolbox/releases/download/$tag/$tag-x86_64-linux.tar.zst"
 sudo sh ./install.sh "$url" "$sha256"
 bun --version
@@ -23,7 +24,7 @@ bun lint --help
 ## Build and use the rules
 
 Both packages use the same release build with LTO and AOT disabled. The
-patched package applies the patches in this directory at patch level `p7`.
+patched package applies the patches in this directory at patch level `p8`.
 The unpatched package is the control.
 
 ```sh
@@ -81,6 +82,33 @@ hashes. Build `.#bun-unpatched.cargoDeps` and `.#bun-unpatched.npmDeps`
 to refresh the vendor hashes when their inputs change. Apply the Effect
 patches at the new commit and run the Blacksmith proof for both variants.
 
+## Test input recorder
+
+`patches/07-test-input-recorder.patch` adds a native recorder to
+`bun test --isolate`. It is off unless you set a variable below, and then it
+only adds work around the resolver and the transpiler. It comes from the
+`native-recorder` branch of our Bun checkout, which is based on a newer
+upstream commit than this pin, with fix-ups for the APIs that moved.
+
+| Variable | Effect |
+| --- | --- |
+| `BUN_TEST_INPUT_RECORD_DIR=<dir>` | Writes one JSON record per test file to `<dir>`, named by the file's path relative to the project root. A record lists the file's resolutions (question and answer), the modules it loaded with a SHA-256 of their source, what its own code read through `node:fs`, `Bun.file`, `Bun.Glob`, snapshots and `Bun.mmap`, what it did that a record cannot replay (spawn, FFI, workers, SQLite, macros), and its outcome counts. Records hold in another checkout of the same files. Needs `--isolate`; `--parallel` implies it. |
+| `BUN_TEST_INPUT_REUSE=1` | With a record directory, skips every test file whose record still holds and counts its recorded results in the summary. `explain` also says why each other file runs. `check` runs every file anyway and fails the run when a file whose record held ends with other counts. `0` or unset is off. A run with coverage never reuses. |
+| `BUN_TEST_INPUT_REUSE_REPORT=<file>` | Writes one JSON line per file saying whether its record held and why not. |
+| `BUN_TEST_INPUT_RECORD_SALT=<text>` | Part of every record's fingerprint, for what you know changes outcomes, such as a database version. |
+| `BUN_TEST_INPUT_RECORD_ENV=<A,B>` | Environment variables whose values are part of the fingerprint. |
+
+`BUN_TEST_INPUT_RECORD_FINGERPRINT` is internal: a `--parallel` coordinator
+hands its fingerprint to its workers with it.
+
+The fingerprint covers the Bun build, the flags that change how tests run,
+the transpiler's options and the environment Bun itself acts on, so a Bun
+upgrade makes every record stale (and says so once).
+
+Proof: `upstream-tests.txt` lists `cli/test/isolation.test.ts` with an `only`
+line that runs the recorder's cases (`BUN_TEST_INPUT_*`) and none of the file's
+other upstream tests.
+
 ## Upstream patch files
 
 Existing Bun files changed by `patches/01-effect-seams.patch`:
@@ -123,6 +151,15 @@ Effect registrations, regression fixtures and generated rule docs.
 their expected/actual type comparisons, regression cases and rule docs. It
 uses Bun's existing type queries. The generated rule index and reports are
 the only upstream-owned files touched by this patch.
+
+`patches/07-test-input-recorder.patch` adds `src/jsc/TestInputRecorder.rs`,
+`src/jsc/TestOwnReads.rs` and `src/runtime/cli/test/InputReuse.rs`, one `bun_glob`
+dependency of `bun_jsc` (with its `Cargo.lock` line), the recorder's
+cases in `test/cli/test/isolation.test.ts`, and small hooks in about thirty existing
+files: the resolver and module loading in `VirtualMachine.rs`,
+`RuntimeTranspilerStore.rs` and `jsc_hooks.rs`, `bun test` in
+`test_command.rs`, and the file APIs it records or marks (`node:fs`,
+`Bun.file`, `Bun.write`, `Bun.Glob`, `Bun.spawn`, the shell, SQLite, FFI).
 
 The Nix build also edits the existing `scripts/build/flags.ts` to disable
 debug-section compression for both variants.

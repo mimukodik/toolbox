@@ -1,0 +1,3997 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index ba5d65e0c..7a81297ac 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -1083,6 +1083,7 @@ dependencies = [
+  "bun_errno",
+  "bun_event_loop",
+  "bun_exe_format",
++ "bun_glob",
+  "bun_hash",
+  "bun_http",
+  "bun_http_types",
+diff --git a/src/bun_core/env_var.rs b/src/bun_core/env_var.rs
+index 945fc49da..bd06f094c 100644
+--- a/src/bun_core/env_var.rs
++++ b/src/bun_core/env_var.rs
+@@ -53,6 +53,18 @@ new!(pub BUN_BYTECODE_DIGEST_OUT: string, "BUN_BYTECODE_DIGEST_OUT", {});
+ new!(pub BUN_BYTECODE_ORDER_NAMES_OUT: string, "BUN_BYTECODE_ORDER_NAMES_OUT", {});
+ // A compiled executable writes the payload order file of this run here at exit; `%p` in the path becomes the pid.
+ new!(pub BUN_BYTECODE_ORDER_OUT: string, "BUN_BYTECODE_ORDER_OUT", {});
++// `bun test --isolate` writes one record of its inputs per test file into this directory.
++new!(pub BUN_TEST_INPUT_RECORD_DIR: string, "BUN_TEST_INPUT_RECORD_DIR", {});
++// With a record directory: "1" skips test files whose record still holds and counts them as it says; "explain" also says why each other file runs; "check" runs every file and fails when one whose record held has other counts.
++new!(pub BUN_TEST_INPUT_REUSE: string, "BUN_TEST_INPUT_REUSE", {});
++// With BUN_TEST_INPUT_REUSE: a file to write one JSON line per test file to, saying whether its record held and why not.
++new!(pub BUN_TEST_INPUT_REUSE_REPORT: string, "BUN_TEST_INPUT_REUSE_REPORT", {});
++// Part of the fingerprint of every record, for what the caller knows changes outcomes, such as the version of a database.
++new!(pub BUN_TEST_INPUT_RECORD_SALT: string, "BUN_TEST_INPUT_RECORD_SALT", {});
++// Comma-separated names of environment variables whose values are part of the fingerprint of every record.
++new!(pub BUN_TEST_INPUT_RECORD_ENV: string, "BUN_TEST_INPUT_RECORD_ENV", {});
++// Internal: what a `--parallel` coordinator hands its workers, so they record its fingerprint.
++new!(pub BUN_TEST_INPUT_RECORD_FINGERPRINT: string, "BUN_TEST_INPUT_RECORD_FINGERPRINT", {});
+ new!(pub BUN_COMPILE_TARGET_TARBALL_URL: string, "BUN_COMPILE_TARGET_TARBALL_URL", {});
+ // JavaScriptCore's option of that name: the engine logs the phases of an AOT build. The front end logs its stages beside them.
+ new!(pub BUN_JSC_logAOTPhaseTimes: boolean, "BUN_JSC_logAOTPhaseTimes", { default: false });
+diff --git a/src/jsc/Cargo.toml b/src/jsc/Cargo.toml
+index ef2194a25..fe73e35ec 100644
+--- a/src/jsc/Cargo.toml
++++ b/src/jsc/Cargo.toml
+@@ -31,6 +31,7 @@ bun_crash_handler.workspace = true
+ bun_dotenv.workspace = true
+ bun_event_loop.workspace = true
+ bun_exe_format.workspace = true
++bun_glob.workspace = true
+ bun_hash.workspace = true
+ bun_http.workspace = true
+ bun_http_types.workspace = true
+diff --git a/src/jsc/NodeModuleModule.rs b/src/jsc/NodeModuleModule.rs
+index 9e91adccf..d6357fb5b 100644
+--- a/src/jsc/NodeModuleModule.rs
++++ b/src/jsc/NodeModuleModule.rs
+@@ -133,6 +133,7 @@ fn on_require_extension_modify(
+     value: JSValue,
+ ) -> Result<(), bun_alloc::AllocError> {
+     let vm = global.bun_vm();
++    crate::test_input_recorder::mark(vm, b"require-extensions");
+     let is_built_in = DEFAULT_LOADERS.get(str).is_some();
+ 
+     vm.commonjs_custom_extensions.with_mut(|extensions| {
+@@ -171,6 +172,7 @@ fn on_require_extension_modify_non_function(
+     str: &[u8],
+ ) -> Result<(), bun_alloc::AllocError> {
+     let vm = global.bun_vm();
++    crate::test_input_recorder::mark(vm, b"require-extensions");
+     let is_built_in = DEFAULT_LOADERS.get(str).is_some();
+ 
+     if let Some(prev) = (vm.commonjs_custom_extensions).with_mut(|it| it.fetch_swap_remove(str)) {
+diff --git a/src/jsc/RuntimeTranspilerStore.rs b/src/jsc/RuntimeTranspilerStore.rs
+index 44f4aa4ab..dad45f9d1 100644
+--- a/src/jsc/RuntimeTranspilerStore.rs
++++ b/src/jsc/RuntimeTranspilerStore.rs
+@@ -353,6 +353,8 @@ impl RuntimeTranspilerStore {
+                 resolved_source,
+                 generation_number: self.generation_number.load(Ordering::SeqCst),
+                 has_plugins: global_object.has_plugins(),
++                record_input: crate::test_input_recorder::recording_token(vm),
++                input_sha256: None,
+                 parse_error: None,
+                 work_task: WorkPoolTask {
+                     node: Default::default(),
+@@ -412,6 +414,10 @@ pub struct TranspilerJob {
+     pub(crate) generation_number: u32,
+     /// Macros load through `Bun.plugin()` callbacks, which the pool thread's VM lacks, so the JS thread must run them.
+     has_plugins: bool,
++    /// The test input recorder is on, with its token for the current file: the pool thread hashes the source it read into
++    /// `input_sha256`, with whether it was virtual.
++    record_input: Option<u32>,
++    input_sha256: Option<([u8; 32], bool)>,
+     pub(crate) log: bun_ast::Log,
+     pub(crate) parse_error: Option<crate::CrateError>,
+     /// Moved out by `run_from_js_thread`; dropped with the slot otherwise.
+@@ -530,6 +536,18 @@ impl TranspilerJob {
+             ),
+             Some(e) => (String::clone_utf8(&self.path_text), Err(e)),
+             None => {
++                if let (Some(token), Some((sha256, is_virtual))) =
++                    (self.record_input, self.input_sha256)
++                {
++                    crate::test_input_recorder::did_hash_source(
++                        vm,
++                        token,
++                        &self.path_text,
++                        loader,
++                        sha256,
++                        is_virtual,
++                    );
++                }
+                 let mut resolved_source = core::mem::take(&mut self.resolved_source);
+                 let out = core::mem::take(&mut self.non_threadsafe_input_specifier);
+                 debug_assert!(resolved_source.source_url.is_empty());
+@@ -775,6 +793,7 @@ impl TranspilerJob {
+         if let Some(own) = &this.aot_package_config {
+             parse_options.apply_aot_package_config(own);
+         }
++        let has_virtual_source = parse_options.virtual_source.is_some();
+         let parse_result = transpiler
+             .parse_maybe_return_file_only_allow_shared_buffer::<false, false>(parse_options, None);
+ 
+@@ -791,6 +810,10 @@ impl TranspilerJob {
+             this.parse_error = Some(crate::CrateError::ParseError);
+             return;
+         };
++        if this.record_input.is_some() {
++            let sha256 = crate::test_input_recorder::source_hash(&parse_result.source.contents);
++            this.input_sha256 = Some((sha256, has_virtual_source));
++        }
+ 
+         // SAFETY: leaf scalar field read; see `vm` note above. Inlined
+         // `VirtualMachine::use_isolation_source_provider_cache` to avoid forming
+diff --git a/src/jsc/TestInputRecorder.rs b/src/jsc/TestInputRecorder.rs
+new file mode 100644
+index 000000000..e9788a1e1
+--- /dev/null
++++ b/src/jsc/TestInputRecorder.rs
+@@ -0,0 +1,994 @@
++//! `BUN_TEST_INPUT_RECORD_DIR=<dir>` with `bun test --isolate`: for every test file, write
++//! `<dir>/<path relative to the project root, URI-component-encoded>.json` with what the file
++//! depended on: every resolution made while it was the current file (question and answer), every
++//! module it loaded with a hash of the bytes this process transpiled for it, the files that answered
++//! a resolution but were never loaded, what it did that a record can't replay, and its outcome counts.
++//!
++//! Paths under the project root are written relative to it, so a record holds in another checkout;
++//! a question's specifier, importer and `paths` say so with `specifierFromRoot`, `importerFromRoot`
++//! and `pathsFromRoot`. Each resolution carries `check`, a hash of its answer as written: asking the
++//! resolver the same question again gives the same `check` when the answer and its details are the same.
++//!
++//! Files run one at a time on the VM's thread, so the current file is state of the VM, set by
++//! [`will_run_file`] and cleared when the returned [`FileRecording`] ends. Work of a finished
++//! file that still resolves, loads or marks afterwards is counted as `unattributedBefore` in the next
++//! record. An async transpile carries the number of the file that started it, so one that completes
++//! while a later file is current is counted in that file's `lateFromEarlierFiles` instead of
++//! listed as its module. Worker VMs have no recorder.
++
++use core::cell::{OnceCell, RefCell};
++use core::ffi::{CStr, c_char};
++use std::io::Write as _;
++
++use bun_ast::Loader;
++use bun_collections::StringHashMap;
++use bun_core::String as BunString;
++use bun_resolver::Result as ResolverResult;
++
++use crate::test_own_reads::{Look, OwnReads};
++use crate::virtual_machine::{ResolveMode, VirtualMachine};
++use crate::{JSGlobalObject, JSValue};
++
++/// The record format. 3 adds `reads`: a record without them did not record its own reads, so it
++/// must not be taken for one that read nothing.
++pub const RECORD_VERSION: u32 = 3;
++
++pub struct TestInputRecorder {
++    dir: Box<[u8]>,
++    root: Box<[u8]>,
++    /// What the run was started with, one `name=value` per line; see `InputReuse::fingerprint`.
++    fingerprint: Box<[u8]>,
++    fingerprint_hash: [u8; 32],
++    state: RefCell<State>,
++}
++
++#[derive(Default)]
++struct State {
++    /// By module key (absolute path). What the isolation source cache serves for a key was
++    /// transpiled from one of the sources this process read for it, so the hash is unambiguous
++    /// unless two reads differed.
++    sources: StringHashMap<Source>,
++    file: Option<FileState>,
++    /// Resolutions under way, innermost last: an `onResolve` callback can resolve again.
++    open: Vec<Option<Found>>,
++    unattributed: u32,
++    /// Counts the files started; the current file's number while `file` is set.
++    file_number: u32,
++}
++
++struct Source {
++    sha256: [u8; 32],
++    loader: Loader,
++    is_virtual: bool,
++    changed_during_run: bool,
++}
++
++#[derive(Default)]
++struct FileState {
++    resolutions: Vec<Box<[u8]>>,
++    seen_resolutions: StringHashMap<()>,
++    modules: Vec<(Box<[u8]>, bool)>,
++    module_index: StringHashMap<usize>,
++    /// Absolute paths that answered a resolution.
++    answers: Vec<Box<[u8]>>,
++    seen_answers: StringHashMap<()>,
++    /// What the file did that a record can't replay, by name.
++    marks: Vec<Box<[u8]>>,
++    unattributed_before: u32,
++    /// Async transpiles started by an earlier file that completed while this file was current.
++    late_from_earlier_files: u32,
++    /// What the file's own code looked at on the file system.
++    own: OwnReads,
++}
++
++/// What the resolver's result says about the module, beyond its path.
++struct Found {
++    path: Box<[u8]>,
++    json: Box<[u8]>,
++}
++
++/// `fingerprint` describes the run; records of another fingerprint are not reused.
++pub fn enable(vm: &VirtualMachine, fingerprint: &[u8]) {
++    let Some(dir) = bun_core::env_var::BUN_TEST_INPUT_RECORD_DIR.get_not_empty() else {
++        return;
++    };
++    let root = vm.top_level_dir();
++    let dir = resolve_from(root, &[dir]);
++    let recorder = TestInputRecorder {
++        dir: dir.into_boxed_slice(),
++        root: Box::from(root),
++        fingerprint: Box::from(fingerprint),
++        fingerprint_hash: source_hash(fingerprint),
++        state: RefCell::default(),
++    };
++    let _ = vm
++        .test_isolation_state
++        .input_recorder
++        .set(Box::new(recorder));
++}
++
++/// When recording, the number of the current file (0 between files): asked on the JS thread when an async
++/// transpile is scheduled, and handed back to [`did_hash_source`] when it completes.
++pub fn recording_token(vm: &VirtualMachine) -> Option<u32> {
++    let state = recorder_of(vm)?.state.borrow();
++    Some(if state.file.is_some() {
++        state.file_number
++    } else {
++        0
++    })
++}
++
++/// SHA-256 of the bytes given to the transpiler; safe on the transpiler pool's threads.
++pub fn source_hash(contents: &[u8]) -> [u8; 32] {
++    let mut sha256 = [0u8; 32];
++    bun_sha_hmac::sha::hashers::SHA256::hash(contents, &mut sha256);
++    sha256
++}
++
++pub fn write_hex(out: &mut Vec<u8>, bytes: &[u8]) {
++    for byte in bytes {
++        let _ = write!(out, "{byte:02x}");
++    }
++}
++
++fn recorder_of(vm: &VirtualMachine) -> Option<&TestInputRecorder> {
++    vm.test_isolation_state.input_recorder.get().map(|it| &**it)
++}
++
++pub type InputRecorderCell = OnceCell<Box<TestInputRecorder>>;
++
++pub struct PendingResolve<'a> {
++    recording: Option<(&'a TestInputRecorder, Question)>,
++}
++
++struct Question {
++    specifier: Box<[u8]>,
++    importer: Box<[u8]>,
++    importer_is_file: bool,
++    kind: &'static str,
++    paths: Vec<Box<[u8]>>,
++}
++
++/// At the start of `VirtualMachine::resolve_maybe_needs_trailing_slash`.
++pub fn will_resolve<'a>(
++    global: &'a JSGlobalObject,
++    specifier: &BunString,
++    source: &BunString,
++    mode: ResolveMode,
++    importer_is_file: bool,
++) -> PendingResolve<'a> {
++    let vm = global.bun_vm();
++    let Some(recorder) = recorder_of(vm) else {
++        return PendingResolve { recording: None };
++    };
++    let mut state = recorder.state.borrow_mut();
++    if state.file.is_none() {
++        state.unattributed += 1;
++        return PendingResolve { recording: None };
++    }
++    state.open.push(None);
++    let paths = vm
++        .transpiler
++        .get()
++        .resolver
++        .custom_dir_paths
++        .map(|paths| {
++            paths
++                .iter()
++                .map(|it| Box::from(it.to_utf8().slice()))
++                .collect()
++        })
++        .unwrap_or_default();
++    PendingResolve {
++        recording: Some((
++            recorder,
++            Question {
++                specifier: Box::from(specifier.to_utf8().slice()),
++                importer: Box::from(source.to_utf8().slice()),
++                importer_is_file,
++                kind: kind_of(mode),
++                paths,
++            },
++        )),
++    }
++}
++
++fn kind_of(mode: ResolveMode) -> &'static str {
++    match mode {
++        ResolveMode::Esm => "import",
++        ResolveMode::Require => "require",
++        ResolveMode::RequireResolve => "require-resolve",
++        ResolveMode::EsmResolve => "esm-resolve",
++    }
++}
++
++impl PendingResolve<'_> {
++    /// Passes `resolved` through.
++    pub fn did_resolve(
++        mut self,
++        resolved: Result<BunString, JSValue>,
++        by_plugin: bool,
++    ) -> Result<BunString, JSValue> {
++        let Some((recorder, question)) = self.recording.take() else {
++            return resolved;
++        };
++        let mut state = recorder.state.borrow_mut();
++        let found = state.open.pop().flatten();
++        let answer = resolved.as_ref().ok().map(|it| it.to_utf8());
++        let answer = answer.as_ref().map(|it| it.slice());
++        let found = found.filter(|found| answer == Some(&*found.path));
++        let line = recorder.resolution_line(&question, answer, by_plugin, found.as_ref());
++        if let Some(file) = state.file.as_mut() {
++            file.add_resolution(line, answer);
++        }
++        resolved
++    }
++}
++
++impl Drop for PendingResolve<'_> {
++    fn drop(&mut self) {
++        if let Some((recorder, _)) = self.recording.take() {
++            recorder.state.borrow_mut().open.pop();
++        }
++    }
++}
++
++/// In `VirtualMachine::_resolve`, with the resolver's answer to the innermost resolution.
++pub fn did_find(vm: &VirtualMachine, result: &ResolverResult<'_>) {
++    let Some(recorder) = recorder_of(vm) else {
++        return;
++    };
++    let mut state = recorder.state.borrow_mut();
++    let Some(slot) = state.open.last_mut() else {
++        return;
++    };
++    *slot = recorder.found(result);
++}
++
++/// A resolution made by calling the resolver itself: a preload, or the test file named on the
++/// command line.
++pub fn did_resolve_directly(
++    vm: &VirtualMachine,
++    kind: &'static str,
++    specifier: &[u8],
++    dir: &[u8],
++    result: &ResolverResult<'_>,
++) {
++    let Some(recorder) = recorder_of(vm) else {
++        return;
++    };
++    let found = recorder.found(result);
++    let question = Question {
++        specifier: Box::from(specifier),
++        importer: Box::from(dir),
++        importer_is_file: false,
++        kind,
++        paths: Vec::new(),
++    };
++    let answer = found.as_ref().map(|found| &*found.path);
++    let line = recorder.resolution_line(&question, answer, false, found.as_ref());
++    let mut state = recorder.state.borrow_mut();
++    match state.file.as_mut() {
++        Some(file) => file.add_resolution(line, answer),
++        None => state.unattributed += 1,
++    }
++}
++
++/// Where the transpiler has read a module's source: `contents` are the bytes it transpiles.
++pub fn did_read_source(
++    vm: &VirtualMachine,
++    path: &[u8],
++    loader: Loader,
++    contents: &[u8],
++    is_virtual: bool,
++) {
++    if let Some(token) = recording_token(vm) {
++        did_hash_source(vm, token, path, loader, source_hash(contents), is_virtual);
++    }
++}
++
++/// An async transpile hashed its source on the pool thread; this records it on the JS thread when the job completes.
++pub fn did_hash_source(
++    vm: &VirtualMachine,
++    token: u32,
++    path: &[u8],
++    loader: Loader,
++    sha256: [u8; 32],
++    is_virtual: bool,
++) {
++    let Some(recorder) = recorder_of(vm) else {
++        return;
++    };
++    let path = module_file(path);
++    let mut state = recorder.state.borrow_mut();
++    match state.sources.get_mut(path) {
++        Some(source) => {
++            source.changed_during_run |= source.sha256 != sha256;
++            source.sha256 = sha256;
++            source.loader = loader;
++            source.is_virtual = is_virtual;
++        }
++        None => {
++            let source = Source {
++                sha256,
++                loader,
++                is_virtual,
++                changed_during_run: false,
++            };
++            bun_core::handle_oom(state.sources.put(path, source));
++        }
++    }
++    if state.file.is_some() && token == state.file_number {
++        state.note_module(path, false);
++    } else if let Some(file) = state.file.as_mut() {
++        file.late_from_earlier_files += 1;
++    } else {
++        state.unattributed += 1;
++    }
++}
++
++/// `IsolatedModuleCache::lookup` found a provider for `key`.
++#[unsafe(no_mangle)]
++pub extern "C" fn Bun__TestInputRecorder__didServeCachedSource(
++    vm: &VirtualMachine,
++    key: &BunString,
++) {
++    let Some(recorder) = recorder_of(vm) else {
++        return;
++    };
++    let key = key.to_utf8();
++    recorder.state.borrow_mut().note_module(module_file(key.slice()), true);
++}
++
++/// The file a module key loads. The original of a mocked module is loaded under the file's path with
++/// `?actual` (or `&actual`, any number of times, then maybe `&spy`; see `withoutOriginalModuleQuery`
++/// in `BunPlugin.cpp`), and its source is the file's, so it is the same input as the plain import.
++fn module_file(key: &[u8]) -> &[u8] {
++    let mut path = key.strip_suffix(b"&spy").unwrap_or(key);
++    while let Some(rest) = path
++        .strip_suffix(b"?actual")
++        .or_else(|| path.strip_suffix(b"&actual"))
++    {
++        path = rest;
++    }
++    path
++}
++
++/// The current file did something whose effect a record can't replay, such as spawning a process:
++/// its record names it and is not reused.
++pub fn mark(vm: &VirtualMachine, name: &[u8]) {
++    let Some(recorder) = recorder_of(vm) else {
++        return;
++    };
++    let mut state = recorder.state.borrow_mut();
++    match state.file.as_mut() {
++        Some(file) => {
++            if !file.marks.iter().any(|it| &**it == name) {
++                file.marks.push(Box::from(name));
++            }
++        }
++        None => state.unattributed += 1,
++    }
++}
++
++/// Whether this VM records, so a hook can skip work that only recording needs.
++pub fn is_recording(vm: &VirtualMachine) -> bool {
++    recorder_of(vm).is_some()
++}
++
++/// The current file's own code looks at `path` (absolute, or relative to the working directory now)
++/// the way `look` says. Called on the JS thread when the call is made, also for async calls, so the
++/// file that started the work is the one credited; a look while no file is current makes the next
++/// record not reusable.
++pub fn own_read(vm: &VirtualMachine, look: Look, path: &[u8]) {
++    own_read_with(vm, look, path, b"");
++}
++
++/// [`own_read`] with what else the look needs, such as a glob's pattern.
++pub fn own_read_with(vm: &VirtualMachine, look: Look, path: &[u8], extra: &[u8]) {
++    let Some(recorder) = recorder_of(vm) else {
++        return;
++    };
++    let path = absolute_now(path);
++    let mut state = recorder.state.borrow_mut();
++    match state.file.as_mut() {
++        Some(file) => file.own.read(look, &path, extra),
++        None => state.unattributed += 1,
++    }
++}
++
++/// The current file's own code is about to write, create or remove `path`, or, with `prefix`, any
++/// path that starts with it (`fs.mkdtemp`). What it looked at there is observed first. A write while
++/// no file is current changes no record: every look of the last file was observed when its record
++/// was written, and the next file's looks see what the write left.
++pub fn own_write(vm: &VirtualMachine, path: &[u8], prefix: bool) {
++    let Some(recorder) = recorder_of(vm) else {
++        return;
++    };
++    let mut state = recorder.state.borrow_mut();
++    if let Some(file) = state.file.as_mut() {
++        file.own.write(&recorder.root, &absolute_now(path), prefix);
++    }
++}
++
++/// Looks at a path again the way a record says it was looked at, for validation.
++pub fn observe_again(vm: &VirtualMachine, look: Look, path: &[u8], extra: &[u8]) -> Box<[u8]> {
++    crate::test_own_reads::observe(vm.top_level_dir(), look, path, extra)
++}
++
++/// `path.resolve(first, ...rest)` for an absolute `first`: joined, without `.` and `..`.
++fn resolve_from(first: &[u8], rest: &[&[u8]]) -> Vec<u8> {
++    bun_paths::resolve_path::join_abs_string::<bun_paths::platform::Auto>(first, rest).to_vec()
++}
++
++/// `path` made absolute against the working directory as it is now, without `.` and `..`.
++fn absolute_now(path: &[u8]) -> Vec<u8> {
++    if bun_paths::is_absolute(path) {
++        return resolve_from(path, &[&b"."[..]]);
++    }
++    let mut buf = bun_paths::path_buffer_pool::get();
++    match bun_sys::getcwd_z(&mut *buf) {
++        Ok(cwd) => resolve_from(cwd.as_bytes(), &[path]),
++        Err(_) => path.to_vec(),
++    }
++}
++
++/// [`mark`] on the VM of this thread, for code that has none at hand.
++pub fn mark_current(name: &[u8]) {
++    if let Some(vm) = VirtualMachine::get_or_null() {
++        mark(vm, name);
++    }
++}
++
++/// [`mark`] from C++; `name` is a string literal.
++#[unsafe(no_mangle)]
++pub extern "C" fn Bun__TestInputRecorder__mark(vm: &VirtualMachine, name: *const c_char) {
++    // SAFETY: the callers pass a NUL-terminated literal.
++    mark(vm, unsafe { CStr::from_ptr(name) }.to_bytes());
++}
++
++impl State {
++    fn note_module(&mut self, path: &[u8], cached: bool) {
++        if !bun_paths::is_absolute(path) {
++            return;
++        }
++        let Some(file) = self.file.as_mut() else {
++            self.unattributed += 1;
++            return;
++        };
++        match file.module_index.get(path) {
++            Some(&index) => file.modules[index].1 &= cached,
++            None => {
++                bun_core::handle_oom(file.module_index.put(path, file.modules.len()));
++                file.modules.push((Box::from(path), cached));
++            }
++        }
++    }
++}
++
++impl FileState {
++    fn add_resolution(&mut self, line: Box<[u8]>, answer: Option<&[u8]>) {
++        if !self.seen_resolutions.contains_key(&*line) {
++            bun_core::handle_oom(self.seen_resolutions.put(&line, ()));
++            self.resolutions.push(line);
++        }
++        if let Some(answer) = answer.filter(|it| bun_paths::is_absolute(it))
++            && !self.seen_answers.contains_key(answer)
++        {
++            bun_core::handle_oom(self.seen_answers.put(answer, ()));
++            self.answers.push(Box::from(answer));
++        }
++    }
++}
++
++/// Counts of the reporter's summary, by name, at a point in the run.
++pub type Counts = [(&'static str, u32); 6];
++
++pub struct FileRecording<'a> {
++    vm: &'a VirtualMachine,
++    recording: Option<(&'a TestInputRecorder, Box<[u8]>, Counts)>,
++}
++
++/// At the start of `TestCommand::run`, before the test file is resolved.
++pub fn will_run_file<'a>(
++    vm: &'a VirtualMachine,
++    file_name: &[u8],
++    counts: Counts,
++) -> FileRecording<'a> {
++    let Some(recorder) = recorder_of(vm) else {
++        return FileRecording {
++            vm,
++            recording: None,
++        };
++    };
++    let mut state = recorder.state.borrow_mut();
++    let unattributed_before = core::mem::take(&mut state.unattributed);
++    state.file_number += 1;
++    state.file = Some(FileState {
++        unattributed_before,
++        ..Default::default()
++    });
++    FileRecording {
++        vm,
++        recording: Some((recorder, Box::from(file_name), counts)),
++    }
++}
++
++impl FileRecording<'_> {
++    /// After the file's last test and hook, with the counts as they are now.
++    pub fn did_run_file(mut self, file_path: &[u8], counts: Counts) {
++        if let Some((recorder, _, before)) = self.recording.take() {
++            recorder.write_record(self.vm, file_path, Some((&before, &counts)));
++        }
++    }
++}
++
++impl Drop for FileRecording<'_> {
++    /// `TestCommand::run` returned early with an error: the record says so and has no outcome.
++    fn drop(&mut self) {
++        if let Some((recorder, file_name, _)) = self.recording.take() {
++            recorder.write_record(self.vm, &file_name, None);
++        }
++    }
++}
++
++/// Where the record of the test file at `file_path` is; `None` when not recording.
++pub fn record_path(vm: &VirtualMachine, file_path: &[u8]) -> Option<Vec<u8>> {
++    Some(recorder_of(vm)?.record_path(file_path))
++}
++
++/// The fingerprint of this run as records write it; `None` when not recording.
++pub fn fingerprint_hex(vm: &VirtualMachine) -> Option<Vec<u8>> {
++    let mut out = Vec::with_capacity(64);
++    write_hex(&mut out, &recorder_of(vm)?.fingerprint_hash);
++    Some(out)
++}
++
++/// The fingerprint text records carry; `None` when not recording.
++pub fn fingerprint_text(vm: &VirtualMachine) -> Option<&[u8]> {
++    Some(&recorder_of(vm)?.fingerprint)
++}
++
++/// A path as a record writes it, made absolute again: relative ones are under the project root.
++pub fn from_root(vm: &VirtualMachine, path: &[u8]) -> Vec<u8> {
++    let root = vm.top_level_dir();
++    let mut out = root.to_vec();
++    match path {
++        b"." => {}
++        b"./" => out.push(bun_paths::SEP),
++        _ => {
++            if !out.last().is_some_and(|&c| bun_paths::is_sep_native(c)) {
++                out.push(bun_paths::SEP);
++            }
++            out.extend_from_slice(path);
++        }
++    }
++    out
++}
++
++/// What a package with the "aot" condition says about JSX, decorators and class fields of the
++/// TypeScript file at `path`, which both transpile paths put in place of the run's options
++/// (`ParseOptions::apply_aot_package_config`). The resolver's result does not carry it. `None`
++/// when no such package config applies, which is always so without the "aot" condition.
++pub fn aot_config_check(vm: &VirtualMachine, path: &[u8]) -> Option<[u8; 32]> {
++    let own = vm
++        .transpiler
++        .with_mut(|t| t.resolver.aot_package_config(path))?;
++    let jsx = own.merge_jsx(bun_bundler::options_impl::jsx::Pragma {
++        development: vm.transpiler.get().options.jsx.development,
++        ..Default::default()
++    });
++    let text = format!(
++        "{jsx:?}|{}|{}|{:?}",
++        own.emit_decorator_metadata, own.experimental_decorators, own.use_define_for_class_fields
++    );
++    Some(source_hash(text.as_bytes()))
++}
++
++/// A recorded question with its paths made absolute again.
++pub struct Asked<'a> {
++    pub kind: &'a [u8],
++    pub specifier: &'a [u8],
++    pub importer: &'a [u8],
++    pub importer_is_file: bool,
++    pub paths: &'a [Box<[u8]>],
++}
++
++/// Asks the resolver `asked` again, the way it was asked while recording but without plugins, and
++/// returns the `check` of the answer as a record would write it. `None` when it can't be asked again.
++/// Holds the API lock: a failed resolution makes an error object.
++pub fn check_again(vm: &VirtualMachine, asked: &Asked<'_>) -> Option<[u8; 32]> {
++    let recorder = recorder_of(vm)?;
++    let mut part = Vec::with_capacity(256);
++    match asked.kind {
++        b"entry" | b"preload" => {
++            let mut log = bun_ast::Log::default();
++            let prev_log = vm.transpiler.get().log;
++            vm.transpiler.with_mut(|t| t.set_log(&raw mut log));
++            scopeguard::defer! {
++                vm.transpiler.with_mut(|t| t.set_log(prev_log));
++            }
++            let found = if asked.kind == b"entry" {
++                let dot_slash = OnceCell::new();
++                match vm
++                    .transpiler
++                    .with_mut(|t| t.resolve_entry_point(asked.specifier, &dot_slash))
++                {
++                    Ok(result) => recorder.found(&result),
++                    Err(_) => None,
++                }
++            } else {
++                let global_cache = if vm.standalone_module_graph.is_none() {
++                    bun_resolver::GlobalCache::read_only
++                } else {
++                    bun_resolver::GlobalCache::disable
++                };
++                match vm.transpiler.with_mut(|t| {
++                    t.resolver.resolve_and_auto_install(
++                        asked.importer,
++                        asked.specifier,
++                        bun_ast::ImportKind::Stmt,
++                        global_cache,
++                    )
++                }) {
++                    bun_resolver::ResultUnion::Success(result) => recorder.found(&result),
++                    _ => None,
++                }
++            };
++            let answer = found.as_ref().map(|found| &*found.path);
++            recorder.write_answer(&mut part, answer, false, found.as_ref());
++        }
++        kind => {
++            let mode = match kind {
++                b"import" => ResolveMode::Esm,
++                b"require" => ResolveMode::Require,
++                b"require-resolve" => ResolveMode::RequireResolve,
++                b"esm-resolve" => ResolveMode::EsmResolve,
++                _ => return None,
++            };
++            let global = vm.global();
++            let specifier = BunString::clone_utf8(asked.specifier);
++            let importer = BunString::clone_utf8(asked.importer);
++            let paths: Vec<BunString> = asked
++                .paths
++                .iter()
++                .map(|it| BunString::clone_utf8(it))
++                .collect();
++            if !paths.is_empty() {
++                // SAFETY: `paths` outlives the resolution below; the slot is cleared after it.
++                let paths = unsafe { bun_ptr::detach_lifetime(&paths[..]) };
++                vm.transpiler
++                    .with_mut(|t| t.resolver.custom_dir_paths = Some(paths));
++            }
++            recorder.state.borrow_mut().open.push(None);
++            let global_cache = vm.transpiler.get().resolver.opts.global_cache;
++            let resolved = if asked.importer_is_file {
++                VirtualMachine::resolve_without_on_resolve::<true>(
++                    global,
++                    &specifier,
++                    &importer,
++                    None,
++                    mode,
++                    global_cache,
++                )
++            } else {
++                VirtualMachine::resolve_without_on_resolve::<false>(
++                    global,
++                    &specifier,
++                    &importer,
++                    None,
++                    mode,
++                    global_cache,
++                )
++            };
++            let found = recorder.state.borrow_mut().open.pop().flatten();
++            vm.transpiler
++                .with_mut(|t| t.resolver.custom_dir_paths = None);
++            let answer = match resolved {
++                Ok(Ok(answer)) => Some(answer),
++                Ok(Err(_)) => None,
++                Err(_) => {
++                    global.clear_exception();
++                    return None;
++                }
++            };
++            let answer = answer.as_ref().map(|it| it.to_utf8());
++            let answer = answer.as_ref().map(|it| it.slice());
++            let found = found.filter(|found| answer == Some(&*found.path));
++            recorder.write_answer(&mut part, answer, false, found.as_ref());
++        }
++    }
++    Some(source_hash(&part))
++}
++
++impl TestInputRecorder {
++    fn found(&self, result: &ResolverResult<'_>) -> Option<Found> {
++        let path = result.path_const()?.text;
++        let mut json = Vec::with_capacity(128);
++        let _ = write!(
++            json,
++            ",\"moduleType\":\"{:?}\",\"flags\":{}",
++            result.module_type,
++            result.flags.bits()
++        );
++        if let Some(package_json) = result.package_json {
++            json.extend_from_slice(b",\"packageJson\":");
++            self.write_path(&mut json, package_json.source.path.text);
++        }
++        Some(Found {
++            path: Box::from(path),
++            json: json.into_boxed_slice(),
++        })
++    }
++
++    /// One entry of `resolutions`: the question, the answer with its details, and the `check` of the answer.
++    fn resolution_line(
++        &self,
++        question: &Question,
++        answer: Option<&[u8]>,
++        by_plugin: bool,
++        found: Option<&Found>,
++    ) -> Box<[u8]> {
++        let mut line = Vec::with_capacity(320);
++        self.write_question(&mut line, question);
++        let start = line.len();
++        self.write_answer(&mut line, answer, by_plugin, found);
++        let check = source_hash(&line[start..]);
++        line.extend_from_slice(b",\"check\":\"");
++        write_hex(&mut line, &check);
++        line.extend_from_slice(b"\"}");
++        line.into_boxed_slice()
++    }
++
++    fn write_answer(
++        &self,
++        out: &mut Vec<u8>,
++        answer: Option<&[u8]>,
++        by_plugin: bool,
++        found: Option<&Found>,
++    ) {
++        out.extend_from_slice(b",\"answer\":");
++        match answer {
++            Some(path) => {
++                self.write_path(out, path);
++            }
++            None => out.extend_from_slice(b"null"),
++        }
++        if by_plugin {
++            out.extend_from_slice(b",\"plugin\":true");
++        }
++        if let Some(found) = found {
++            out.extend_from_slice(&found.json);
++        }
++    }
++
++    fn write_question(&self, out: &mut Vec<u8>, question: &Question) {
++        out.extend_from_slice(b"{\"specifier\":");
++        let specifier_from_root = self.write_path(out, &question.specifier);
++        out.extend_from_slice(b",\"importer\":");
++        let importer_from_root = self.write_path(out, &question.importer);
++        let _ = write!(out, ",\"kind\":\"{}\"", question.kind);
++        if !question.importer_is_file {
++            out.extend_from_slice(b",\"importerIsDir\":true");
++        }
++        if specifier_from_root {
++            out.extend_from_slice(b",\"specifierFromRoot\":true");
++        }
++        if importer_from_root {
++            out.extend_from_slice(b",\"importerFromRoot\":true");
++        }
++        if !question.paths.is_empty() {
++            let mut from_root = Vec::new();
++            out.extend_from_slice(b",\"paths\":[");
++            for (i, path) in question.paths.iter().enumerate() {
++                if i > 0 {
++                    out.push(b',');
++                }
++                if self.write_path(out, path) {
++                    from_root.push(i);
++                }
++            }
++            out.push(b']');
++            if !from_root.is_empty() {
++                out.extend_from_slice(b",\"pathsFromRoot\":[");
++                for (n, i) in from_root.iter().enumerate() {
++                    let _ = write!(out, "{}{i}", if n > 0 { "," } else { "" });
++                }
++                out.push(b']');
++            }
++        }
++    }
++
++    /// Inside the root, relative to it; elsewhere as it is. Whether it was made relative.
++    fn write_path(&self, out: &mut Vec<u8>, path: &[u8]) -> bool {
++        let relative = self.relative(path);
++        let _ = write!(
++            out,
++            "{}",
++            bun_core::fmt::format_json_string_utf8(relative.unwrap_or(path), Default::default())
++        );
++        relative.is_some()
++    }
++
++    /// The root itself is `.`, and `./` with a separator after it.
++    fn relative<'p>(&self, path: &'p [u8]) -> Option<&'p [u8]> {
++        let rest = path.strip_prefix(&*self.root)?;
++        if rest.is_empty() {
++            return Some(b".");
++        }
++        if self.root.last().is_some_and(|&c| bun_paths::is_sep_native(c)) {
++            return Some(rest);
++        }
++        if !bun_paths::is_sep_native(rest[0]) {
++            return None;
++        }
++        Some(if rest.len() == 1 { b"./" } else { &rest[1..] })
++    }
++
++    fn write_record(
++        &self,
++        vm: &VirtualMachine,
++        file_path: &[u8],
++        counts: Option<(&Counts, &Counts)>,
++    ) {
++        let Some(file) = self.state.borrow_mut().file.take() else {
++            return;
++        };
++        let state = self.state.borrow();
++        let mut out = Vec::with_capacity(4096);
++        let _ = write!(out, "{{\"version\":{RECORD_VERSION},\"file\":");
++        self.write_path(&mut out, file_path);
++        let _ = write!(
++            out,
++            ",\"root\":{},\"fingerprint\":\"",
++            bun_core::fmt::format_json_string_utf8(&self.root, Default::default())
++        );
++        write_hex(&mut out, &self.fingerprint_hash);
++        out.extend_from_slice(b"\",\"outcome\":");
++        match counts {
++            Some((before, after)) => {
++                out.push(b'{');
++                for (i, ((name, before), (_, after))) in before.iter().zip(after).enumerate() {
++                    let comma = if i > 0 { "," } else { "" };
++                    let delta = after.wrapping_sub(*before);
++                    let _ = write!(out, "{comma}\"{name}\":{delta}");
++                }
++                out.push(b'}');
++            }
++            None => out.extend_from_slice(b"null,\"error\":true"),
++        }
++        let _ = write!(
++            out,
++            ",\"unattributedBefore\":{},\"lateFromEarlierFiles\":{},\"marks\":[",
++            file.unattributed_before, file.late_from_earlier_files
++        );
++        for (i, name) in file.marks.iter().enumerate() {
++            let _ = write!(
++                out,
++                "{}{}",
++                if i > 0 { "," } else { "" },
++                bun_core::fmt::format_json_string_utf8(name, Default::default())
++            );
++        }
++        out.extend_from_slice(b"],\"resolutions\":[");
++        for (i, line) in file.resolutions.iter().enumerate() {
++            out.extend_from_slice(if i > 0 { b",\n" } else { b"\n" });
++            out.extend_from_slice(line);
++        }
++        out.extend_from_slice(b"],\"modules\":[");
++        for (i, (path, cached)) in file.modules.iter().enumerate() {
++            out.extend_from_slice(if i > 0 { b",\n" } else { b"\n" });
++            out.extend_from_slice(b"{\"path\":");
++            self.write_path(&mut out, path);
++            match state.sources.get(&**path) {
++                Some(source) => {
++                    out.extend_from_slice(b",\"sha256\":\"");
++                    write_hex(&mut out, &source.sha256);
++                    let loader: &'static str = source.loader.into();
++                    let _ = write!(out, "\",\"loader\":\"{loader}\"");
++                    if source.is_virtual {
++                        out.extend_from_slice(b",\"virtual\":true");
++                    }
++                    if source.changed_during_run {
++                        out.extend_from_slice(b",\"changedDuringRun\":true");
++                    }
++                }
++                None => out.extend_from_slice(b",\"sha256\":null"),
++            }
++            if let Some(own) = aot_config_check(vm, path) {
++                out.extend_from_slice(b",\"aotConfig\":\"");
++                write_hex(&mut out, &own);
++                out.push(b'"');
++            }
++            if *cached {
++                out.extend_from_slice(b",\"cached\":true");
++            }
++            out.push(b'}');
++        }
++        // An answer that was never loaded, such as an `import()` the file did not wait for: hashed as it is now.
++        out.extend_from_slice(b"],\"answerFiles\":[");
++        let mut first = true;
++        for answer in &file.answers {
++            if file.module_index.contains_key(&**answer) {
++                continue;
++            }
++            out.extend_from_slice(if first { b"\n" } else { b",\n" });
++            first = false;
++            out.extend_from_slice(b"{\"path\":");
++            self.write_path(&mut out, answer);
++            match bun_sys::File::read_from(bun_sys::Fd::cwd(), answer) {
++                Ok(contents) => {
++                    out.extend_from_slice(b",\"sha256\":\"");
++                    write_hex(&mut out, &source_hash(&contents));
++                    out.extend_from_slice(b"\"}");
++                }
++                Err(_) => out.extend_from_slice(b",\"sha256\":null}"),
++            }
++        }
++        out.extend_from_slice(b"],\"reads\":[");
++        let mut own = file.own;
++        own.finish(&self.root);
++        for (i, read) in own.reads.iter().enumerate() {
++            out.extend_from_slice(if i > 0 { b",\n" } else { b"\n" });
++            let _ = write!(out, "{{\"look\":\"{}\",\"path\":", read.look.name());
++            self.write_path(&mut out, &read.path);
++            if !read.extra.is_empty() {
++                let _ = write!(
++                    out,
++                    ",\"extra\":{}",
++                    bun_core::fmt::format_json_string_utf8(&read.extra, Default::default())
++                );
++            }
++            let _ = write!(
++                out,
++                ",\"value\":{}}}",
++                bun_core::fmt::format_json_string_utf8(
++                    read.value.as_deref().unwrap_or(b""),
++                    Default::default()
++                )
++            );
++        }
++        out.extend_from_slice(b"]}\n");
++        drop(state);
++        self.write_file(file_path, &out);
++    }
++
++    fn record_path(&self, file_path: &[u8]) -> Vec<u8> {
++        let mut path = self.dir.to_vec();
++        if !path.last().is_some_and(|&c| bun_paths::is_sep_native(c)) {
++            path.push(bun_paths::SEP);
++        }
++        for &c in self.relative(file_path).unwrap_or(file_path) {
++            match c {
++                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' => path.push(c),
++                b'-' | b'_' | b'.' | b'!' | b'~' | b'*' | b'\'' | b'(' | b')' => path.push(c),
++                _ => {
++                    let _ = write!(path, "%{c:02X}");
++                }
++            }
++        }
++        path.extend_from_slice(b".json");
++        path
++    }
++
++    fn write_file(&self, file_path: &[u8], text: &[u8]) {
++        let path = self.record_path(file_path);
++        let mut tmp = path.clone();
++        let _ = write!(tmp, ".{}.tmp", std::process::id());
++        let tmp = bun_core::ZBox::from_vec(tmp);
++        let dest = bun_core::ZBox::from_vec(path);
++        let flags =
++            bun_sys::O::WRONLY | bun_sys::O::CREAT | bun_sys::O::TRUNC | bun_sys::O::CLOEXEC;
++        let result = bun_sys::File::make_open(tmp.as_bytes(), flags, 0o666)
++            .and_then(|f| f.write_all(text))
++            .and_then(|()| bun_sys::renameat(bun_sys::Fd::cwd(), &tmp, bun_sys::Fd::cwd(), &dest));
++        if let Err(err) = result {
++            let _ = bun_sys::unlink(&tmp);
++            bun_core::Output::err(
++                err,
++                "failed to write the test input record <b>{}<r>",
++                (bstr::BStr::new(dest.as_bytes()),),
++            );
++        }
++    }
++}
+diff --git a/src/jsc/TestOwnReads.rs b/src/jsc/TestOwnReads.rs
+new file mode 100644
+index 000000000..f15fa4c1c
+--- /dev/null
++++ b/src/jsc/TestOwnReads.rs
+@@ -0,0 +1,346 @@
++//! What a test file's own code read from the file system, as part of its input record.
++//!
++//! The JavaScript-facing file APIs (`node:fs` in all three forms, `Bun.file` and `Bun.write`,
++//! `Bun.Glob`, `fs.watch`) and the runner's snapshot files report each look at a path on the JS
++//! thread, when the call is made, so async work is credited to the file that started it. A look is
++//! not taken then: it is observed the way validation repeats it, the first time the file writes to
++//! the path or near it, or else when the record is written. So a read followed by the file's own
++//! write keeps what the path held before the write. A path the file wrote before it looked at it is
++//! not an input, and neither is anything under a directory it created.
++//!
++//! The resolver's and the module loader's reads are not here: resolutions are asked again and
++//! modules are hashed.
++
++use std::io::Write as _;
++
++use bun_collections::StringHashMap;
++
++/// One way of looking at a path; validation looks again the same way and compares.
++#[derive(Clone, Copy, PartialEq, Eq, Debug)]
++pub enum Look {
++    /// The bytes.
++    Content,
++    /// Type and size, following a symbolic link.
++    Stat,
++    /// Type and size of the path itself.
++    Lstat,
++    /// Whether it exists.
++    Exists,
++    /// A symbolic link's target.
++    Readlink,
++    /// The canonical path.
++    Realpath,
++    /// The names and types of a directory's entries.
++    List,
++    /// The same, for every directory below it too.
++    ListRecursive,
++    /// Names, types and the bytes of every file below a directory (`fs.cp`).
++    Tree,
++    /// What a `Bun.Glob` scan from this directory matches. `extra` holds the pattern and options.
++    Glob,
++}
++
++const LOOKS: [(Look, &str); 10] = [
++    (Look::Content, "content"),
++    (Look::Stat, "stat"),
++    (Look::Lstat, "lstat"),
++    (Look::Exists, "exists"),
++    (Look::Readlink, "readlink"),
++    (Look::Realpath, "realpath"),
++    (Look::List, "list"),
++    (Look::ListRecursive, "listRecursive"),
++    (Look::Tree, "tree"),
++    (Look::Glob, "glob"),
++];
++
++impl Look {
++    pub fn name(self) -> &'static str {
++        LOOKS.iter().find(|(look, _)| *look == self).map_or("", |(_, name)| name)
++    }
++
++    pub fn from_name(name: &[u8]) -> Option<Look> {
++        LOOKS
++            .iter()
++            .find(|(_, it)| it.as_bytes() == name)
++            .map(|(look, _)| *look)
++    }
++}
++
++pub struct Read {
++    pub look: Look,
++    /// Absolute.
++    pub path: Box<[u8]>,
++    pub extra: Box<[u8]>,
++    /// `None` until observed.
++    pub value: Option<Box<[u8]>>,
++}
++
++#[derive(Default)]
++pub struct OwnReads {
++    pub reads: Vec<Read>,
++    keys: StringHashMap<()>,
++    /// Absolute paths the file wrote, created or removed; `true` when every path that starts with
++    /// these bytes counts (the prefix of `fs.mkdtemp`).
++    written: Vec<(Box<[u8]>, bool)>,
++}
++
++/// `inner` is `outer` or below it.
++fn under(inner: &[u8], outer: &[u8]) -> bool {
++    match inner.strip_prefix(outer) {
++        Some(rest) => {
++            rest.is_empty()
++                || bun_paths::is_sep_native(rest[0])
++                || outer.last().is_some_and(|&c| bun_paths::is_sep_native(c))
++        }
++        None => false,
++    }
++}
++
++impl OwnReads {
++    pub fn read(&mut self, look: Look, path: &[u8], extra: &[u8]) {
++        if self.written.iter().any(|(written, prefix)| {
++            if *prefix {
++                path.starts_with(written)
++            } else {
++                under(path, written)
++            }
++        }) {
++            return;
++        }
++        let mut key = Vec::with_capacity(path.len() + extra.len() + 16);
++        key.extend_from_slice(look.name().as_bytes());
++        key.push(0);
++        key.extend_from_slice(path);
++        key.push(0);
++        key.extend_from_slice(extra);
++        if self.keys.contains_key(&*key) {
++            return;
++        }
++        bun_core::handle_oom(self.keys.put(&key, ()));
++        self.reads.push(Read {
++            look,
++            path: Box::from(path),
++            extra: Box::from(extra),
++            value: None,
++        });
++    }
++
++    /// Before the file writes to `path`: what it looked at there, below it, or above it is observed
++    /// now, so the record keeps what was there before the write.
++    pub fn write(&mut self, root: &[u8], path: &[u8], prefix: bool) {
++        for read in self.reads.iter_mut().filter(|read| read.value.is_none()) {
++            let touched = if prefix {
++                read.path.starts_with(path) || under(path, &read.path)
++            } else {
++                under(&read.path, path) || under(path, &read.path)
++            };
++            if touched {
++                read.value = Some(observe(root, read.look, &read.path, &read.extra));
++            }
++        }
++        if !self
++            .written
++            .iter()
++            .any(|(written, was_prefix)| *was_prefix == prefix && **written == *path)
++        {
++            self.written.push((Box::from(path), prefix));
++        }
++    }
++
++    /// When the record is written: observes what was not observed yet.
++    pub fn finish(&mut self, root: &[u8]) {
++        for read in self.reads.iter_mut().filter(|read| read.value.is_none()) {
++            read.value = Some(observe(root, read.look, &read.path, &read.extra));
++        }
++    }
++}
++
++/// Looks at `path` the way `look` says. The same call records and validates, so the two agree on
++/// the encoding: a hex SHA-256 for bytes and listings, a short text for the rest, and the error's
++/// name (such as `ENOENT`) when the look fails. Paths under `root` in a value are relative to it.
++pub fn observe(root: &[u8], look: Look, path: &[u8], extra: &[u8]) -> Box<[u8]> {
++    let zpath = bun_core::ZBox::from_vec(path.to_vec());
++    let error = |err: bun_sys::Error| -> Box<[u8]> { Box::from(err.name()) };
++    let value: Vec<u8> = match look {
++        Look::Content => match bun_sys::File::read_from(bun_sys::Fd::cwd(), path) {
++            Ok(contents) => hex(&crate::test_input_recorder::source_hash(&contents)),
++            Err(err) => return error(err),
++        },
++        Look::Stat | Look::Lstat => {
++            let stat = if look == Look::Stat {
++                bun_sys::stat(&zpath)
++            } else {
++                bun_sys::lstat(&zpath)
++            };
++            match stat {
++                Ok(stat) => describe(stat.st_mode as u32, stat.st_size as u64),
++                Err(err) => return error(err),
++            }
++        }
++        Look::Exists => {
++            if bun_sys::stat(&zpath).is_ok() {
++                b"yes".to_vec()
++            } else {
++                b"no".to_vec()
++            }
++        }
++        Look::Readlink => {
++            let mut buf = bun_paths::path_buffer_pool::get();
++            match bun_sys::readlink(&zpath, &mut buf[..]) {
++                Ok(len) => buf[..len].to_vec(),
++                Err(err) => return error(err),
++            }
++        }
++        Look::Realpath => {
++            let mut buf = bun_paths::path_buffer_pool::get();
++            match bun_sys::realpath(&zpath, &mut buf) {
++                Ok(real) => from_root(root, real),
++                Err(err) => return error(err),
++            }
++        }
++        Look::List | Look::ListRecursive | Look::Tree => {
++            let mut lines = Vec::new();
++            if let Err(err) = list(path, b"", look, &mut lines) {
++                return error(err);
++            }
++            lines.sort();
++            hex(&crate::test_input_recorder::source_hash(&lines.concat()))
++        }
++        Look::Glob => match glob(root, path, extra) {
++            Some(mut matches) => {
++                matches.sort();
++                let mut joined = Vec::new();
++                for it in matches {
++                    joined.extend_from_slice(&it);
++                    joined.push(b'\n');
++                }
++                hex(&crate::test_input_recorder::source_hash(&joined))
++            }
++            None => b"error".to_vec(),
++        },
++    };
++    value.into_boxed_slice()
++}
++
++fn hex(bytes: &[u8]) -> Vec<u8> {
++    let mut out = Vec::with_capacity(64);
++    crate::test_input_recorder::write_hex(&mut out, bytes);
++    out
++}
++
++fn describe(mode: u32, size: u64) -> Vec<u8> {
++    let kind = mode & bun_sys::S::IFMT as u32;
++    if kind == bun_sys::S::IFREG as u32 {
++        format!("file {size}").into_bytes()
++    } else if kind == bun_sys::S::IFDIR as u32 {
++        b"directory".to_vec()
++    } else if kind == bun_sys::S::IFLNK as u32 {
++        b"symlink".to_vec()
++    } else {
++        b"other".to_vec()
++    }
++}
++
++fn from_root(root: &[u8], path: &[u8]) -> Vec<u8> {
++    match path.strip_prefix(root) {
++        Some(rest) if rest.is_empty() => b".".to_vec(),
++        Some(rest) if bun_paths::is_sep_native(rest[0]) => {
++            let mut out = b".".to_vec();
++            out.extend_from_slice(rest);
++            out
++        }
++        _ => path.to_vec(),
++    }
++}
++
++/// One line per entry, `relative name, kind[, hash]`, for the directory at `path` (and, for the
++/// recursive looks, every directory below it; symbolic links are not followed).
++fn list(path: &[u8], prefix: &[u8], look: Look, lines: &mut Vec<Vec<u8>>) -> bun_sys::Result<()> {
++    let fd = bun_sys::open_dir_for_iteration(bun_sys::Fd::cwd(), path)?;
++    let dir = bun_sys::File::from_fd(fd);
++    let mut entries = Vec::new();
++    let mut iterator = bun_sys::dir_iterator::iterate(dir.handle);
++    while let Some(entry) = iterator.next()? {
++        entries.push((entry.name.slice_u8().to_vec(), entry.kind));
++    }
++    drop(dir);
++    for (name, kind) in entries {
++        let mut relative = prefix.to_vec();
++        relative.extend_from_slice(&name);
++        let mut line = relative.clone();
++        let _ = write!(line, "\t{kind:?}");
++        let mut child = path.to_vec();
++        child.push(bun_paths::SEP);
++        child.extend_from_slice(&name);
++        let is_dir = matches!(kind, bun_sys::EntryKind::Directory);
++        if look == Look::Tree && matches!(kind, bun_sys::EntryKind::File) {
++            line.push(b'\t');
++            match bun_sys::File::read_from(bun_sys::Fd::cwd(), &child) {
++                Ok(contents) => line.extend_from_slice(&hex(
++                    &crate::test_input_recorder::source_hash(&contents),
++                )),
++                Err(err) => line.extend_from_slice(err.name()),
++            }
++        }
++        line.push(b'\n');
++        lines.push(line);
++        if is_dir && look != Look::List {
++            relative.push(b'/');
++            list(&child, &relative, look, lines)?;
++        }
++    }
++    Ok(())
++}
++
++/// The options of a `Bun.Glob` scan, as `extra` carries them after the pattern and a NUL.
++pub struct GlobOptions {
++    pub dot: bool,
++    pub absolute: bool,
++    pub only_files: bool,
++    pub follow_symlinks: bool,
++    pub error_on_broken_symlinks: bool,
++}
++
++pub fn glob_extra(pattern: &[u8], options: &GlobOptions) -> Vec<u8> {
++    let mut extra = pattern.to_vec();
++    extra.push(0);
++    for (on, letter) in [
++        (options.dot, b'd'),
++        (options.absolute, b'a'),
++        (options.only_files, b'f'),
++        (options.follow_symlinks, b'l'),
++        (options.error_on_broken_symlinks, b'e'),
++    ] {
++        if on {
++            extra.push(letter);
++        }
++    }
++    extra
++}
++
++fn glob(root: &[u8], cwd: &[u8], extra: &[u8]) -> Option<Vec<Vec<u8>>> {
++    let split = extra.iter().position(|&c| c == 0)?;
++    let (pattern, flags) = (&extra[..split], &extra[split + 1..]);
++    let has = |letter: u8| flags.contains(&letter);
++    let mut walker = bun_glob::walk::GlobWalker::<bun_glob::walk::SyscallAccessor, false>::init_with_cwd(
++        pattern,
++        cwd,
++        has(b'd'),
++        has(b'a'),
++        has(b'l'),
++        has(b'e'),
++        has(b'f'),
++        None,
++    )
++    .ok()?
++    .ok()?;
++    walker.walk().ok()?.ok()?;
++    Some(
++        walker
++            .matched_paths
++            .keys()
++            .iter()
++            .map(|it| from_root(root, it))
++            .collect(),
++    )
++}
+diff --git a/src/jsc/VirtualMachine.rs b/src/jsc/VirtualMachine.rs
+index 0e61e9871..27d950035 100644
+--- a/src/jsc/VirtualMachine.rs
++++ b/src/jsc/VirtualMachine.rs
+@@ -442,6 +442,7 @@ pub struct TestIsolationState {
+     /// What the outgoing file gives back once its realm is retired. See
+     /// [`VirtualMachine::release_at_retirement`].
+     at_retirement: JsCell<Vec<Box<dyn FnOnce()>>>,
++    pub input_recorder: crate::test_input_recorder::InputRecorderCell,
+ }
+ 
+ // ──────────────────────────────────────────────────────────────────────────
+@@ -1754,6 +1755,7 @@ impl VirtualMachine {
+     }
+ 
+     pub(crate) fn enable_macro_mode(&self) {
++        crate::test_input_recorder::mark(self, b"macro");
+         if !self.has_enabled_macro_mode.get() {
+             self.has_enabled_macro_mode.set(true);
+             self.macro_event_loop
+@@ -4965,6 +4967,7 @@ impl VirtualMachine {
+             }
+         };
+ 
++        crate::test_input_recorder::did_find(self, &result);
+         if !self.macro_mode.get() {
+             self.has_any_macro_remappings.set(
+                 self.has_any_macro_remappings.get()
+@@ -5037,6 +5040,13 @@ impl VirtualMachine {
+         mut query_string: Option<&mut bun_core::String>,
+         mode: ResolveMode,
+     ) -> JsResult<Result<bun_core::String, JSValue>> {
++        let recording = crate::test_input_recorder::will_resolve(
++            global,
++            specifier,
++            source,
++            mode,
++            IS_A_FILE_PATH,
++        );
+         if let Some(resolved) = Self::resolve_with_on_resolve::<IS_A_FILE_PATH>(
+             global,
+             specifier,
+@@ -5045,16 +5055,17 @@ impl VirtualMachine {
+             mode,
+             false,
+         )? {
+-            return Ok(resolved);
++            return Ok(recording.did_resolve(resolved, true));
+         }
+-        Self::resolve_without_on_resolve::<IS_A_FILE_PATH>(
++        let resolved = Self::resolve_without_on_resolve::<IS_A_FILE_PATH>(
+             global,
+             specifier,
+             source,
+             query_string,
+             mode,
+             global.bun_vm().transpiler.get().resolver.opts.global_cache,
+-        )
++        )?;
++        Ok(recording.did_resolve(resolved, false))
+     }
+ 
+     /// `None` when no `onResolve` claims `specifier`, or `same_is_no_answer` is set and it returns `specifier` unchanged.
+@@ -5114,7 +5125,7 @@ impl VirtualMachine {
+         Ok(Some(resolved))
+     }
+ 
+-    fn resolve_without_on_resolve<const IS_A_FILE_PATH: bool>(
++    pub(crate) fn resolve_without_on_resolve<const IS_A_FILE_PATH: bool>(
+         global: &JSGlobalObject,
+         specifier: &bun_core::String,
+         source: &bun_core::String,
+diff --git a/src/jsc/bindings/BunProcess.cpp b/src/jsc/bindings/BunProcess.cpp
+index 13ca10372..4a1328f77 100644
+--- a/src/jsc/bindings/BunProcess.cpp
++++ b/src/jsc/bindings/BunProcess.cpp
+@@ -483,6 +483,7 @@ extern "C" size_t Bun__process_dlopen_count;
+ 
+ extern "C" DlOpenAction* CrashHandler__beginDlOpenAction(const char* path);
+ extern "C" bool Bun__VM__allowAddons(void* vm);
++extern "C" void Bun__TestInputRecorder__mark(void* bunVM, const char* name);
+ extern "C" int32_t Bun__addonNeedsGlibcOnMusl(const char* path, size_t len, char* soname_out, size_t soname_cap);
+ 
+ // Drops only this load's reference. A library that registered modules on an earlier load is still referenced by that load.
+@@ -507,6 +508,7 @@ JSC_DEFINE_HOST_FUNCTION_WITH_ATTRIBUTES(Process_functionDlopen, __attribute__((
+     auto scope = DECLARE_THROW_SCOPE(JSC::getVM(globalObject));
+     auto& vm = JSC::getVM(globalObject);
+ 
++    Bun__TestInputRecorder__mark(globalObject->bunVM(), "native-addon");
+     if (!Bun__VM__allowAddons(globalObject->bunVM())) {
+         return ERR::DLOPEN_DISABLED(scope, globalObject, "Cannot load native addon because loading addons is disabled."_s);
+     }
+diff --git a/src/jsc/bindings/IsolatedModuleCache.cpp b/src/jsc/bindings/IsolatedModuleCache.cpp
+index c4b307258..c1105f6e1 100644
+--- a/src/jsc/bindings/IsolatedModuleCache.cpp
++++ b/src/jsc/bindings/IsolatedModuleCache.cpp
+@@ -27,6 +27,7 @@ bool IsolatedModuleCache::canUse(JSC::VM&, void* bunVM, const BunString* typeAtt
+ 
+ extern "C" uint64_t Bun__hashPluginContents(const EncodedSlice* contents, BunLoaderType loader);
+ extern "C" bool Bun__VM__hasGlobalsOfVitest(void* bunVM);
++extern "C" void Bun__TestInputRecorder__didServeCachedSource(void* bunVM, const BunString* key);
+ 
+ static uint64_t madeFromHash(JSC::VM& vm, const WTF::String& key, const CodeString* pluginContents)
+ {
+@@ -47,7 +48,11 @@ Zig::SourceProvider* IsolatedModuleCache::lookup(JSC::VM& vm, const WTF::String&
+         return nullptr;
+     ASSERT(it->value);
+     auto* provider = static_cast<Zig::SourceProvider*>(it->value.get());
+-    return provider->m_madeFromHash == madeFromHash(vm, key, pluginContents) ? provider : nullptr;
++    if (provider->m_madeFromHash != madeFromHash(vm, key, pluginContents))
++        return nullptr;
++    BunString borrowedKey = Bun::toString(key);
++    Bun__TestInputRecorder__didServeCachedSource(WebCore::clientData(vm)->bunVM, &borrowedKey);
++    return provider;
+ }
+ 
+ void IsolatedModuleCache::insert(JSC::VM& vm, const WTF::String& key, Zig::SourceProvider& provider, const CodeString* pluginContents)
+diff --git a/src/jsc/bindings/ZigSourceProvider.cpp b/src/jsc/bindings/ZigSourceProvider.cpp
+index 9213a0056..52398a707 100644
+--- a/src/jsc/bindings/ZigSourceProvider.cpp
++++ b/src/jsc/bindings/ZigSourceProvider.cpp
+@@ -73,6 +73,7 @@ void addCodeCoverageSourceID(JSC::VM& vm, JSC::SourceProvider& provider)
+ }
+ 
+ extern "C" bool BunTest__shouldGenerateCodeCoverage(const BunString* sourceURL);
++extern "C" void Bun__TestInputRecorder__mark(void* bunVM, const char* name);
+ extern "C" void Bun__addSourceProviderSourceMap(void* bun_vm, SourceProvider* opaque_source_provider, const BunString* specifier);
+ extern "C" void Bun__removeSourceProviderSourceMap(void* bun_vm, SourceProvider* opaque_source_provider, const BunString* specifier);
+ 
+@@ -90,6 +91,9 @@ Ref<SourceProvider> SourceProvider::create(
+         sourceType = JSC::SourceProviderSourceType::BunTranspiledModule;
+     }
+ 
++    // What a macro or `import.meta.glob` put into the output is not in the source.
++    if (resolvedSource.depends_on_more_than_source)
++        Bun__TestInputRecorder__mark(globalObject->bunVM(), "macro-or-import-meta-glob");
+     auto string = resolvedSource.source_code.transferToWTFString();
+     auto sourceURLString = resolvedSource.source_url.transferToWTFString();
+ 
+diff --git a/src/jsc/bindings/sqlite/JSSQLStatement.cpp b/src/jsc/bindings/sqlite/JSSQLStatement.cpp
+index 4d49ac814..f90ab5f19 100644
+--- a/src/jsc/bindings/sqlite/JSSQLStatement.cpp
++++ b/src/jsc/bindings/sqlite/JSSQLStatement.cpp
+@@ -115,6 +115,8 @@ using Bun::SqlitePtr;
+ // One-time sqlite3_config() calls. Must run before the FIRST sqlite3_open_v2
+ // from EITHER bun:sqlite or node:sqlite (they share one library, and config
+ // is SQLITE_MISUSE after init). extern "C" for the cross-TU forward-declare.
++extern "C" void Bun__TestInputRecorder__mark(void* bunVM, const char* name);
++
+ extern "C" void Bun__initializeSQLite()
+ {
+     static std::once_flag onceFlag;
+@@ -1625,6 +1627,9 @@ JSC_DEFINE_HOST_FUNCTION(jsSQLStatementOpenStatementFunction, (JSC::JSGlobalObje
+         openFlags = JSC::toInt32(flags.asNumber());
+     }
+ 
++    // An in-memory database reads nothing.
++    if (!(path.length() == 8 && !memcmp(path.legacyCStringPointer(), ":memory:", 8)))
++        Bun__TestInputRecorder__mark(defaultGlobalObject(lexicalGlobalObject)->bunVM(), "sqlite");
+     SqlitePtr<sqlite3> db;
+     int statusCode = sqlite3_open_v2(path.legacyCStringPointer(), outPtr(db), openFlags, nullptr);
+ 
+diff --git a/src/jsc/bindings/sqlite/NodeSqlite.cpp b/src/jsc/bindings/sqlite/NodeSqlite.cpp
+index 5d80f694b..d331664a9 100644
+--- a/src/jsc/bindings/sqlite/NodeSqlite.cpp
++++ b/src/jsc/bindings/sqlite/NodeSqlite.cpp
+@@ -125,6 +125,8 @@ static const char* probeSqliteVersion()
+ }
+ #endif
+ 
++extern "C" void Bun__TestInputRecorder__mark(void* bunVM, const char* name);
++
+ extern "C" const char* Bun__sqlite3_version()
+ {
+ #if LAZY_LOAD_SQLITE
+@@ -735,6 +737,8 @@ bool JSDatabaseSync::open(JSGlobalObject* globalObject, ThrowScope& scope)
+ 
+     auto utf8 = tryUTF8(globalObject, scope, m_location);
+     RETURN_IF_EXCEPTION(scope, false);
++    if (m_location != ":memory:"_s)
++        Bun__TestInputRecorder__mark(defaultGlobalObject(globalObject)->bunVM(), "sqlite");
+     SqlitePtr<sqlite3> db;
+     int r = sqlite3_open_v2(utf8.legacyCStringPointer(), outPtr(db), flags, nullptr);
+     if (r != SQLITE_OK) {
+diff --git a/src/jsc/lib.rs b/src/jsc/lib.rs
+index 55e099bd2..b8846e5b5 100644
+--- a/src/jsc/lib.rs
++++ b/src/jsc/lib.rs
+@@ -479,6 +479,10 @@ pub mod jsc_scheduler;
+ pub mod process_auto_killer;
+ #[path = "ScriptExecutionContext.rs"]
+ pub mod script_execution_context;
++#[path = "TestInputRecorder.rs"]
++pub mod test_input_recorder;
++#[path = "TestOwnReads.rs"]
++pub mod test_own_reads;
+ 
+ /// Flags for `JSCInitialize` in ZigGlobalObject.cpp. JSC is set up once per process: the first call's flags win.
+ #[derive(Clone, Copy, Default)]
+diff --git a/src/jsc/web_worker.rs b/src/jsc/web_worker.rs
+index 8cbb75565..679a2d055 100644
+--- a/src/jsc/web_worker.rs
++++ b/src/jsc/web_worker.rs
+@@ -377,6 +377,7 @@ impl WebWorker {
+     ) -> Option<bun_ptr::RefPtr<WebWorker>> {
+         jsc::mark_binding();
+         log!("[{}] create", this_context_id);
++        crate::test_input_recorder::mark(parent, b"worker");
+ 
+         let spec_slice = specifier_str.to_utf8();
+         // The transpiler holds its address: it is neither moved nor named until the guard below has run.
+diff --git a/src/runtime/api/Archive.rs b/src/runtime/api/Archive.rs
+index 7e683df33..346d43cdd 100644
+--- a/src/runtime/api/Archive.rs
++++ b/src/runtime/api/Archive.rs
+@@ -321,6 +321,7 @@ impl Archive {
+         }
+ 
+         let path_slice = path_arg.to_utf8(global)?;
++        bun_jsc::test_input_recorder::own_write(global.bun_vm(), path_slice.slice(), false);
+ 
+         // Parse options for compression override
+         let options_compress = parse_compression_options(global, options.to_js())?;
+@@ -390,6 +391,7 @@ impl Archive {
+         }
+ 
+         let path_slice = path_arg.to_utf8(global)?;
++        bun_jsc::test_input_recorder::own_write(global.bun_vm(), path_slice.slice(), false);
+ 
+         // Parse options
+         let mut glob_patterns: Option<Vec<GlobPattern>> = None;
+diff --git a/src/runtime/api/BunObject.rs b/src/runtime/api/BunObject.rs
+index 346f78602..4dd72a996 100644
+--- a/src/runtime/api/BunObject.rs
++++ b/src/runtime/api/BunObject.rs
+@@ -293,6 +293,8 @@ pub(crate) fn which<'a>(
+     if command.len() >= MAX_PATH_BYTES {
+         return Err(heap.error(format_args!("bin path is too long")));
+     }
++    // What it finds depends on PATH and on every directory in it.
++    bun_jsc::test_input_recorder::mark_current(b"which");
+ 
+     let vm = VirtualMachine::get();
+     let path = options
+@@ -1213,6 +1215,11 @@ pub(crate) fn alloc_unsafe<'a>(
+ 
+ pub(crate) fn mmap(cx: &mut JsScope<'_>, path: &[u8], options: &MMapOptions) -> JsResult<JSValue> {
+     let global_this = cx.global();
++    bun_jsc::test_input_recorder::own_read(
++        global_this.bun_vm(),
++        bun_jsc::test_own_reads::Look::Content,
++        path,
++    );
+ 
+     #[cfg(windows)]
+     {
+diff --git a/src/runtime/api/JSBundler.rs b/src/runtime/api/JSBundler.rs
+index c25fd93f7..1dff4cbc6 100644
+--- a/src/runtime/api/JSBundler.rs
++++ b/src/runtime/api/JSBundler.rs
+@@ -1892,6 +1892,7 @@ pub(crate) mod js_bundler {
+     /// `Bun.build(config)`
+     pub(crate) fn build(cx: &mut JsScope<'_>, config: JsLocal<'_>) -> JsResult<JSValue> {
+         let global_this = cx.global();
++        bun_jsc::test_input_recorder::mark(global_this.bun_vm(), b"bundler");
+         let config = config.to_js();
+         if !config.is_object() {
+             return Err(global_this.throw_invalid_arguments(format_args!(
+diff --git a/src/runtime/api/cron_os.rs b/src/runtime/api/cron_os.rs
+index 6e0cd7d4e..845dda416 100644
+--- a/src/runtime/api/cron_os.rs
++++ b/src/runtime/api/cron_os.rs
+@@ -276,6 +276,7 @@ impl OsJob {
+         #[cfg(windows)]
+         let env = Some(envp.as_list());
+ 
++        bun_jsc::test_input_recorder::mark_current(b"spawn");
+         let mut spawned = spawn::spawn_process(&options, argv.as_list(), env)
+             .map_err(|err| Failure::Spawn(err.name().as_bytes()))?
+             .map_err(|err| Failure::Spawn(err.name()))?;
+diff --git a/src/runtime/api/filesystem_router.rs b/src/runtime/api/filesystem_router.rs
+index bcab92646..2729e148e 100644
+--- a/src/runtime/api/filesystem_router.rs
++++ b/src/runtime/api/filesystem_router.rs
+@@ -181,6 +181,7 @@ impl FileSystemRouter {
+         cx: &mut JsScope<'a>,
+         options: &FileSystemRouterOptions<'a>,
+     ) -> bindgen::Result<'a, Self> {
++        bun_jsc::test_input_recorder::mark(cx.global().bun_vm(), b"file-system-router");
+         match options.style {
+             Some(b"nextjs") => {}
+             Some(_) => {
+diff --git a/src/runtime/api/glob.rs b/src/runtime/api/glob.rs
+index ed7e7b99f..8854d870b 100644
+--- a/src/runtime/api/glob.rs
++++ b/src/runtime/api/glob.rs
+@@ -408,10 +408,28 @@ impl Glob {
+                 init_walker::<StandaloneAccessor>(self.pattern.slice(), &match_opts)?,
+             ));
+         }
+-        Ok(AnyGlobWalker::Fs(init_walker::<walk::SyscallAccessor>(
+-            self.pattern.slice(),
+-            &match_opts,
+-        )?))
++        let walker = init_walker::<walk::SyscallAccessor>(self.pattern.slice(), &match_opts)?;
++        if let Some(vm) = bun_jsc::virtual_machine::VirtualMachine::get_or_null()
++            && bun_jsc::test_input_recorder::is_recording(vm)
++        {
++            use bun_jsc::test_own_reads::{GlobOptions, Look, glob_extra};
++            let extra = glob_extra(
++                self.pattern.slice(),
++                &GlobOptions {
++                    dot: match_opts.dot,
++                    absolute: match_opts.absolute,
++                    only_files: match_opts.only_files,
++                    follow_symlinks: match_opts.follow_symlinks,
++                    error_on_broken_symlinks: match_opts.error_on_broken_symlinks,
++                },
++            );
++            let cwd = match &match_opts.cwd {
++                Some(cwd) => cwd.to_vec(),
++                None => b".".to_vec(),
++            };
++            bun_jsc::test_input_recorder::own_read_with(vm, Look::Glob, &cwd, &extra);
++        }
++        Ok(AnyGlobWalker::Fs(walker))
+     }
+ }
+ 
+diff --git a/src/runtime/cli/mod.rs b/src/runtime/cli/mod.rs
+index 440dbe094..55ec86ac9 100644
+--- a/src/runtime/cli/mod.rs
++++ b/src/runtime/cli/mod.rs
+@@ -81,6 +81,10 @@ pub(crate) mod test {
+     #[path = "Timings.rs"]
+     pub(crate) mod timings;
+ 
++    /// `BUN_TEST_INPUT_REUSE`: skip test files whose input record still holds.
++    #[path = "InputReuse.rs"]
++    pub(crate) mod input_reuse;
++
+     /// `bun test --aot --shard`: puts test files that import the same modules in the same shard.
+     #[path = "ShardsByReach.rs"]
+     pub(crate) mod shards_by_reach;
+diff --git a/src/runtime/cli/test/InputReuse.rs b/src/runtime/cli/test/InputReuse.rs
+new file mode 100644
+index 000000000..c3a4be322
+--- /dev/null
++++ b/src/runtime/cli/test/InputReuse.rs
+@@ -0,0 +1,995 @@
++//! `BUN_TEST_INPUT_REUSE=1` with `BUN_TEST_INPUT_RECORD_DIR` under `bun test --isolate`: before the
++//! run, a test file whose record still holds is not run, and its recorded counts go into the summary.
++//!
++//! A record holds when the run has the same fingerprint, the file passed with no unhandled error and
++//! nothing from an earlier file ran into it, it did nothing a record can't replay (`marks`), no
++//! plugin answered a resolution or served a source, every file it loaded or that answered one of its
++//! resolutions has the bytes it had, and every question it asked the resolver gets the same answer
++//! with the same details when asked again. Each path is hashed once and each question asked once per
++//! run, however many records list it. `BUN_TEST_INPUT_REUSE=explain` says why each other file runs.
++//! `BUN_TEST_INPUT_REUSE=check` runs every file anyway and fails the run when a file whose record
++//! held ends with other counts than its record has: a miss of the records, found in one run.
++
++use std::collections::HashMap;
++use std::io::Write as _;
++
++use bun_core::{Global, env, pretty_error};
++use bun_jsc::test_input_recorder as recorder;
++use bun_jsc::test_own_reads::Look;
++use bun_jsc::virtual_machine::VirtualMachine;
++use bun_options_types::context::{ContextData, MacroOptions, TestGlobals};
++use bun_parsers::json as bun_json;
++use bun_ptr::Interned;
++use bun_sys::{Fd, File};
++
++/// What the run was started with that can change a test file's outcome, one `name=value` per line.
++/// Paths under the project root are relative to it.
++pub(crate) fn fingerprint(ctx: &ContextData, vm: &VirtualMachine) -> Vec<u8> {
++    let root = vm.top_level_dir();
++    let relative = |path: &[u8]| -> Vec<u8> {
++        match path.strip_prefix(root) {
++            Some(rest) if rest.first().is_some_and(|&c| bun_paths::is_sep_native(c)) => rest[1..].to_vec(),
++            _ => path.to_vec(),
++        }
++    };
++    let mut out = Vec::with_capacity(1024);
++    let list = |out: &mut Vec<u8>, name: &str, items: &mut dyn Iterator<Item = Vec<u8>>| {
++        let _ = write!(out, "{name}=");
++        for (i, item) in items.enumerate() {
++            if i > 0 {
++                out.push(b',');
++            }
++            out.extend_from_slice(&item);
++        }
++        out.push(b'\n');
++    };
++    let bytes =
++        |items: &[Box<[u8]>]| -> Vec<Vec<u8>> { items.iter().map(|it| it.to_vec()).collect() };
++    let opt = |it: &Option<Box<[u8]>>| bstr::BString::from(it.as_deref().unwrap_or(b"-"));
++
++    let test = &ctx.test_options;
++    let _ = writeln!(out, "bun={}", Global::package_json_version_with_revision);
++    let _ = writeln!(
++        out,
++        "platform={}-{}",
++        env::OS.npm_name(),
++        env::ARCH.npm_name()
++    );
++    let _ = writeln!(out, "timeout={}", test.default_timeout_ms);
++    let _ = writeln!(out, "updateSnapshots={}", test.update_snapshots);
++    let _ = writeln!(out, "rerunEach={}", test.repeat_count);
++    let _ = writeln!(out, "retry={}", test.retry);
++    let _ = writeln!(out, "todo={}", test.run_todo);
++    let _ = writeln!(out, "only={}", test.only);
++    let _ = writeln!(out, "concurrent={}", test.concurrent);
++    // Without `--seed`, a randomized run draws one, and no record of it is reused.
++    let _ = writeln!(out, "randomize={}", test.randomize);
++    if test.randomize {
++        let _ = writeln!(out, "seed={:?}", test.seed);
++    }
++    list(
++        &mut out,
++        "concurrentTestGlob",
++        &mut test
++            .concurrent_test_glob
++            .iter()
++            .flatten()
++            .map(|it| it.to_vec()),
++    );
++    let _ = writeln!(out, "coverage={}", test.coverage.enabled);
++    let _ = writeln!(out, "testNamePattern={}", opt(&test.test_filter_pattern));
++    let _ = writeln!(out, "maxConcurrency={}", test.max_concurrency);
++    let _ = writeln!(
++        out,
++        "resetsBeforeEachTest={:?}",
++        test.resets_before_each_test
++    );
++    let _ = writeln!(out, "isolateModules={}", test.isolate_modules);
++    let _ = writeln!(
++        out,
++        "environment={}",
++        test.environment.map_or("-", |it| it.name())
++    );
++    let _ = writeln!(
++        out,
++        "globals={}",
++        match test.globals {
++            None => "-",
++            Some(TestGlobals::Bun) => "bun",
++            Some(TestGlobals::Vitest) => "vitest",
++        }
++    );
++    match &test.react_compiler {
++        None => out.extend_from_slice(b"reactCompiler=-\n"),
++        Some(scope) => {
++            list(
++                &mut out,
++                "reactCompiler.include",
++                &mut bytes(&scope.include).into_iter(),
++            );
++            list(
++                &mut out,
++                "reactCompiler.exclude",
++                &mut bytes(&scope.exclude).into_iter(),
++            );
++        }
++    }
++    list(
++        &mut out,
++        "preload",
++        &mut ctx.preloads.iter().map(|it| relative(it)),
++    );
++
++    let args = &ctx.args;
++    match &args.jsx {
++        None => out.extend_from_slice(b"jsx=-\n"),
++        Some(jsx) => {
++            let _ = writeln!(
++                out,
++                "jsx={:?},{},{},{},{},{}",
++                jsx.runtime,
++                bstr::BStr::new(&jsx.factory),
++                bstr::BStr::new(&jsx.fragment),
++                jsx.development,
++                bstr::BStr::new(&jsx.import_source),
++                jsx.side_effects
++            );
++        }
++    }
++    let _ = writeln!(
++        out,
++        "tsconfigOverride={}",
++        bstr::BString::from(
++            args.tsconfig_override
++                .as_deref()
++                .map_or(b"-".to_vec(), relative)
++        )
++    );
++    match &args.define {
++        None => out.extend_from_slice(b"define=-\n"),
++        Some(define) => list(
++            &mut out,
++            "define",
++            &mut define.keys.iter().zip(&define.values).map(|(key, value)| {
++                let mut pair = key.to_vec();
++                pair.push(b'=');
++                pair.extend_from_slice(value);
++                pair
++            }),
++        ),
++    }
++    list(&mut out, "drop", &mut bytes(&args.drop).into_iter());
++    list(
++        &mut out,
++        "featureFlags",
++        &mut bytes(&args.feature_flags).into_iter(),
++    );
++    let _ = writeln!(out, "preserveSymlinks={:?}", args.preserve_symlinks);
++    list(
++        &mut out,
++        "inject",
++        &mut args.inject.iter().map(|it| relative(it)),
++    );
++    list(&mut out, "external", &mut bytes(&args.external).into_iter());
++    match &args.loaders {
++        None => out.extend_from_slice(b"loaders=-\n"),
++        Some(loaders) => list(
++            &mut out,
++            "loaders",
++            &mut loaders
++                .extensions
++                .iter()
++                .zip(&loaders.loaders)
++                .map(|(ext, loader)| {
++                    let mut pair = ext.to_vec();
++                    let _ = write!(pair, "={loader:?}");
++                    pair
++                }),
++        ),
++    }
++    list(
++        &mut out,
++        "mainFields",
++        &mut bytes(&args.main_fields).into_iter(),
++    );
++    let _ = writeln!(out, "target={:?}", args.target);
++    list(
++        &mut out,
++        "envFiles",
++        &mut bytes(&args.env_files).into_iter(),
++    );
++    let _ = writeln!(
++        out,
++        "disableDefaultEnvFiles={}",
++        args.disable_default_env_files
++    );
++    list(
++        &mut out,
++        "extensionOrder",
++        &mut bytes(&args.extension_order).into_iter(),
++    );
++    list(
++        &mut out,
++        "conditions",
++        &mut bytes(&args.conditions).into_iter(),
++    );
++    let _ = writeln!(out, "packages={:?}", args.packages);
++    let _ = writeln!(out, "ignoreDceAnnotations={}", args.ignore_dce_annotations);
++    let _ = writeln!(out, "allowAddons={:?}", args.allow_addons);
++    let _ = writeln!(out, "allowFfiCc={:?}", args.allow_ffi_cc);
++    let _ = writeln!(out, "unhandledRejections={:?}", args.unhandled_rejections);
++    match &ctx.debug.macros {
++        MacroOptions::Unspecified => out.extend_from_slice(b"macros=-\n"),
++        MacroOptions::Disable => out.extend_from_slice(b"macros=off\n"),
++        MacroOptions::Map(map) => list(
++            &mut out,
++            "macros",
++            &mut map.keys().iter().zip(map.values()).map(|(package, names)| {
++                let mut entry = package.to_vec();
++                for (name, replacement) in names.keys().iter().zip(names.values()) {
++                    let _ = write!(
++                        entry,
++                        ":{}={}",
++                        bstr::BStr::new(name),
++                        bstr::BStr::new(replacement)
++                    );
++                }
++                entry
++            }),
++        ),
++    }
++    // What both transpile paths take for every module from the transpiler's options: set from the
++    // flags above and from the root directory's tsconfig.json, which is a file and not a flag.
++    let options = &vm.transpiler.get().options;
++    let jsx = &options.jsx;
++    let members = |list: &bun_options_types::jsx::MemberList| -> bstr::BString {
++        let parts: Vec<&[u8]> = list.iter().collect();
++        bstr::BString::from(parts.join(&b"."[..]))
++    };
++    let _ = writeln!(
++        out,
++        "transpiler.jsx={:?},{},{},{},{},{},{},{}",
++        jsx.runtime,
++        members(&jsx.factory),
++        members(&jsx.fragment),
++        bstr::BStr::new(&jsx.import_source.production),
++        bstr::BStr::new(&jsx.import_source.development),
++        bstr::BStr::new(&jsx.classic_import_source),
++        jsx.development,
++        jsx.side_effects
++    );
++    let _ = writeln!(
++        out,
++        "transpiler.decorators={},{}",
++        options.experimental_decorators, options.emit_decorator_metadata
++    );
++    let _ = writeln!(
++        out,
++        "transpiler.useDefineForClassFields={}",
++        options.use_define_for_class_fields
++    );
++    let _ = writeln!(
++        out,
++        "transpiler.features={:?},{},{},{},{},{},{},{}",
++        options.trim_unused_imports,
++        options.tree_shaking,
++        options.no_macros,
++        options.inlining,
++        options.auto_import_jsx,
++        options.allow_runtime,
++        options.defers_requires,
++        options.rewrite_jest_for_tests
++    );
++    list(
++        &mut out,
++        "transpiler.macroRemap",
++        &mut options.macro_remap.keys().iter().map(|it| it.to_vec()),
++    );
++    let runtime = &ctx.runtime_options;
++    let _ = writeln!(out, "smol={}", runtime.smol);
++    let _ = writeln!(out, "exposeGc={}", runtime.expose_gc);
++    let _ = writeln!(out, "consoleDepth={:?}", runtime.console_depth);
++    let _ = writeln!(
++        out,
++        "preserveSymlinksMain={}",
++        runtime.preserve_symlinks_main
++    );
++    let _ = writeln!(
++        out,
++        "dnsResultOrder={}",
++        bstr::BStr::new(&runtime.dns_result_order)
++    );
++    write_environment(&mut out, ctx, vm);
++    let salt = bun_core::env_var::BUN_TEST_INPUT_RECORD_SALT
++        .get()
++        .unwrap_or(b"");
++    let _ = writeln!(out, "salt={}", bstr::BStr::new(salt));
++    out
++}
++
++/// The environment Bun itself acts on, the `.env` files `bun test` loads, and the variables named in
++/// `BUN_TEST_INPUT_RECORD_ENV`. What test code reads from `process.env` is not recorded per file:
++/// a variable that differs on every run, such as a database port, would make every record stale.
++fn write_environment(out: &mut Vec<u8>, ctx: &ContextData, vm: &VirtualMachine) {
++    // SAFETY: `vm.transpiler.env` is the process-lifetime DotEnv loader pointer.
++    let loaded = unsafe { &*vm.transpiler.get().env };
++    let value = |name: &[u8]| bstr::BString::from(loaded.get(name).unwrap_or(b"-"));
++    let _ = writeln!(out, "env.TZ={}", value(b"TZ"));
++    let _ = writeln!(out, "env.NODE_ENV={}", value(b"NODE_ENV"));
++    let _ = writeln!(out, "env.CI={}", bun_core::ci_info::is_ci());
++    let _ = writeln!(out, "env.BUN_DISABLE_TRANSPILER={}", value(b"BUN_DISABLE_TRANSPILER"));
++    let _ = writeln!(
++        out,
++        "env.NODE_PRESERVE_SYMLINKS_MAIN={}",
++        value(b"NODE_PRESERVE_SYMLINKS_MAIN")
++    );
++    // JSC options and feature flags are read from the process environment, before any `.env` file.
++    let mut process: Vec<(Vec<u8>, Vec<u8>)> = std::env::vars_os()
++        .filter_map(|(name, value)| {
++            use std::os::unix::ffi::OsStrExt as _;
++            let name = name.as_bytes();
++            (name.starts_with(b"BUN_JSC_") || name.starts_with(b"BUN_FEATURE_FLAG_"))
++                .then(|| (name.to_vec(), value.as_bytes().to_vec()))
++        })
++        .collect();
++    process.sort();
++    for (name, value) in process {
++        let _ = writeln!(out, "env.{}={}", bstr::BStr::new(&name), bstr::BStr::new(&value));
++    }
++    if let Some(names) = bun_core::env_var::BUN_TEST_INPUT_RECORD_ENV.get_not_empty() {
++        let mut names: Vec<&[u8]> = names
++            .split(|&c| c == b',')
++            .map(|it| it.trim_ascii())
++            .filter(|it| !it.is_empty())
++            .collect();
++        names.sort();
++        names.dedup();
++        for name in names {
++            let _ = writeln!(out, "env.{}={}", bstr::BStr::new(name), value(name));
++        }
++    }
++
++    // The files `bun test` loads: the `--env-file` list, or else the test defaults in the working
++    // directory. A missing file is written as such, so creating one changes the fingerprint.
++    let args = &ctx.args;
++    let files: Vec<&[u8]> = if !args.env_files.is_empty() {
++        args.env_files.iter().map(|it| &**it).collect()
++    } else if !args.disable_default_env_files {
++        vec![b".env.test.local", b".env.test", b".env"]
++    } else {
++        Vec::new()
++    };
++    for file in files {
++        let _ = write!(out, "envFile.{}=", bstr::BStr::new(file));
++        match File::read_from(Fd::cwd(), file) {
++            Ok(contents) => {
++                recorder::write_hex(out, &recorder::source_hash(&contents));
++                out.push(b'\n');
++            }
++            Err(_) => out.extend_from_slice(b"-\n"),
++        }
++    }
++}
++
++/// A test file that is not run: its record holds.
++pub(crate) struct Reused {
++    pub(crate) file: Interned,
++    pub(crate) pass: u32,
++    pub(crate) skip: u32,
++    pub(crate) todo: u32,
++    pub(crate) expectations: u32,
++}
++
++/// The setting of `BUN_TEST_INPUT_REUSE`.
++#[derive(Clone, Copy, PartialEq, Eq)]
++enum Mode {
++    /// `1`: skip the files whose record holds.
++    Reuse,
++    /// `explain`: the same, and say why each other file runs.
++    Explain,
++    /// `check`: run every file, and compare the outcome of each file whose record held with the record.
++    Check,
++}
++
++/// Why a file runs: a short kind, and what it is about (a path, a question, a mark), if anything.
++struct Why {
++    kind: &'static str,
++    detail: Vec<u8>,
++}
++
++impl Why {
++    fn new(kind: &'static str) -> Why {
++        Why { kind, detail: Vec::new() }
++    }
++
++    fn with(kind: &'static str, detail: Vec<u8>) -> Why {
++        Why { kind, detail }
++    }
++}
++
++/// A file whose record held under `check`, with the outcome its record has.
++struct WouldReuse {
++    file: Interned,
++    recorded: [u32; 6],
++}
++
++thread_local! {
++    /// Files `check` runs although their record held, until the run ends. Test files run on one thread.
++    static CHECKING: core::cell::RefCell<Option<Vec<WouldReuse>>> = const { core::cell::RefCell::new(None) };
++}
++
++/// With `BUN_TEST_INPUT_REUSE` set, moves the files to run to the front of `files` and returns how
++/// many there are, with the files whose record holds. `None` when reuse is off. Under `check`, every
++/// file runs and none is returned as reused; [`finish_check`] compares them after the run.
++///
++/// `BUN_TEST_INPUT_REUSE_REPORT=<path>` writes one JSON line per file: whether its record held, and
++/// if not, why (`why`, and `detail` when there is one).
++pub(crate) fn take_reusable(
++    vm: &VirtualMachine,
++    files: &mut [Interned],
++) -> Option<(usize, Vec<Reused>)> {
++    let mode = match bun_core::env_var::BUN_TEST_INPUT_REUSE.get_not_empty()? {
++        b"0" => return None,
++        b"explain" => Mode::Explain,
++        b"check" => Mode::Check,
++        _ => Mode::Reuse,
++    };
++    let Some(fingerprint) = recorder::fingerprint_hex(vm) else {
++        pretty_error!(
++            "<r><yellow>warn<r><d>:<r> BUN_TEST_INPUT_REUSE needs BUN_TEST_INPUT_RECORD_DIR and --isolate; every file runs\n"
++        );
++        return None;
++    };
++    let mut validator = Validator {
++        vm,
++        fingerprint,
++        hashes: HashMap::new(),
++        aot: HashMap::new(),
++        checks: HashMap::new(),
++        looks: HashMap::new(),
++    };
++    let mut report = Vec::new();
++    let mut reused = Vec::new();
++    let mut checking = Vec::new();
++    let mut kept = 0;
++    let started = std::time::Instant::now();
++    // Records of another build, record format, flags or environment: said once in every mode, so
++    // that a Bun upgrade does not look like reuse silently stopped working.
++    let mut ignored = 0usize;
++    vm.run_with_api_lock(|| {
++        for i in 0..files.len() {
++            let file = files[i];
++            let title = validator.shown(file.as_bytes());
++            report.extend_from_slice(b"{\"file\":");
++            json_string(&mut report, &title);
++            match validator.holds(file.as_bytes()) {
++                Ok(outcome) => {
++                    report.extend_from_slice(b",\"held\":true}\n");
++                    if mode == Mode::Check {
++                        checking.push(WouldReuse { file, recorded: outcome });
++                        files[kept] = file;
++                        kept += 1;
++                    } else {
++                        reused.push(Reused {
++                            file,
++                            pass: outcome[0],
++                            skip: outcome[2],
++                            todo: outcome[3],
++                            expectations: outcome[4],
++                        });
++                    }
++                }
++                Err(why) => {
++                    if why.kind == "fingerprint" || why.kind == "record-version" {
++                        ignored += 1;
++                    }
++                    let _ = write!(report, ",\"held\":false,\"why\":\"{}\"", why.kind);
++                    if !why.detail.is_empty() {
++                        report.extend_from_slice(b",\"detail\":");
++                        json_string(&mut report, &why.detail);
++                    }
++                    report.extend_from_slice(b"}\n");
++                    if mode == Mode::Explain {
++                        pretty_error!(
++                            "<r><d>reuse: {} runs: {}{}{}<r>\n",
++                            bstr::BStr::new(&title),
++                            why.kind,
++                            if why.detail.is_empty() { "" } else { " " },
++                            bstr::BStr::new(&why.detail)
++                        );
++                    }
++                    files[kept] = file;
++                    kept += 1;
++                }
++            }
++        }
++    });
++    let held = reused.len() + checking.len();
++    if ignored > 0 {
++        pretty_error!(
++            "<r><d>reuse:<r> {} {} ignored: written by another build or with other settings{}\n",
++            ignored,
++            if ignored == 1 { "record" } else { "records" },
++            if mode == Mode::Explain { "" } else { " (BUN_TEST_INPUT_REUSE=explain names each)" }
++        );
++    }
++    if mode != Mode::Reuse {
++        pretty_error!(
++            "<r><d>reuse: {} of {} files {}; {} paths hashed, {} questions asked, {} looks repeated, in {} ms<r>\n",
++            held,
++            files.len(),
++            if mode == Mode::Check { "would be reused" } else { "reused" },
++            validator.hashes.len(),
++            validator.checks.len(),
++            validator.looks.len(),
++            started.elapsed().as_micros() as f64 / 1000.0
++        );
++    }
++    write_report(&report, false);
++    if mode == Mode::Check {
++        CHECKING.with_borrow_mut(|it| *it = Some(checking));
++    }
++    Some((kept, reused))
++}
++
++/// After a `check` run: compares each file whose record held with the record this run wrote for it,
++/// prints a line per file whose outcome differs and a summary line, and returns how many differ.
++/// `None` when this run was not a `check`.
++pub(crate) fn finish_check(vm: &VirtualMachine) -> Option<usize> {
++    let checking = CHECKING.with_borrow_mut(|it| it.take())?;
++    let fingerprint = recorder::fingerprint_hex(vm)?;
++    let validator = Validator {
++        vm,
++        fingerprint,
++        hashes: HashMap::new(),
++        aot: HashMap::new(),
++        checks: HashMap::new(),
++        looks: HashMap::new(),
++    };
++    let mut report = Vec::new();
++    let mut mismatches = 0;
++    for it in &checking {
++        let title = validator.shown(it.file.as_bytes());
++        let fresh = validator.read(it.file.as_bytes()).ok().and_then(|record| record.outcome);
++        report.extend_from_slice(b"{\"file\":");
++        json_string(&mut report, &title);
++        if fresh == Some(it.recorded) {
++            report.extend_from_slice(b",\"check\":\"same\"}\n");
++            continue;
++        }
++        mismatches += 1;
++        let counts = |out: &mut Vec<u8>, counts: &[u32; 6]| {
++            for (i, (name, count)) in OUTCOME.iter().zip(counts).enumerate() {
++                let _ = write!(
++                    out,
++                    "{}{} {}",
++                    if i > 0 { ", " } else { "" },
++                    count,
++                    bstr::BStr::new(name)
++                );
++            }
++        };
++        let mut line = Vec::new();
++        counts(&mut line, &it.recorded);
++        line.extend_from_slice(b"; this run: ");
++        match &fresh {
++            Some(fresh) => counts(&mut line, fresh),
++            None => line.extend_from_slice(b"no outcome"),
++        }
++        pretty_error!(
++            "<r><red>reuse check:<r> {} would have been reused, but its outcome differs. Recorded: {}\n",
++            bstr::BStr::new(&title),
++            bstr::BStr::new(&line)
++        );
++        report.extend_from_slice(b",\"check\":\"differs\",\"recorded\":");
++        outcome_json(&mut report, &it.recorded);
++        report.extend_from_slice(b",\"thisRun\":");
++        match &fresh {
++            Some(fresh) => outcome_json(&mut report, fresh),
++            None => report.extend_from_slice(b"null"),
++        }
++        report.extend_from_slice(b"}\n");
++    }
++    // The markup is read from the format string, so each color is its own literal.
++    if mismatches > 0 {
++        pretty_error!(
++            "<r><red>reuse check:<r> would reuse {}, mismatches {}\n",
++            checking.len(),
++            mismatches
++        );
++    } else {
++        pretty_error!(
++            "<r><d>reuse check:<r> would reuse {}, mismatches {}\n",
++            checking.len(),
++            mismatches
++        );
++    }
++    write_report(&report, true);
++    Some(mismatches)
++}
++
++fn outcome_json(out: &mut Vec<u8>, counts: &[u32; 6]) {
++    out.push(b'{');
++    for (i, (name, count)) in OUTCOME.iter().zip(counts).enumerate() {
++        let _ = write!(
++            out,
++            "{}\"{}\":{}",
++            if i > 0 { "," } else { "" },
++            bstr::BStr::new(name),
++            count
++        );
++    }
++    out.push(b'}');
++}
++
++fn json_string(out: &mut Vec<u8>, value: &[u8]) {
++    let _ = write!(
++        out,
++        "{}",
++        bun_core::fmt::format_json_string_utf8(value, Default::default())
++    );
++}
++
++/// Writes (or, after the run, appends) to `BUN_TEST_INPUT_REUSE_REPORT`, if it is set.
++fn write_report(lines: &[u8], append: bool) {
++    let Some(path) = bun_core::env_var::BUN_TEST_INPUT_REUSE_REPORT.get_not_empty() else {
++        return;
++    };
++    let mut options = std::fs::OpenOptions::new();
++    options.create(true);
++    if append {
++        options.append(true);
++    } else {
++        options.write(true).truncate(true);
++    }
++    use std::os::unix::ffi::OsStrExt as _;
++    let written = options
++        .open(std::ffi::OsStr::from_bytes(path))
++        .and_then(|mut file| std::io::Write::write_all(&mut file, lines));
++    if let Err(err) = written {
++        pretty_error!(
++            "<r><yellow>warn<r><d>:<r> BUN_TEST_INPUT_REUSE_REPORT could not be written: {}\n",
++            err
++        );
++    }
++}
++
++struct Validator<'a> {
++    vm: &'a VirtualMachine,
++    fingerprint: Vec<u8>,
++    /// By absolute path: the hex SHA-256 of the file now, `None` if it can't be read.
++    hashes: HashMap<Vec<u8>, Option<Vec<u8>>>,
++    /// By absolute path: the hex `aotConfig` of the module now.
++    aot: HashMap<Vec<u8>, Option<Vec<u8>>>,
++    /// By question: the hex `check` of its answer now, `None` if it can't be asked again.
++    checks: HashMap<Vec<u8>, Option<Vec<u8>>>,
++    /// By look, path and extra: what looking again gives now.
++    looks: HashMap<Vec<u8>, Box<[u8]>>,
++}
++
++/// pass, fail, skip, todo, expectations, unhandledErrors.
++const OUTCOME: [&[u8]; 6] = [
++    b"pass",
++    b"fail",
++    b"skip",
++    b"todo",
++    b"expectations",
++    b"unhandledErrors",
++];
++
++struct Record {
++    fingerprint: Vec<u8>,
++    outcome: Option<[u32; 6]>,
++    unattributed_before: u32,
++    marks: Vec<Vec<u8>>,
++    resolutions: Vec<Resolution>,
++    /// Modules and answer files: absolute path and the recorded hex hash.
++    files: Vec<(Vec<u8>, Option<Vec<u8>>)>,
++    /// Modules: absolute path and the recorded `aotConfig`.
++    aot: Vec<(Vec<u8>, Option<Vec<u8>>)>,
++    /// Why a module can't be compared by its bytes, if one can't.
++    unhashable: Option<Why>,
++    /// What the file's own code looked at: how, the absolute path, what else the look needs, the value.
++    reads: Vec<(Look, Vec<u8>, Vec<u8>, Vec<u8>)>,
++}
++
++struct Resolution {
++    kind: Vec<u8>,
++    specifier: Vec<u8>,
++    importer: Vec<u8>,
++    importer_is_file: bool,
++    paths: Vec<Box<[u8]>>,
++    plugin: bool,
++    check: Option<Vec<u8>>,
++}
++
++impl Validator<'_> {
++    /// A path as reasons show it: relative to the root when under it.
++    fn shown(&self, path: &[u8]) -> Vec<u8> {
++        let root = self.vm.top_level_dir();
++        match path.strip_prefix(root) {
++            Some(rest) if rest.first().is_some_and(|&c| bun_paths::is_sep_native(c)) => rest[1..].to_vec(),
++            _ => path.to_vec(),
++        }
++    }
++
++    /// A question as reasons show it: `kind specifier from importer`.
++    fn question(&self, resolution: &Resolution) -> Vec<u8> {
++        let mut out = resolution.kind.clone();
++        out.push(b' ');
++        out.extend_from_slice(&self.shown(&resolution.specifier));
++        out.extend_from_slice(b" from ");
++        out.extend_from_slice(&self.shown(&resolution.importer));
++        out
++    }
++
++    /// The recorded outcome, or why the file runs.
++    fn holds(&mut self, file: &[u8]) -> Result<[u32; 6], Why> {
++        let record = self.read(file)?;
++        if record.fingerprint != self.fingerprint {
++            return Err(Why::new("fingerprint"));
++        }
++        let Some(outcome) = record.outcome else {
++            return Err(Why::new("error-before-tests"));
++        };
++        if outcome[1] > 0 {
++            return Err(Why::new("failed"));
++        }
++        if outcome[5] > 0 {
++            return Err(Why::new("unhandled-error"));
++        }
++        if record.unattributed_before > 0 {
++            return Err(Why::new("earlier-file-work"));
++        }
++        if let Some(name) = record.marks.first() {
++            return Err(Why::with("mark", name.clone()));
++        }
++        if let Some(why) = record.unhashable {
++            return Err(why);
++        }
++        for resolution in &record.resolutions {
++            if resolution.plugin {
++                return Err(Why::with("plugin", self.question(resolution)));
++            }
++            if resolution.check.is_none() {
++                return Err(Why::with("no-check", self.question(resolution)));
++            }
++        }
++        for (path, sha256) in &record.files {
++            let Some(sha256) = sha256 else {
++                return Err(Why::with("no-hash", self.shown(path)));
++            };
++            if self.hash(path) != Some(sha256) {
++                return Err(Why::with("changed", self.shown(path)));
++            }
++        }
++        let vm = self.vm;
++        for (path, recorded) in &record.aot {
++            let now = self.aot.entry(path.clone()).or_insert_with(|| {
++                let check = recorder::aot_config_check(vm, path)?;
++                let mut hex = Vec::with_capacity(64);
++                recorder::write_hex(&mut hex, &check);
++                Some(hex)
++            });
++            if now != recorded {
++                return Err(Why::with("package-config", self.shown(path)));
++            }
++        }
++        for (look, path, extra, value) in &record.reads {
++            let mut key = look.name().as_bytes().to_vec();
++            for part in [&path[..], &extra[..]] {
++                key.push(0);
++                key.extend_from_slice(part);
++            }
++            let vm = self.vm;
++            let now = self
++                .looks
++                .entry(key)
++                .or_insert_with(|| recorder::observe_again(vm, *look, path, extra));
++            if **now != **value {
++                let mut detail = look.name().as_bytes().to_vec();
++                detail.push(b' ');
++                detail.extend_from_slice(&self.shown(path));
++                return Err(Why::with("own-read", detail));
++            }
++        }
++        for resolution in &record.resolutions {
++            if self.check(resolution) != resolution.check.as_ref() {
++                return Err(Why::with("answer", self.question(resolution)));
++            }
++        }
++        Ok(outcome)
++    }
++
++    fn hash(&mut self, path: &[u8]) -> Option<&Vec<u8>> {
++        self.hashes
++            .entry(path.to_vec())
++            .or_insert_with(|| {
++                let contents = File::read_from(Fd::cwd(), path).ok()?;
++                let mut hex = Vec::with_capacity(64);
++                recorder::write_hex(&mut hex, &recorder::source_hash(&contents));
++                Some(hex)
++            })
++            .as_ref()
++    }
++
++    fn check(&mut self, resolution: &Resolution) -> Option<&Vec<u8>> {
++        let mut key = Vec::with_capacity(256);
++        for part in [
++            &resolution.kind,
++            &resolution.specifier,
++            &resolution.importer,
++        ] {
++            key.extend_from_slice(part);
++            key.push(0);
++        }
++        key.push(resolution.importer_is_file as u8);
++        for path in &resolution.paths {
++            key.push(0);
++            key.extend_from_slice(path);
++        }
++        let vm = self.vm;
++        self.checks
++            .entry(key)
++            .or_insert_with(|| {
++                let asked = recorder::Asked {
++                    kind: &resolution.kind,
++                    specifier: &resolution.specifier,
++                    importer: &resolution.importer,
++                    importer_is_file: resolution.importer_is_file,
++                    paths: &resolution.paths,
++                };
++                let check = recorder::check_again(vm, &asked)?;
++                let mut hex = Vec::with_capacity(64);
++                recorder::write_hex(&mut hex, &check);
++                Some(hex)
++            })
++            .as_ref()
++    }
++
++    fn read(&self, file: &[u8]) -> Result<Record, Why> {
++        let Some(path) = recorder::record_path(self.vm, file) else {
++            return Err(Why::new("not-recording"));
++        };
++        let contents = match File::read_from(Fd::cwd(), &path) {
++            Ok(contents) => contents,
++            Err(_) => return Err(Why::new("no-record")),
++        };
++        bun_ast::initialize_store();
++        let record = self.parse(&path, &contents);
++        bun_ast::Expr::data_store_reset();
++        bun_ast::Stmt::data_store_reset();
++        record
++    }
++
++    fn parse(&self, path: &[u8], contents: &[u8]) -> Result<Record, Why> {
++        let source = bun_ast::Source::init_path_string(path, contents);
++        let mut log = bun_ast::Log::init();
++        let Ok(parsed) = bun_json::ParsedJson::parse_json(&source, &mut log) else {
++            return Err(Why::new("unreadable-record"));
++        };
++        let root = &parsed.root;
++        let version = root.get(b"version").and_then(|it| it.as_number());
++        if version != Some(f64::from(recorder::RECORD_VERSION)) {
++            return Err(Why::new("record-version"));
++        }
++        self.parse_root(root).ok_or_else(|| Why::new("unreadable-record"))
++    }
++
++    fn parse_root(&self, root: &bun_ast::Expr) -> Option<Record> {
++        let string = |expr: &bun_ast::Expr, name: &[u8]| -> Option<Vec<u8>> {
++            Some(expr.get(name)?.as_utf8_string_literal()?.to_vec())
++        };
++        let flag = |expr: &bun_ast::Expr, name: &[u8]| -> bool {
++            expr.get(name).and_then(|it| it.as_bool()).unwrap_or(false)
++        };
++        let vm = self.vm;
++        let absolute = |path: Vec<u8>, from_root: bool| -> Vec<u8> {
++            if from_root {
++                recorder::from_root(vm, &path)
++            } else {
++                path
++            }
++        };
++        let outcome = match root.get(b"outcome") {
++            Some(outcome) if outcome.get(b"pass").is_some() => {
++                let mut counts = [0u32; 6];
++                for (count, name) in counts.iter_mut().zip(OUTCOME) {
++                    *count = outcome.get(name)?.as_number()? as u32;
++                }
++                Some(counts)
++            }
++            _ => None,
++        };
++        let mut marks = Vec::new();
++        if let Some(mut items) = root.get_array(b"marks") {
++            while let Some(item) = items.next() {
++                marks.push(item.as_utf8_string_literal()?.to_vec());
++            }
++        }
++        let mut resolutions = Vec::new();
++        if let Some(mut items) = root.get_array(b"resolutions") {
++            while let Some(item) = items.next() {
++                let mut paths = Vec::new();
++                if let Some(mut items) = item.get_array(b"paths") {
++                    while let Some(path) = items.next() {
++                        paths.push(Box::<[u8]>::from(path.as_utf8_string_literal()?));
++                    }
++                }
++                if let Some(mut indexes) = item.get_array(b"pathsFromRoot") {
++                    while let Some(index) = indexes.next() {
++                        let path = paths.get_mut(index.as_number()? as usize)?;
++                        *path = recorder::from_root(vm, path).into_boxed_slice();
++                    }
++                }
++                resolutions.push(Resolution {
++                    kind: string(&item, b"kind")?,
++                    specifier: absolute(
++                        string(&item, b"specifier")?,
++                        flag(&item, b"specifierFromRoot"),
++                    ),
++                    importer: absolute(
++                        string(&item, b"importer")?,
++                        flag(&item, b"importerFromRoot"),
++                    ),
++                    importer_is_file: !flag(&item, b"importerIsDir"),
++                    paths,
++                    plugin: flag(&item, b"plugin"),
++                    check: string(&item, b"check"),
++                });
++            }
++        }
++        let mut files = Vec::new();
++        let mut aot = Vec::new();
++        let mut unhashable = None;
++        for list in [&b"modules"[..], b"answerFiles"] {
++            let Some(mut items) = root.get_array(list) else {
++                continue;
++            };
++            while let Some(item) = items.next() {
++                let path = string(&item, b"path")?;
++                let path = if bun_paths::is_absolute(&path) {
++                    path
++                } else {
++                    recorder::from_root(vm, &path)
++                };
++                if unhashable.is_none() {
++                    if flag(&item, b"virtual") {
++                        unhashable = Some(Why::with("virtual", self.shown(&path)));
++                    } else if flag(&item, b"changedDuringRun") {
++                        unhashable = Some(Why::with("changed-during-run", self.shown(&path)));
++                    }
++                }
++                if list == b"modules" {
++                    aot.push((path.clone(), string(&item, b"aotConfig")));
++                }
++                files.push((path, string(&item, b"sha256")));
++            }
++        }
++        let mut reads = Vec::new();
++        if let Some(mut items) = root.get_array(b"reads") {
++            while let Some(item) = items.next() {
++                let look = Look::from_name(&string(&item, b"look")?)?;
++                let path = string(&item, b"path")?;
++                let path = if bun_paths::is_absolute(&path) {
++                    path
++                } else {
++                    recorder::from_root(vm, &path)
++                };
++                let extra = string(&item, b"extra").unwrap_or_default();
++                reads.push((look, path, extra, string(&item, b"value")?));
++            }
++        }
++        Some(Record {
++            reads,
++            fingerprint: string(root, b"fingerprint")?,
++            outcome,
++            unattributed_before: root.get(b"unattributedBefore")?.as_number()? as u32,
++            marks,
++            resolutions,
++            files,
++            aot,
++            unhashable,
++        })
++    }
++}
+diff --git a/src/runtime/cli/test/parallel/Frame.rs b/src/runtime/cli/test/parallel/Frame.rs
+index 6a31a48ea..d9c30ca67 100644
+--- a/src/runtime/cli/test/parallel/Frame.rs
++++ b/src/runtime/cli/test/parallel/Frame.rs
+@@ -56,6 +56,7 @@ pub(crate) fn counters(summary: &mut Summary) -> [&mut u32; 8] {
+         skipped_because_label: skipped,
+         files,
+         shuffled,
++        reused_files: _,
+     } = summary;
+     [
+         pass,
+diff --git a/src/runtime/cli/test/parallel/runner.rs b/src/runtime/cli/test/parallel/runner.rs
+index c7c428215..be5bb6bd6 100644
+--- a/src/runtime/cli/test/parallel/runner.rs
++++ b/src/runtime/cli/test/parallel/runner.rs
+@@ -83,6 +83,13 @@ pub(crate) fn run_as_coordinator(
+     // env map once per worker after .put() — appending after the fact would
+     // create duplicate entries when the parent already has the variable set,
+     // and POSIX getenv() returns the first match.
++    // Workers are started with other arguments than this process (an explicit preload, JSX and
++    // env-file flags), so they record the fingerprint of the run that the coordinator computed.
++    if let Some(fingerprint) = bun_jsc::test_input_recorder::fingerprint_text(vm) {
++        let _ = env
++            .map
++            .put(b"BUN_TEST_INPUT_RECORD_FINGERPRINT", fingerprint);
++    }
+     let mut envps: Vec<bun_core::CStringList> = Vec::with_capacity(k as usize);
+     for i in 0..k {
+         let mut id = Vec::new();
+diff --git a/src/runtime/cli/test_command.rs b/src/runtime/cli/test_command.rs
+index 79e9440b5..0d3b36808 100644
+--- a/src/runtime/cli/test_command.rs
++++ b/src/runtime/cli/test_command.rs
+@@ -5,6 +5,7 @@ use bun_io::Write as _;
+ use crate::cli::Command;
+ use crate::cli::run_compiled;
+ use crate::cli::test::changed_files_filter as ChangedFilesFilter;
++use crate::cli::test::input_reuse as InputReuse;
+ use crate::cli::test::parallel::runner as ParallelRunner;
+ use crate::cli::test::scanner::{self, Scanner};
+ use crate::cli::test::timings::Timings;
+@@ -2098,6 +2099,19 @@ impl CommandLineReporter {
+         self.jest.summary.get()
+     }
+ 
++    fn input_record_counts(&self) -> jsc::test_input_recorder::Counts {
++        let summary = self.summary();
++        let unhandled_errors = self.jest.unhandled_errors_between_tests.get();
++        [
++            ("pass", summary.pass),
++            ("fail", summary.fail),
++            ("skip", summary.skip),
++            ("todo", summary.todo),
++            ("expectations", summary.expectations),
++            ("unhandledErrors", unhandled_errors),
++        ]
++    }
++
+     pub(crate) fn update_summary(&self, update: impl FnOnce(&mut Summary)) {
+         self.jest.summary.with_taken(update);
+     }
+@@ -2874,6 +2888,11 @@ impl TestCommand {
+         if ctx.test_options.isolate {
+             vm.test_isolation_enabled.set(true);
+             vm.auto_killer.enabled.set(true);
++            let fingerprint = match env_var::BUN_TEST_INPUT_RECORD_FINGERPRINT.get_not_empty() {
++                Some(given) if ctx.test_options.test_worker => given.to_vec(),
++                _ => InputReuse::fingerprint(ctx, vm),
++            };
++            jsc::test_input_recorder::enable(vm, &fingerprint);
+         }
+         vm.test_isolation_state
+             .shares_global
+@@ -3120,6 +3139,40 @@ impl TestCommand {
+         } else {
+             &mut all_test_files[..]
+         };
++        // `BUN_TEST_INPUT_REUSE`: files whose record holds are counted as it says and not run. Under
++        // --parallel this is the coordinator; workers never see them. Coverage would miss them.
++        if !ctx.test_options.coverage.enabled
++            && let Some((kept, reused)) = InputReuse::take_reusable(vm, test_files)
++        {
++            for it in &reused {
++                let title = resolve_path::relative(FileSystem::get().top_level_dir(), it.file.as_bytes());
++                pretty_error!(
++                    "<r><d>{}: reused, {} pass",
++                    bstr::BStr::new(&title[..]),
++                    it.pass
++                );
++                if it.skip > 0 {
++                    pretty_error!(", {} skip", it.skip);
++                }
++                if it.todo > 0 {
++                    pretty_error!(", {} todo", it.todo);
++                }
++                pretty_error!(", {} expect() calls<r>\n", it.expectations);
++                reporter.update_summary(|summary| {
++                    summary.pass += it.pass;
++                    summary.skip += it.skip;
++                    summary.todo += it.todo;
++                    summary.expectations += it.expectations;
++                    summary.files += 1;
++                    summary.reused_files += 1;
++                });
++            }
++            Output::flush();
++            if kept == 0 && !reused.is_empty() {
++                pass_with_no_tests_from_filter = true;
++            }
++            test_files = &mut test_files[..kept];
++        }
+         // --shard=M/N: sort the test files for determinism, then keep only
+         // every Nth file starting at M-1. This round-robin distribution
+         // keeps shards roughly balanced regardless of how many files there
+@@ -3480,6 +3533,14 @@ impl TestCommand {
+                 }
+ 
+                 pretty_error!("{}{:5>} fail<r>\n", &indenter, summary.fail);
++                if summary.reused_files > 0 {
++                    pretty_error!(
++                        "{}<r><d>{:5>} file{} reused, not run<r>\n",
++                        &indenter,
++                        summary.reused_files,
++                        if summary.reused_files == 1 { "" } else { "s" }
++                    );
++                }
+                 if unhandled_errors > 0 {
+                     pretty_error!(
+                         "{}<r><red>{:5>} error{}<r>\n",
+@@ -3681,6 +3742,10 @@ impl TestCommand {
+         if vm.hot_reload.get() == jsc::virtual_machine::HotReload::Watch {
+             vm.run_with_api_lock(|| Self::run_event_loop_for_watch(vm));
+         }
++        // `BUN_TEST_INPUT_REUSE=check`: a file whose record held but whose outcome now differs fails the run.
++        if InputReuse::finish_check(vm).is_some_and(|mismatches| mismatches > 0) {
++            vm.exit_handler.exit_code.set(1);
++        }
+         let summary = reporter.summary();
+ 
+         let should_fail_on_no_tests = !ctx.test_options.pass_with_no_tests
+@@ -3809,6 +3874,13 @@ impl TestCommand {
+         let resolution = vm
+             .transpiler
+             .with_mut(|t| t.resolve_entry_point(file_name, &dot_slash))?;
++        jsc::test_input_recorder::did_resolve_directly(
++            vm,
++            "entry",
++            file_name,
++            vm.top_level_dir(),
++            &resolution,
++        );
+         // `append_slice` interns into the process-static `FilenameStore` and
+         // returns `&'static [u8]`.
+         Ok(FileSystem::get()
+@@ -3901,6 +3973,8 @@ impl TestCommand {
+         first_last: bun_test::FirstLast,
+     ) -> crate::Result<()> {
+         let _print_log = PrintLogAfterFile(vm.log.get());
++        let recording =
++            jsc::test_input_recorder::will_run_file(vm, file_name, reporter.input_record_counts());
+ 
+         let file_path = Self::resolve_test_file(vm, file_name)?;
+         vm.clear_entry_point()?;
+@@ -4165,6 +4239,7 @@ impl TestCommand {
+                 environment.teardown(vm);
+             }
+         }
++        recording.did_run_file(file_path, reporter.input_record_counts());
+         reporter.with_junit(|junit| {
+             let _ = junit.end_file(Some(junit_file_name(file_path)), None);
+         });
+diff --git a/src/runtime/ffi/ffi_body.rs b/src/runtime/ffi/ffi_body.rs
+index ead6258bc..e95a80f01 100644
+--- a/src/runtime/ffi/ffi_body.rs
++++ b/src/runtime/ffi/ffi_body.rs
+@@ -990,6 +990,7 @@ impl StringArray {
+ impl FFI {
+     pub(crate) fn cc<'a>(cx: &mut JsScope<'a>, options: JsLocal<'a>) -> JsResult<JSValue> {
+         let global_this = cx.global();
++        bun_jsc::test_input_recorder::mark(global_this.bun_vm(), b"ffi");
+         if !global_this.bun_vm().allow_ffi_cc() {
+             return Err(global_this
+                 .err(
+@@ -1494,6 +1495,7 @@ impl FFI {
+         let object_value = symbols.to_js();
+         jsc::mark_binding();
+         let vm = jsc::VirtualMachineRef::get();
++        bun_jsc::test_input_recorder::mark(global.bun_vm(), b"ffi");
+ 
+         if object_value.is_empty_or_undefined_or_null() {
+             return Ok(invalid_options_arg(global));
+diff --git a/src/runtime/image/Image.rs b/src/runtime/image/Image.rs
+index 6729453b3..944407039 100644
+--- a/src/runtime/image/Image.rs
++++ b/src/runtime/image/Image.rs
+@@ -348,6 +348,11 @@ fn source_from_js(global: &JSGlobalObject, value: JSValue) -> JsResult<Source> {
+             return Ok(Source::Owned(out));
+         }
+         crate::node::types::Valid::path_null_bytes(s, global)?;
++        bun_jsc::test_input_recorder::own_read(
++            global.bun_vm(),
++            bun_jsc::test_own_reads::Look::Content,
++            s,
++        );
+         return Ok(Source::Path(ZBox::from_bytes(s)));
+     }
+     if let Some(ab) = value.as_array_buffer(global) {
+diff --git a/src/runtime/jsc_hooks.rs b/src/runtime/jsc_hooks.rs
+index a3afc5d39..e17abf3f0 100644
+--- a/src/runtime/jsc_hooks.rs
++++ b/src/runtime/jsc_hooks.rs
+@@ -626,6 +626,13 @@ fn load_preloads(vm: &VirtualMachine) -> bun_jsc::CrateResult<*mut JSInternalPro
+             };
+ 
+             // ── import ──────────────────────────────────────────────────────
++            bun_jsc::test_input_recorder::did_resolve_directly(
++                vm,
++                "preload",
++                normalized,
++                top_level_dir,
++                &result,
++            );
+             let path_text = result
+                 .path()
+                 .expect("resolver Success result has a primary path")
+@@ -2152,6 +2159,13 @@ fn transpile_source_code_of_any_provenance<const DATA_ONLY: bool>(
+                 if !disable_transpilying {
+                     maybe_watch_file(jsc_vm, &mut input_file, is_node_override, path, hash);
+                 }
++                bun_jsc::test_input_recorder::did_read_source(
++                    jsc_vm,
++                    path.text,
++                    loader,
++                    &parse_result.source.contents,
++                    virtual_source.is_some(),
++                );
+ 
+                 // SAFETY: `transpiler.log` was swapped to non-null `args.log` above.
+                 if unsafe { (*(*transpiler).log).errors > 0 } {
+@@ -3776,6 +3790,7 @@ fn transpile_file<const DATA_ONLY: bool>(
+     } else if is_commonjs_require && jsc_vm.has_mutated_built_in_extensions.get() > 0 {
+         use bun_jsc::node_module_module::{CustomLoader, find_longest_registered_extension};
+         if let Some(entry) = find_longest_registered_extension(jsc_vm, _specifier.slice()) {
++            bun_jsc::test_input_recorder::mark(jsc_vm, b"require-extensions");
+             match entry {
+                 CustomLoader::Loader(loader) => lr.loader = Some(*loader),
+                 CustomLoader::Custom(strong) => {
+@@ -3914,6 +3929,7 @@ fn transpile_file<const DATA_ONLY: bool>(
+                     && jsc_vm.has_mutated_built_in_extensions.get() == 0
+                 {
+                     if let Some(entry) = find_longest_registered_extension(jsc_vm, lr.path.text) {
++                        bun_jsc::test_input_recorder::mark(jsc_vm, b"require-extensions");
+                         match entry {
+                             CustomLoader::Loader(loader) => break 'loader *loader,
+                             CustomLoader::Custom(strong) => {
+diff --git a/src/runtime/node/node_fs.rs b/src/runtime/node/node_fs.rs
+index a77331146..6e5fb12b6 100644
+--- a/src/runtime/node/node_fs.rs
++++ b/src/runtime/node/node_fs.rs
+@@ -276,7 +276,9 @@ pub(crate) fn note_found_on_disk() {
+     }
+ }
+ 
++/// Before `Bun.spawn`, `Bun.spawnSync` (and so `node:child_process`) or the shell starts a process.
+ pub(crate) fn note_process_start() {
++    bun_jsc::test_input_recorder::mark_current(b"spawn");
+     if let Some(graph) = compiled_program_graph() {
+         graph.note_process_start();
+     }
+diff --git a/src/runtime/node/node_fs_binding.rs b/src/runtime/node/node_fs_binding.rs
+index cb96f7419..4f2a1ac0f 100644
+--- a/src/runtime/node/node_fs_binding.rs
++++ b/src/runtime/node/node_fs_binding.rs
+@@ -20,15 +20,145 @@ use crate::node::fs::{
+ /// Returns bindings to call jsc.Node.fs.NodeFS.<function>.
+ /// Async calls use a thread pool.
+ 
+-fn run_sync_with<R: FsReturn, A: FsArgument>(
++/// What a `node:fs` call looks at and writes, for the test input recorder (`bun test --isolate`
++/// with `BUN_TEST_INPUT_RECORD_DIR`). Called on the JS thread with the parsed arguments, before the
++/// operation runs or is scheduled. Calls on a file descriptor are covered by the `open` that made it.
++fn note_own<A: FsArgument + 'static>(vm: &VirtualMachine, function: NodeFSFunctionEnum, args: &A) {
++    use bun_jsc::test_input_recorder as recorder;
++    use bun_jsc::test_own_reads::Look;
++    use NodeFSFunctionEnum as F;
++    if !recorder::is_recording(vm) {
++        return;
++    }
++    let [first, second] = args.paths();
++    let (first, second) = (first.map(|it| it.slice()), second.map(|it| it.slice()));
++    let read = |look: Look, path: Option<&[u8]>| {
++        if let Some(path) = path {
++            recorder::own_read(vm, look, path);
++        }
++    };
++    let write = |path: Option<&[u8]>| {
++        if let Some(path) = path {
++            recorder::own_write(vm, path, false);
++        }
++    };
++    let any: &dyn core::any::Any = args;
++    // What an open (or a whole-file write) with these flags depends on: the bytes when it reads
++    // them or keeps some of them, else whether the path is there when that decides failure.
++    let open_like = |flags: i32, path: Option<&[u8]>| {
++        use bun_sys::O;
++        let access = flags & (O::RDONLY | O::WRONLY | O::RDWR);
++        if access != O::WRONLY || flags & O::APPEND != 0 || flags & O::TRUNC == 0 {
++            read(Look::Content, path);
++        } else if flags & O::EXCL != 0 || flags & O::CREAT == 0 {
++            read(Look::Exists, path);
++        }
++        if access != O::RDONLY || flags & (O::CREAT | O::TRUNC | O::APPEND) != 0 {
++            write(path);
++        }
++    };
++    match function {
++        F::Access | F::Exists => read(Look::Exists, first),
++        F::Stat => read(Look::Stat, first),
++        F::Lstat => read(Look::Lstat, first),
++        F::Readlink => read(Look::Readlink, first),
++        F::Realpath | F::RealpathNonNative => read(Look::Realpath, first),
++        F::Readdir => {
++            let recursive = any
++                .downcast_ref::<args::Readdir<'static>>()
++                .is_some_and(|it| it.recursive);
++            read(if recursive { Look::ListRecursive } else { Look::List }, first);
++        }
++        F::ReadFile => read(Look::Content, first),
++        F::Open => {
++            let flags = any
++                .downcast_ref::<args::Open<'static>>()
++                .map_or(0, |it| it.flags.as_int());
++            open_like(flags, first);
++        }
++        F::WriteFile | F::AppendFile => {
++            let flags = match any.downcast_ref::<args::WriteFile<'static>>() {
++                Some(it) => it.flag.as_int(),
++                None => any
++                    .downcast_ref::<args::AppendFile<'static>>()
++                    .map_or(0, |it| it.0.flag.as_int()),
++            };
++            open_like(flags, first);
++        }
++        F::CopyFile => {
++            read(Look::Content, first);
++            let exclusive = any
++                .downcast_ref::<args::CopyFile<'static>>()
++                .is_some_and(|it| it.mode.0 & 1 != 0);
++            if exclusive {
++                read(Look::Exists, second);
++            }
++            write(second);
++        }
++        F::Rename => {
++            read(Look::Exists, first);
++            write(first);
++            write(second);
++        }
++        F::Link | F::Symlink => {
++            if function == F::Link {
++                read(Look::Exists, first);
++            }
++            // The new name must not be there yet.
++            let new = if function == F::Link { second } else { first };
++            read(Look::Exists, new);
++            write(new);
++        }
++        F::Mkdtemp => {
++            if let Some(prefix) = first {
++                recorder::own_write(vm, prefix, true);
++            }
++        }
++        F::Mkdir => {
++            let recursive = any
++                .downcast_ref::<args::Mkdir<'static>>()
++                .is_some_and(|it| it.recursive);
++            if !recursive {
++                read(Look::Exists, first);
++            }
++            write(first);
++        }
++        F::Rm => {
++            let force = any
++                .downcast_ref::<args::Rm<'static>>()
++                .is_some_and(|it| it.0.force);
++            if !force {
++                read(Look::Exists, first);
++            }
++            write(first);
++        }
++        F::Truncate => {
++            // What is left of the bytes is still there afterwards.
++            read(Look::Content, first);
++            write(first);
++        }
++        F::Unlink | F::Rmdir | F::Chmod | F::Chown | F::Lchmod | F::Lchown | F::Utimes
++        | F::Lutimes => {
++            // These fail when the path is missing.
++            read(Look::Exists, first);
++            write(first);
++        }
++        F::Statfs | F::Close | F::Fchmod | F::Fchown | F::Fdatasync | F::Fstat | F::Fsync
++        | F::Ftruncate | F::Futimes | F::Read | F::Readv | F::Write | F::Writev => {}
++    }
++}
++
++fn run_sync_with<R: FsReturn, A: FsArgument + 'static>(
+     cx: &mut JsScope<'_>,
+     args: &[JsLocal<'_>],
++    function: NodeFSFunctionEnum,
+     dispatch: impl FnOnce(&A) -> Maybe<R>,
+ ) -> JsResult<JSValue> {
+     let global = cx.global();
+     let vm: &VirtualMachine = global.bun_vm();
+     let mut slice = ArgumentsSlice::init(vm, JsLocal::to_js_slice(args));
+     let args = <A as FsArgument>::from_js(global, &mut slice)?;
++    note_own(vm, function, &args);
+     move_waiting_descriptors();
+     match dispatch(&args) {
+         Err(err) => Err(global.throw_value(err.to_js(global))),
+@@ -37,7 +167,7 @@ fn run_sync_with<R: FsReturn, A: FsArgument>(
+ }
+ 
+ /// `Bindings(FunctionEnum).runSync`.
+-fn run_sync<R: FsReturn, A: FsArgument, const F: NodeFSFunctionEnum>(
++fn run_sync<R: FsReturn, A: FsArgument + 'static, const F: NodeFSFunctionEnum>(
+     this: &Binding,
+     cx: &mut JsScope<'_>,
+     args: &[JsLocal<'_>],
+@@ -48,14 +178,14 @@ where
+     // R-2: `JsCell::with_mut` scopes the `&mut NodeFS` to the blocking
+     // syscall; `dispatch` never re-enters JS, and `Maybe<R>` is fully owned
+     // (`sys::Error.path` is `Box<[u8]>`, not a borrow into `sync_error_buf`).
+-    run_sync_with::<R, A>(cx, args, |args| {
++    run_sync_with::<R, A>(cx, args, F, |args| {
+         this.node_fs
+             .with_mut(|nfs| NodeFS::dispatch::<R, A, F>(nfs, args, Flavor::Sync))
+     })
+ }
+ 
+ /// A synchronous `node:fs` function for compiled code. It has no binding object and uses the `NodeFS` of the VM.
+-fn run_sync_function<R: FsReturn, A: FsArgument, const F: NodeFSFunctionEnum>(
++fn run_sync_function<R: FsReturn, A: FsArgument + 'static, const F: NodeFSFunctionEnum>(
+     cx: &mut JsScope<'_>,
+     args: &[JsLocal<'_>],
+ ) -> JsResult<JSValue>
+@@ -63,7 +193,7 @@ where
+     Op<{ F }>: NodeFSDispatch<R, A>,
+ {
+     let vm = cx.global().bun_vm();
+-    run_sync_with::<R, A>(cx, args, |args| {
++    run_sync_with::<R, A>(cx, args, F, |args| {
+         crate::jsc_hooks::with_node_fs(vm, |node_fs| {
+             node_fs.vm = Some(vm);
+             NodeFS::dispatch::<R, A, F>(node_fs, args, Flavor::Sync)
+@@ -125,10 +255,11 @@ fn split_callback<'a>(
+ /// Windows path picks `UVFSRequest` for a handful of fds-only ops while
+ /// everything else uses `AsyncFSTask`, and that choice is encoded in the
+ /// `async_::*` type aliases rather than derivable from `F` alone.
+-fn run_async<A: FsArgument>(
++fn run_async<A: FsArgument + 'static>(
+     this: &Binding,
+     cx: &mut JsScope<'_>,
+     args: &[JsLocal<'_>],
++    function: NodeFSFunctionEnum,
+     arm: AsyncArm,
+     create_task: fn(
+         &bun_jsc::JsThread<'_>,
+@@ -146,6 +277,7 @@ fn run_async<A: FsArgument>(
+         ParsedAsyncArgs::Rejected(error) => return reject_before_schedule(global, callback, error),
+     };
+     let vm: &VirtualMachine = global.bun_vm();
++    note_own(vm, function, &*args);
+     move_waiting_descriptors();
+     Ok(create_task(&cx, this, args, vm, callback))
+ }
+@@ -223,6 +355,7 @@ impl Binding {
+             ParsedAsyncArgs::Rejected(error) => return reject_before_schedule(global, None, error),
+         };
+         let vm: &VirtualMachine = global.bun_vm();
++        note_cp(vm, &cp_args);
+         Ok(AsyncCpTask::create(&cx, self, cp_args, vm))
+     }
+ 
+@@ -234,6 +367,7 @@ impl Binding {
+ 
+         // `defer args.deinit()` → `Drop` on `cp_args` (its `PathLike` fields).
+         let cp_args = args::Cp::from_js(global, &mut slice)?;
++        note_cp(vm, &cp_args);
+ 
+         // R-2: blocking syscall — `&mut NodeFS` scoped to the call, no JS re-entry.
+         match self.node_fs.with_mut(|nfs| nfs.cp(&cp_args, Flavor::Sync)) {
+@@ -272,6 +406,7 @@ impl Binding {
+             }
+         };
+         let vm: &VirtualMachine = global.bun_vm();
++        note_own(vm, NodeFSFunctionEnum::Readdir, &*rd_args);
+         // /$bunfs/ is in-memory; readdir_inner handles it (recursive included).
+         let is_bunfs = bun_standalone_graph::Graph::get_ref()
+             .is_some_and(|graph| graph.owns_directory(rd_args.path.slice()));
+@@ -291,6 +426,11 @@ impl Binding {
+         let mut slice = ArgumentsSlice::init(cx.vm(), JsLocal::to_js_slice(args));
+ 
+         let watch_args = fs::Watcher::Arguments::from_js(&cx, &mut slice)?;
++        bun_jsc::test_input_recorder::own_read(
++            cx.vm(),
++            bun_jsc::test_own_reads::Look::Exists,
++            watch_args.path.slice(),
++        );
+ 
+         // R-2: `NodeFS::watch` only reads `self.vm` (no scratch-buffer write);
+         // scoped via `with_mut` so the borrow cannot outlive the call.
+@@ -314,6 +454,11 @@ impl Binding {
+         let mut slice = ArgumentsSlice::init(cx.vm(), JsLocal::to_js_slice(args));
+ 
+         let wf_args = fs::StatWatcher::Arguments::from_js(&cx, &mut slice)?;
++        bun_jsc::test_input_recorder::own_read(
++            cx.vm(),
++            bun_jsc::test_own_reads::Look::Stat,
++            wf_args.path.slice(),
++        );
+ 
+         match self
+             .node_fs
+@@ -343,14 +488,14 @@ macro_rules! node_fs_bindings {
+                     cx: &mut JsScope<'_>,
+                     args: &[JsLocal<'_>],
+                 ) -> JsResult<JSValue> {
+-                    run_async::<$Args>(self, cx, args, AsyncArm::Promise, async_::$F::create)
++                    run_async::<$Args>(self, cx, args, NodeFSFunctionEnum::$F, AsyncArm::Promise, async_::$F::create)
+                 }
+                 pub(crate) fn $callback(
+                     &self,
+                     cx: &mut JsScope<'_>,
+                     args: &[JsLocal<'_>],
+                 ) -> JsResult<JSValue> {
+-                    run_async::<$Args>(self, cx, args, AsyncArm::Callback, async_::$F::create)
++                    run_async::<$Args>(self, cx, args, NodeFSFunctionEnum::$F, AsyncArm::Callback, async_::$F::create)
+                 }
+             )*
+         }
+@@ -417,6 +562,21 @@ impl Binding {
+     // pub const statfsSync = callSync(.statfs);
+ }
+ 
++/// `fs.cp`: what is below the source, and the destination, for the test input recorder.
++fn note_cp(vm: &VirtualMachine, args: &args::Cp<'static>) {
++    use bun_jsc::test_input_recorder as recorder;
++    use bun_jsc::test_own_reads::Look;
++    if !recorder::is_recording(vm) {
++        return;
++    }
++    let look = if args.flags.recursive { Look::Tree } else { Look::Content };
++    recorder::own_read(vm, look, args.src.slice());
++    if args.flags.error_on_exist && !args.flags.force {
++        recorder::own_read(vm, Look::Exists, args.dest.slice());
++    }
++    recorder::own_write(vm, args.dest.slice(), false);
++}
++
+ pub(crate) fn binding<'a>(cx: &mut JsScope<'a>) -> JsWrapper<'a, Binding> {
+     Binding {
+         node_fs: JsCell::new(NodeFS {
+diff --git a/src/runtime/shell/interpreter.rs b/src/runtime/shell/interpreter.rs
+index 7991d02b5..dfb79d7f2 100644
+--- a/src/runtime/shell/interpreter.rs
++++ b/src/runtime/shell/interpreter.rs
+@@ -2503,6 +2503,8 @@ pub(crate) fn create_shell_interpreter<'a>(
+     use crate::shell::parsed_shell_script::{self, ParsedShellScript};
+ 
+     let global = cx.global();
++    // Builtins and redirections read and write files out of sight, and commands run elsewhere.
++    bun_jsc::test_input_recorder::mark(global.bun_vm(), b"shell");
+     let parsed_shell_script_js = parsed_shell_script.to_js();
+     let parsed_shell_script = parsed_shell_script_js
+         .as_class_ref::<ParsedShellScript>()
+diff --git a/src/runtime/test_runner/jest.rs b/src/runtime/test_runner/jest.rs
+index 0df5c2d00..370662c56 100644
+--- a/src/runtime/test_runner/jest.rs
++++ b/src/runtime/test_runner/jest.rs
+@@ -236,6 +236,8 @@ pub(crate) struct Summary {
+     pub(crate) skipped_because_label: u32,
+     /// Files reordered by `describe.shuffle`. The seed is printed if there are any.
+     pub(crate) shuffled: u32,
++    /// Files not run because their input record held; `files` counts them too.
++    pub(crate) reused_files: u32,
+ }
+ 
+ impl Summary {
+diff --git a/src/runtime/test_runner/snapshot.rs b/src/runtime/test_runner/snapshot.rs
+index c4572eabd..3887187cf 100644
+--- a/src/runtime/test_runner/snapshot.rs
++++ b/src/runtime/test_runner/snapshot.rs
+@@ -337,6 +337,9 @@ impl Snapshots {
+         let (_, _, len) =
+             snapshot_file_path(test_file, path_buf.0.as_mut_slice()).ok_or(Error::FailedToOpenSnapshotFile)?;
+         let path = &path_buf.0[..len];
++        if let Some(vm) = VirtualMachine::get_or_null() {
++            bun_jsc::test_input_recorder::own_read(vm, bun_jsc::test_own_reads::Look::Content, path);
++        }
+         let contents = match bun_sys::File::read_from(bun_sys::Fd::cwd(), path) {
+             Ok(contents) => contents,
+             Err(err) if err.get_errno() == bun_sys::Errno::ENOENT => Vec::new(),
+@@ -629,6 +632,9 @@ impl Snapshots {
+             return FileOutcome::IsSnapshotFile;
+         }
+ 
++        if let Some(vm) = VirtualMachine::get_or_null() {
++            bun_jsc::test_input_recorder::own_read(vm, bun_jsc::test_own_reads::Look::Content, path);
++        }
+         let saved = match bun_sys::File::read_from(bun_sys::Fd::cwd(), path) {
+             Ok(saved) => Some(saved),
+             Err(err) if err.get_errno() == bun_sys::Errno::ENOENT => None,
+@@ -656,6 +662,9 @@ impl Snapshots {
+             None => {}
+         }
+ 
++        if let Some(vm) = VirtualMachine::get_or_null() {
++            bun_jsc::test_input_recorder::own_write(vm, path, false);
++        }
+         let flags = bun_sys::O::WRONLY | bun_sys::O::CREAT | bun_sys::O::TRUNC;
+         match bun_sys::File::make_open(path, flags, 0o644).and_then(|file| file.write_all(received)) {
+             Ok(()) => {
+@@ -694,6 +703,9 @@ impl Snapshots {
+         let (_, _, len) =
+             snapshot_file_path(file.test_file, path_buf.0.as_mut_slice()).ok_or(Error::FailedToWriteSnapshotFile)?;
+         let path = ZStr::from_buf(&path_buf.0[..], len);
++        if let Some(vm) = VirtualMachine::get_or_null() {
++            bun_jsc::test_input_recorder::own_write(vm, path.as_bytes(), false);
++        }
+         if self.values.is_empty() {
+             return match bun_sys::unlink(path) {
+                 Err(err) if err.get_errno() != bun_sys::Errno::ENOENT => Err(Error::FailedToWriteSnapshotFile),
+@@ -1180,6 +1192,9 @@ impl Snapshots {
+             buf[dir_len] = after_dir;
+         }
+ 
++        if let Some(vm) = VirtualMachine::get_or_null() {
++            bun_jsc::test_input_recorder::own_write(vm, &buf[..len], false);
++        }
+         // Not O_TRUNC: a run that exits before `write_snapshot_file` must leave the old contents.
+         let flags: i32 = bun_sys::O::CREAT | bun_sys::O::RDWR;
+         let fd = bun_sys::open(ZStr::from_buf(&buf[..], len), flags, 0o644)?;
+diff --git a/src/runtime/webcore/Blob.rs b/src/runtime/webcore/Blob.rs
+index a9967b9ab..c481dc04f 100644
+--- a/src/runtime/webcore/Blob.rs
++++ b/src/runtime/webcore/Blob.rs
+@@ -1110,6 +1110,7 @@ impl BlobExt for Blob {
+         validate_writable_blob(cx.global(), self)?;
+ 
+         let store = self.store().expect("infallible: store present").clone();
++        note_file_write(cx.global(), &store);
+         match &store.data {
+             store::Data::S3(s3) => s3.unlink(store.clone(), &cx, Some(options.to_js())),
+             store::Data::File(file) => file.unlink(&cx),
+@@ -1318,6 +1319,7 @@ impl BlobExt for Blob {
+         validate_writable_blob(global_this, self)?;
+ 
+         let store = self.store().expect("infallible: store present").clone();
++        note_file_write(global_this, &store);
+         if self.is_s3() {
+             // Borrow `s3` through the
+             // cloned `store: RefPtr<Store>` (independent of `self`) so the
+@@ -2777,6 +2779,15 @@ impl BlobExt for Blob {
+             }
+         };
+ 
++        // `Bun.file`, a `file://` fetch or a file body: what the code reads from it later is the
++        // file's bytes, so they count from here; a write first makes them not an input.
++        if let PathOrFileDescriptor::Path(path) = &path {
++            bun_jsc::test_input_recorder::own_read(
++                global_this.bun_vm(),
++                bun_jsc::test_own_reads::Look::Content,
++                path.slice(),
++            );
++        }
+         named(
+             Blob::init_with_store(
+                 bun_core::handle_oom(Store::init_file(path, None)),
+@@ -3857,6 +3868,9 @@ pub(crate) fn write_file_internal(
+     {
+         return Ok(JSPromise::rejected_promise(cx.global(), err.to_js(cx.global())).to_js());
+     }
++    if let Some(PathOrFileDescriptor::Path(path)) = destination {
++        bun_jsc::test_input_recorder::own_write(cx.global().bun_vm(), path.slice(), false);
++    }
+ 
+     if let Some(mkdir) = options.mkdirp_if_not_exists {
+         if mkdir
+@@ -4675,6 +4689,15 @@ fn is_held_at_source_path(path: &PathOrFileDescriptor<'static>) -> bool {
+             .is_some_and(|graph| graph.find_data(path.slice()).is_some())
+ }
+ 
++/// A file blob's path is about to be written or removed, for the test input recorder.
++fn note_file_write(global_this: &JSGlobalObject, store: &Store) {
++    if let store::Data::File(file) = &store.data
++        && let PathOrFileDescriptor::Path(path) = &file.pathlike
++    {
++        bun_jsc::test_input_recorder::own_write(global_this.bun_vm(), path.slice(), false);
++    }
++}
++
+ /// `find_or_create_file_from_path` with `check_s3`.
+ #[inline(always)]
+ fn try_find_or_create_file_from_path(
+diff --git a/src/runtime/webview/ChromeProcess.rs b/src/runtime/webview/ChromeProcess.rs
+index 6f4211187..7ff90bb7a 100644
+--- a/src/runtime/webview/ChromeProcess.rs
++++ b/src/runtime/webview/ChromeProcess.rs
+@@ -602,6 +602,7 @@ fn spawn(
+             ..SpawnOptions::default()
+         };
+ 
++        bun_jsc::test_input_recorder::mark_current(b"spawn");
+         let spawned = bun_spawn::spawn_process(&opts, argv, Some(env.as_list()))??;
+         #[cfg(windows)]
+         let mut spawned = spawned;
+diff --git a/src/runtime/webview/HostProcess.rs b/src/runtime/webview/HostProcess.rs
+index c707b7554..4ebe0102f 100644
+--- a/src/runtime/webview/HostProcess.rs
++++ b/src/runtime/webview/HostProcess.rs
+@@ -179,6 +179,7 @@ fn spawn(vm: &VirtualMachine, stdout_inherit: bool, stderr_inherit: bool) -> Res
+     };
+ 
+     let (argv, env) = (CStrList::new(&argv), CStrList::new(&env));
++    bun_jsc::test_input_recorder::mark_current(b"spawn");
+     let spawned = bun_spawn::spawn_process(&opts, argv, Some(env))??;
+ 
+     let event_loop = EventLoopHandle::init(vm.event_loop_ptr());
+diff --git a/test/cli/test/isolation.test.ts b/test/cli/test/isolation.test.ts
+index 6d0d65721..382edc2e6 100644
+--- a/test/cli/test/isolation.test.ts
++++ b/test/cli/test/isolation.test.ts
+@@ -3510,3 +3510,436 @@ describe.concurrent("mocks and spies do not outlive their test file", () => {
+     });
+   });
+ });
++
++describe.concurrent("BUN_TEST_INPUT_RECORD_DIR writes one record of inputs per test file", () => {
++  const recorderFixtures = {
++    "package.json": `{ "name": "recorded" }`,
++    "shared.ts": `export const value = 1;\n`,
++    "a.test.ts": `
++      import { expect, test } from "bun:test";
++      import { value } from "./shared";
++      test("a", () => {
++        expect(() => require("./missing")).toThrow();
++        expect(value).toBe(1);
++      });
++    `,
++    "b.test.ts": `
++      import { expect, test } from "bun:test";
++      import { value } from "./shared";
++      test("b", () => expect(value).toBe(1));
++      test.skip("skipped", () => {});
++    `,
++  };
++  const sha256 = (dir: string, file: string) =>
++    new Bun.CryptoHasher("sha256").update(fs.readFileSync(join(dir, file))).digest("hex");
++
++  function readRecords(dir: string) {
++    const records = join(dir, "records");
++    const names = fs.existsSync(records) ? fs.readdirSync(records).sort() : [];
++    return names.map(name => {
++      const record = JSON.parse(fs.readFileSync(join(records, name), "utf8"));
++      const local = (p: string) =>
++        p === record.root ? "." : p.startsWith(record.root + "/") ? p.slice(record.root.length + 1) : p;
++      return {
++        name,
++        file: record.file,
++        outcome: record.outcome,
++        resolutions: record.resolutions.map((r: any) => [r.kind, local(r.specifier), local(r.importer), r.answer]),
++        modules: record.modules,
++      };
++    });
++  }
++
++  function expected(dir: string, sharedCachedInB: boolean) {
++    const shared = { path: "shared.ts", sha256: sha256(dir, "shared.ts"), loader: "ts" };
++    return [
++      {
++        name: "a.test.ts.json",
++        file: "a.test.ts",
++        outcome: { pass: 1, fail: 0, skip: 0, todo: 0, expectations: 2, unhandledErrors: 0 },
++        resolutions: [
++          ["entry", "a.test.ts", ".", "a.test.ts"],
++          ["import", "a.test.ts", "", "a.test.ts"],
++          ["import", "./shared", "a.test.ts", "shared.ts"],
++          ["require", "./missing", "a.test.ts", null],
++        ],
++        modules: [{ path: "a.test.ts", sha256: sha256(dir, "a.test.ts"), loader: "ts" }, shared],
++      },
++      {
++        name: "b.test.ts.json",
++        file: "b.test.ts",
++        outcome: { pass: 1, fail: 0, skip: 1, todo: 0, expectations: 1, unhandledErrors: 0 },
++        resolutions: [
++          ["entry", "b.test.ts", ".", "b.test.ts"],
++          ["import", "b.test.ts", "", "b.test.ts"],
++          ["import", "./shared", "b.test.ts", "shared.ts"],
++        ],
++        modules: [
++          { path: "b.test.ts", sha256: sha256(dir, "b.test.ts"), loader: "ts" },
++          sharedCachedInB ? { ...shared, cached: true } : shared,
++        ],
++      },
++    ];
++  }
++
++  test("--isolate records resolutions, hashed sources and outcomes, including sources served from the cache", async () => {
++    using dir = tempDir("input-record", recorderFixtures);
++    const env = { ...bunEnv, BUN_TEST_INPUT_RECORD_DIR: "records" };
++    const { stderr, exitCode } = await runTests(String(dir), ["--isolate"], ["./a.test.ts", "./b.test.ts"], env);
++    expect({ records: readRecords(String(dir)), exitCode }).toEqual({
++      records: expected(String(dir), true),
++      exitCode: 0,
++    });
++    expect(stderr).toContain("2 pass");
++  });
++
++  test("--parallel=2 records the same questions and sources from every worker", async () => {
++    using dir = tempDir("input-record-parallel", recorderFixtures);
++    const env = { ...bunEnv, BUN_TEST_INPUT_RECORD_DIR: "records" };
++    const { exitCode } = await runTests(String(dir), ["--parallel=2"], ["./a.test.ts", "./b.test.ts"], env);
++    const records = readRecords(String(dir)).map(r => ({ ...r, modules: r.modules.map(({ cached, ...m }: any) => m) }));
++    expect({ records, exitCode }).toEqual({ records: expected(String(dir), false), exitCode: 0 });
++  });
++
++  test("a module that a finished file is still loading is not credited to the next file", async () => {
++    using dir = tempDir("input-record-leftover", {
++      "late.ts": `export const late = 1;\n`,
++      "a.test.ts": `
++        import { test } from "bun:test";
++        test("a", () => {
++          import("./late");
++        });
++      `,
++      "b.test.ts": `
++        import { test } from "bun:test";
++        test("b", async () => {
++          await Bun.sleep(1);
++        });
++      `,
++    });
++    const env = { ...bunEnv, BUN_TEST_INPUT_RECORD_DIR: "records" };
++    const { exitCode } = await runTests(String(dir), ["--isolate"], ["./a.test.ts", "./b.test.ts"], env);
++    const records = readRecords(String(dir));
++    expect({
++      files: records.map(r => r.file),
++      modulesOfB: records[1]?.modules.map((m: any) => m.path),
++      exitCode,
++    }).toEqual({ files: ["a.test.ts", "b.test.ts"], modulesOfB: ["b.test.ts"], exitCode: 0 });
++  });
++
++  test("without --isolate nothing is recorded", async () => {
++    using dir = tempDir("input-record-off", recorderFixtures);
++    const env = { ...bunEnv, BUN_TEST_INPUT_RECORD_DIR: "records" };
++    const { exitCode } = await runTests(String(dir), [], ["./a.test.ts", "./b.test.ts"], env);
++    expect({ exists: fs.existsSync(join(String(dir), "records")), exitCode }).toEqual({ exists: false, exitCode: 0 });
++  });
++});
++
++describe.concurrent("BUN_TEST_INPUT_REUSE skips test files whose record still holds", () => {
++  const files = {
++    "package.json": `{ "name": "reused" }`,
++    "shared.ts": `export const value = 1;\n`,
++    "only-c.ts": `export const c = 1;\n`,
++    "a.test.ts": `
++      import { expect, test } from "bun:test";
++      import { value } from "./shared";
++      test("a", () => expect(value).toBe(1));
++    `,
++    "b.test.ts": `
++      import { expect, test } from "bun:test";
++      import { value } from "./shared";
++      test("b", () => expect(value).toBe(1));
++      test.skip("skipped", () => {});
++    `,
++    "c.test.ts": `
++      import { expect, test } from "bun:test";
++      import { c } from "./only-c";
++      test("c", () => expect(c).toBe(1));
++    `,
++    "spawns.test.ts": `
++      import { expect, test } from "bun:test";
++      test("spawns", () => expect(Bun.spawnSync({ cmd: [process.execPath, "--version"] }).exitCode).toBe(0));
++    `,
++  };
++  const names = ["./a.test.ts", "./b.test.ts", "./c.test.ts", "./spawns.test.ts"];
++  const record = { ...bunEnv, BUN_TEST_INPUT_RECORD_DIR: "records" };
++  const reuse = { ...record, BUN_TEST_INPUT_REUSE: "explain" };
++  const reusedFiles = (stderr: string) => [...stderr.matchAll(/^(\S+): reused, /gm)].map(m => m[1]).sort();
++
++  test("a file whose modules and answers are unchanged is reused, one whose module changed runs", async () => {
++    using dir = tempDir("input-reuse", files);
++    const first = await runTests(String(dir), ["--isolate"], names, record);
++    fs.writeFileSync(join(String(dir), "only-c.ts"), `export const c = 2;\n`);
++    const { stderr, exitCode } = await runTests(String(dir), ["--isolate"], names, reuse);
++    expect({ first: first.exitCode, reused: reusedFiles(stderr), exitCode }).toEqual({
++      first: 0,
++      reused: ["a.test.ts", "b.test.ts"],
++      exitCode: 1,
++    });
++    expect(stderr).toContain("reuse: spawns.test.ts runs: mark spawn");
++    expect(stderr).toContain("2 files reused, not run");
++    expect(stderr).toMatch(/3 pass\s+1 skip\s+1 fail/);
++  });
++
++  test("a file whose import now resolves to another file runs", async () => {
++    using dir = tempDir("input-reuse-shadow", files);
++    await runTests(String(dir), ["--isolate"], names, record);
++    fs.writeFileSync(join(String(dir), "shared.tsx"), `export const value = 1;\n`);
++    fs.rmSync(join(String(dir), "shared.ts"));
++    const { stderr, exitCode } = await runTests(String(dir), ["--isolate"], names, reuse);
++    expect({ reused: reusedFiles(stderr), exitCode }).toEqual({ reused: ["c.test.ts"], exitCode: 0 });
++  });
++
++  test("a record holds in another checkout of the same files", async () => {
++    using dir = tempDir("input-reuse-moved", { here: files });
++    const here = join(String(dir), "here");
++    await runTests(here, ["--isolate"], names, record);
++    fs.cpSync(here, join(String(dir), "there"), { recursive: true });
++    const { stderr, exitCode } = await runTests(join(String(dir), "there"), ["--isolate"], names, reuse);
++    expect({ reused: reusedFiles(stderr), exitCode }).toEqual({
++      reused: ["a.test.ts", "b.test.ts", "c.test.ts"],
++      exitCode: 0,
++    });
++  });
++
++  test("with every file reused the run passes, and a failed file is never reused", async () => {
++    using dir = tempDir("input-reuse-fail", {
++      ...files,
++      "fails.test.ts": `
++        import { expect, test } from "bun:test";
++        test("fails", () => expect(1).toBe(2));
++      `,
++    });
++    await runTests(String(dir), ["--isolate"], ["./a.test.ts", "./fails.test.ts"], record);
++    const onlyA = await runTests(String(dir), ["--isolate"], ["./a.test.ts"], reuse);
++    const both = await runTests(String(dir), ["--isolate"], ["./a.test.ts", "./fails.test.ts"], reuse);
++    expect({
++      onlyA: [reusedFiles(onlyA.stderr), onlyA.exitCode],
++      both: [reusedFiles(both.stderr), both.exitCode],
++    }).toEqual({ onlyA: [["a.test.ts"], 0], both: [["a.test.ts"], 1] });
++    expect(both.stderr).toContain("reuse: fails.test.ts runs: failed");
++  });
++
++  test("check runs every file and fails when one whose record held now has other counts", async () => {
++    using dir = tempDir("input-reuse-check", {
++      ...files,
++      "flavor.test.ts": `
++        import { expect, test } from "bun:test";
++        test("flavor", () => expect(process.env.FLAVOR).toBe("a"));
++      `,
++    });
++    const these = ["./a.test.ts", "./flavor.test.ts", "./spawns.test.ts"];
++    await runTests(String(dir), ["--isolate"], these, { ...record, FLAVOR: "a" });
++    const report = join(String(dir), "report.jsonl");
++    const check = { ...record, BUN_TEST_INPUT_REUSE: "check", BUN_TEST_INPUT_REUSE_REPORT: report };
++    const same = await runTests(String(dir), ["--isolate"], these, { ...check, FLAVOR: "a" });
++    const differs = await runTests(String(dir), ["--isolate"], these, { ...check, FLAVOR: "b" });
++    const lines = fs.readFileSync(report, "utf8").trim().split("\n").map(line => JSON.parse(line));
++    expect({
++      same: [same.exitCode, same.stderr.includes("reuse check: would reuse 2, mismatches 0")],
++      differs: [differs.exitCode, differs.stderr.includes("reuse check: would reuse 2, mismatches 1")],
++      ran: differs.stderr.match(/(\d+) pass/)?.[1],
++      lines,
++    }).toEqual({
++      same: [0, true],
++      differs: [1, true],
++      ran: "2",
++      lines: [
++        { file: "a.test.ts", held: true },
++        { file: "flavor.test.ts", held: true },
++        { file: "spawns.test.ts", held: false, why: "mark", detail: "spawn" },
++        { file: "a.test.ts", check: "same" },
++        {
++          file: "flavor.test.ts",
++          check: "differs",
++          recorded: { pass: 1, fail: 0, skip: 0, todo: 0, expectations: 1, unhandledErrors: 0 },
++          thisRun: { pass: 0, fail: 1, skip: 0, todo: 0, expectations: 1, unhandledErrors: 0 },
++        },
++      ],
++    });
++    expect(differs.stderr).toContain("flavor.test.ts would have been reused, but its outcome differs");
++    expect(differs.stderr).not.toContain("<red>");
++  });
++
++  test("a file runs again when what its own code read changed, not when it only read what it wrote", async () => {
++    using dir = tempDir("input-reuse-own-reads", {
++      ...files,
++      "data.txt": "v1",
++      "listed/one": "",
++      "reads.test.ts": `
++        import { expect, test } from "bun:test";
++        import * as fs from "node:fs";
++        test("reads", async () => {
++          expect(fs.readFileSync(import.meta.dir + "/data.txt", "utf8")).toBe("v1");
++          expect(await fs.promises.readdir(import.meta.dir + "/listed")).toEqual(["one"]);
++        });
++      `,
++      "writes.test.ts": `
++        import { expect, test } from "bun:test";
++        import * as fs from "node:fs";
++        test("writes", async () => {
++          fs.mkdirSync(import.meta.dir + "/out", { recursive: true });
++          fs.writeFileSync(import.meta.dir + "/out/w.txt", String(Date.now()));
++          expect(fs.readFileSync(import.meta.dir + "/out/w.txt", "utf8").length).toBeGreaterThan(0);
++          await Bun.write(import.meta.dir + "/out/b.txt", String(Math.random()));
++          expect((await Bun.file(import.meta.dir + "/out/b.txt").text()).length).toBeGreaterThan(0);
++        });
++      `,
++    });
++    const these = ["./a.test.ts", "./reads.test.ts", "./writes.test.ts"];
++    await runTests(String(dir), ["--isolate"], these, record);
++    const unchanged = await runTests(String(dir), ["--isolate"], these, reuse);
++    fs.writeFileSync(join(String(dir), "data.txt"), "v2");
++    const content = await runTests(String(dir), ["--isolate"], these, reuse);
++    fs.writeFileSync(join(String(dir), "data.txt"), "v1");
++    await runTests(String(dir), ["--isolate"], these, record);
++    fs.writeFileSync(join(String(dir), "listed/two"), "");
++    const listing = await runTests(String(dir), ["--isolate"], these, reuse);
++    expect({
++      unchanged: reusedFiles(unchanged.stderr),
++      content: [reusedFiles(content.stderr), content.exitCode],
++      listing: [reusedFiles(listing.stderr), listing.exitCode],
++    }).toEqual({
++      unchanged: ["a.test.ts", "reads.test.ts", "writes.test.ts"],
++      content: [["a.test.ts", "writes.test.ts"], 1],
++      listing: [["a.test.ts", "writes.test.ts"], 1],
++    });
++    expect(content.stderr).toContain("reuse: reads.test.ts runs: own-read content data.txt");
++    expect(listing.stderr).toContain("reuse: reads.test.ts runs: own-read list listed");
++  });
++
++  test("a file with module mocks is reused, and runs again when its manual mock changes or appears", async () => {
++    using dir = tempDir("input-reuse-mocks", {
++      ...files,
++      "dep.ts": `export const dep = "real";\n`,
++      "user.ts": `import { dep } from "./dep";\nexport const use = () => "user:" + dep;\n`,
++      "auto.ts": `export const auto = "real";\n`,
++      "plain.ts": `export const plain = "real";\n`,
++      "__mocks__/auto.ts": `export const auto = "manual";\n`,
++      "factory.test.ts": `
++        import { expect, mock, test } from "bun:test";
++        test("factory", async () => {
++          mock.module("./dep", () => ({ dep: "mocked" }));
++          expect((await import("./user")).use()).toBe("user:mocked");
++        });
++      `,
++      "manual.test.ts": `
++        import { expect, test, vi } from "bun:test";
++        test("manual", async () => {
++          vi.mock("./auto");
++          vi.mock("./plain");
++          expect([(await import("./auto")).auto, (await import("./plain")).plain]).toEqual(["manual", "real"]);
++        });
++      `,
++    });
++    const these = ["./factory.test.ts", "./manual.test.ts"];
++    await runTests(String(dir), ["--isolate"], these, record);
++    const unchanged = await runTests(String(dir), ["--isolate"], these, reuse);
++    fs.writeFileSync(join(String(dir), "__mocks__/plain.ts"), `export const plain = "manual";\n`);
++    const appeared = await runTests(String(dir), ["--isolate"], these, reuse);
++    expect({
++      unchanged: reusedFiles(unchanged.stderr),
++      appeared: [reusedFiles(appeared.stderr), appeared.exitCode],
++    }).toEqual({ unchanged: ["factory.test.ts", "manual.test.ts"], appeared: [["factory.test.ts"], 1] });
++  });
++
++  test("records of another format or fingerprint are ignored, and the run says so once without explain", async () => {
++    using dir = tempDir("input-reuse-ignored", files);
++    const two = ["./a.test.ts", "./c.test.ts"];
++    const plain = { ...record, BUN_TEST_INPUT_REUSE: "1" };
++    await runTests(String(dir), ["--isolate"], two, record);
++    const recordFile = join(String(dir), "records", "a.test.ts.json");
++    fs.writeFileSync(recordFile, fs.readFileSync(recordFile, "utf8").replace(/^\{"version":\d+/, '{"version":2'));
++    const format = await runTests(String(dir), ["--isolate"], two, plain);
++    const salted = await runTests(String(dir), ["--isolate"], two, { ...plain, BUN_TEST_INPUT_RECORD_SALT: "other" });
++    expect({ format: reusedFiles(format.stderr), salted: reusedFiles(salted.stderr) }).toEqual({
++      format: ["c.test.ts"],
++      salted: [],
++    });
++    expect(format.stderr).toContain("1 record ignored: written by another build or with other settings");
++    expect(salted.stderr).toContain("2 records ignored: written by another build or with other settings");
++  });
++
++  test("the original of a mocked module, served from the cache, is the same input as its file", async () => {
++    const mocking = `
++      import { expect, mock, test } from "bun:test";
++      mock.module("./dep", async (importOriginal) => ({ ...(await importOriginal<any>()), extra: 1 }));
++      test("original", async () => {
++        const m: any = await import("./dep");
++        expect([m.dep, m.extra]).toEqual(["real", 1]);
++      });
++    `;
++    using dir = tempDir("input-reuse-actual", {
++      ...files,
++      "dep.ts": `export const dep = "real";\n`,
++      "first.test.ts": mocking,
++      "second.test.ts": mocking,
++    });
++    const these = ["./first.test.ts", "./second.test.ts"];
++    await runTests(String(dir), ["--isolate"], these, record);
++    const second = JSON.parse(fs.readFileSync(join(String(dir), "records", "second.test.ts.json"), "utf8"));
++    const unchanged = await runTests(String(dir), ["--isolate"], these, reuse);
++    fs.writeFileSync(join(String(dir), "dep.ts"), `export const dep = "edited";\n`);
++    const edited = await runTests(String(dir), ["--isolate"], these, reuse);
++    expect({
++      modules: second.modules.map((m: any) => [m.path, typeof m.sha256, !!m.cached]),
++      unchanged: reusedFiles(unchanged.stderr),
++      edited: [reusedFiles(edited.stderr), edited.exitCode],
++    }).toEqual({
++      modules: [
++        ["second.test.ts", "string", false],
++        ["dep.ts", "string", true],
++      ],
++      unchanged: ["first.test.ts", "second.test.ts"],
++      edited: [[], 1],
++    });
++  });
++
++  test("a changed .env file or listed variable runs every file, an unlisted variable does not", async () => {
++    using dir = tempDir("input-reuse-env", files);
++    const two = ["./a.test.ts", "./c.test.ts"];
++    const listed = { ...reuse, BUN_TEST_INPUT_RECORD_ENV: "DB_NAME", DB_NAME: "one" };
++    await runTests(String(dir), ["--isolate"], two, { ...record, BUN_TEST_INPUT_RECORD_ENV: "DB_NAME", DB_NAME: "one" });
++    const unlisted = await runTests(String(dir), ["--isolate"], two, { ...listed, DB_PORT: "5433" });
++    const variable = await runTests(String(dir), ["--isolate"], two, { ...listed, DB_NAME: "two" });
++    const again = await runTests(String(dir), ["--isolate"], two, { ...listed, DB_NAME: "two" });
++    fs.writeFileSync(join(String(dir), ".env"), "X=1\n");
++    const envFile = await runTests(String(dir), ["--isolate"], two, { ...listed, DB_NAME: "two" });
++    expect({
++      unlisted: reusedFiles(unlisted.stderr),
++      variable: reusedFiles(variable.stderr),
++      again: reusedFiles(again.stderr),
++      envFile: reusedFiles(envFile.stderr),
++    }).toEqual({ unlisted: ["a.test.ts", "c.test.ts"], variable: [], again: ["a.test.ts", "c.test.ts"], envFile: [] });
++  });
++
++  // Records leave out the JSX and decorator settings a resolver result carries per module, because
++  // `bun test` transpiles every module with the root tsconfig.json's settings, which are in the
++  // fingerprint. If a nested tsconfig.json starts to count here, reuse can keep a stale outcome.
++  test("a nested tsconfig.json changes neither JSX nor decorators at run time", async () => {
++    const runtime = (flavor: string) => ({
++      "package.json": `{ "name": "jsx-${flavor}", "exports": { "./jsx-runtime": "./rt.js", "./jsx-dev-runtime": "./rt.js" } }`,
++      "rt.js": `export const jsx = () => "${flavor}", jsxs = jsx, jsxDEV = jsx, Fragment = null;\n`,
++    });
++    using dir = tempDir("input-reuse-nested-tsconfig", {
++      "package.json": `{ "name": "nested" }`,
++      "tsconfig.json": JSON.stringify({
++        compilerOptions: { jsx: "react-jsx", jsxImportSource: "jsx-a", experimentalDecorators: true },
++      }),
++      "node_modules/jsx-a": runtime("a"),
++      "node_modules/jsx-b": runtime("b"),
++      "nest/tsconfig.json": JSON.stringify({
++        compilerOptions: { jsx: "react-jsx", jsxImportSource: "jsx-b", experimentalDecorators: false },
++      }),
++      "nest/nested.test.tsx": `
++        import { expect, test } from "bun:test";
++        let args = 0;
++        const count = (...rest: unknown[]) => { args = rest.length; };
++        class C { @count method() {} }
++        test("nested", () => expect({ flavor: <div />, args }).toEqual({ flavor: "a", args: 3 }));
++      `,
++    });
++    const { stdout, stderr, exitCode } = await runTests(String(dir), ["--isolate"], ["./nest/nested.test.tsx"], bunEnv);
++    expect({ exitCode, stderr: exitCode === 0 ? "" : stdout + stderr }).toEqual({ exitCode: 0, stderr: "" });
++  });
++});
