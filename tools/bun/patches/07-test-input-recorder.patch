@@ -133,10 +133,10 @@ index 15110f74d..cc4c4e600 100644
          // `VirtualMachine::use_isolation_source_provider_cache` to avoid forming
 diff --git a/src/jsc/TestInputRecorder.rs b/src/jsc/TestInputRecorder.rs
 new file mode 100644
-index 000000000..3a6fd8d67
+index 000000000..60c48db4c
 --- /dev/null
 +++ b/src/jsc/TestInputRecorder.rs
-@@ -0,0 +1,1199 @@
+@@ -0,0 +1,1331 @@
 +//! `BUN_TEST_INPUT_RECORD_DIR=<dir>` with `bun test --isolate`: for every test file, write
 +//! `<dir>/<path relative to the record root, URI-component-encoded>.json` with what the file
 +//! depended on: every resolution made while it was the current file (question and answer), every
@@ -254,6 +254,7 @@ index 000000000..3a6fd8d67
 +        .test_isolation_state
 +        .input_recorder
 +        .set(Box::new(recorder));
++    Bun__TestInputRecorder__enabled.store(true, core::sync::atomic::Ordering::Relaxed);
 +}
 +
 +/// What paths in records are relative to, so that a record holds in another checkout: the unit that
@@ -413,9 +414,16 @@ index 000000000..3a6fd8d67
 +}
 +
 +impl Drop for PendingResolve<'_> {
++    /// A resolution that ended without [`PendingResolve::did_resolve`] threw (a plugin's
++    /// `onResolve`, or a termination): its question has no answer to check, so the record is not
++    /// reusable. An import that finds nothing is an answer, not this.
 +    fn drop(&mut self) {
 +        if let Some((recorder, _)) = self.recording.take() {
-+            recorder.state.borrow_mut().open.pop();
++            let mut state = recorder.state.borrow_mut();
++            state.open.pop();
++            if let Some(file) = state.file.as_mut() {
++                file.mark(b"resolve-threw");
++            }
 +        }
 +    }
 +}
@@ -514,6 +522,12 @@ index 000000000..3a6fd8d67
 +    }
 +}
 +
++/// Whether a VM of this process records: read by `IsolatedModuleCache::lookup`, so a cache hit
++/// calls into the recorder only then.
++#[unsafe(no_mangle)]
++pub static Bun__TestInputRecorder__enabled: core::sync::atomic::AtomicBool =
++    core::sync::atomic::AtomicBool::new(false);
++
 +/// `IsolatedModuleCache::lookup` found a provider for `key`.
 +#[unsafe(no_mangle)]
 +pub extern "C" fn Bun__TestInputRecorder__didServeCachedSource(
@@ -549,11 +563,7 @@ index 000000000..3a6fd8d67
 +    };
 +    let mut state = recorder.state.borrow_mut();
 +    match state.file.as_mut() {
-+        Some(file) => {
-+            if !file.marks.iter().any(|it| &**it == name) {
-+                file.marks.push(Box::from(name));
-+            }
-+        }
++        Some(file) => file.mark(name),
 +        None => state.unattributed += 1,
 +    }
 +}
@@ -588,14 +598,124 @@ index 000000000..3a6fd8d67
 +/// looked at there is observed first. A write while
 +/// no file is current changes no record: every look of the last file was observed when its record
 +/// was written, and the next file's looks see what the write left.
++///
++/// The effect applies at once, also if the write then fails; the `node:fs` calls use [`OwnWrites`]
++/// instead. A tree written into a directory that is there and is not the file's product (an
++/// archive extracted into it) merges with what was there, which stays an input.
 +pub fn own_write(vm: &VirtualMachine, path: &[u8], wrote: Wrote) {
 +    let Some(recorder) = recorder_of(vm) else {
 +        return;
 +    };
++    let path = absolute_now(path);
 +    let mut state = recorder.state.borrow_mut();
 +    if let Some(file) = state.file.as_mut() {
-+        file.own.write(&recorder.root, &absolute_now(path), wrote);
++        let merges = wrote == Wrote::Tree
++            && !file.own.generated(&path)
++            && bun_sys::stat(&bun_core::ZBox::from_vec(path.clone())).is_ok_and(|st| {
++                st.st_mode as u32 & bun_sys::S::IFMT as u32 == bun_sys::S::IFDIR as u32
++            });
++        file.own
++            .write(&recorder.root, &path, if merges { Wrote::Meta } else { wrote });
 +    }
++}
++
++/// What one call writes, for [`own_wrote`] to apply when it succeeded. Made when the call is made:
++/// paths are absolute then, and what the file looked at there is observed then.
++pub struct OwnWrites {
++    /// The number of the file that made the call; 0 between files.
++    file: u32,
++    effects: Vec<OwnEffect>,
++}
++
++// SAFETY: plain data, made and applied on the JS thread of the VM that records.
++unsafe impl crate::job::JsAffine for OwnWrites {}
++
++enum OwnEffect {
++    Wrote(Box<[u8]>, Wrote),
++    Linked { at: Box<[u8]>, target: Box<[u8]> },
++    /// `fs.mkdtemp`: the directory it returns is new.
++    Created,
++}
++
++impl OwnWrites {
++    /// `None` when not recording.
++    pub fn new(vm: &VirtualMachine) -> Option<OwnWrites> {
++        Some(OwnWrites {
++            file: recording_token(vm)?,
++            effects: Vec::new(),
++        })
++    }
++
++    /// The call is about to write `path` as `wrote` says: what the file looked at there is observed
++    /// now, and the write's effect waits for the call to succeed.
++    pub fn write(&mut self, vm: &VirtualMachine, path: &[u8], wrote: Wrote) {
++        let Some(recorder) = recorder_of(vm) else {
++            return;
++        };
++        let path = absolute_now(path);
++        if let Some(file) = recorder.state.borrow_mut().file.as_mut() {
++            file.own.before_write(&recorder.root, &path);
++        }
++        self.effects.push(OwnEffect::Wrote(path.into_boxed_slice(), wrote));
++    }
++
++    /// The call makes a symbolic link at `at` to `target` (relative to the link's directory).
++    pub fn link(&mut self, vm: &VirtualMachine, at: &[u8], target: &[u8]) {
++        self.write(vm, at, Wrote::File);
++        let at = absolute_now(at);
++        let target = if bun_paths::is_absolute(target) {
++            bun_paths::Path::resolve(&[target]).as_bytes().to_vec()
++        } else {
++            let dir = bun_paths::dirname(&at).unwrap_or(&at);
++            bun_paths::Path::resolve(&[dir, target]).as_bytes().to_vec()
++        };
++        self.effects.push(OwnEffect::Linked {
++            at: at.into_boxed_slice(),
++            target: target.into_boxed_slice(),
++        });
++    }
++
++    /// The call is `fs.mkdtemp`: the directory it returns is the file's product.
++    pub fn created(&mut self) {
++        self.effects.push(OwnEffect::Created);
++    }
++}
++
++/// The call that made `writes` succeeded, returning `returned` if it returns a path: its effects
++/// apply, if the file that made it is still the current one. A failed call, or one that completes
++/// after its file, leaves what it wrote an input of whatever reads it.
++pub fn own_wrote(vm: &VirtualMachine, writes: OwnWrites, returned: Option<&[u8]>) {
++    let Some(recorder) = recorder_of(vm) else {
++        return;
++    };
++    let mut state = recorder.state.borrow_mut();
++    if writes.file == 0 || writes.file != state.file_number {
++        return;
++    }
++    let Some(file) = state.file.as_mut() else {
++        return;
++    };
++    for effect in writes.effects {
++        match effect {
++            OwnEffect::Wrote(path, wrote) => file.own.wrote(&path, wrote),
++            OwnEffect::Linked { at, target } => file.own.linked(&at, &target),
++            OwnEffect::Created => {
++                if let Some(path) = returned {
++                    file.own.wrote(&absolute_now(path), Wrote::Tree);
++                }
++            }
++        }
++    }
++}
++
++/// Whether what is at `path` now is the current file's own product.
++pub fn own_generated(vm: &VirtualMachine, path: &[u8]) -> bool {
++    let Some(recorder) = recorder_of(vm) else {
++        return false;
++    };
++    let path = absolute_now(path);
++    let state = recorder.state.borrow();
++    state.file.as_ref().is_some_and(|file| file.own.generated(&path))
 +}
 +
 +/// Looks at a path again the way a record says it was looked at, for validation.
@@ -634,13 +754,19 @@ index 000000000..3a6fd8d67
 +
 +impl State {
 +    fn note_module(&mut self, path: &[u8], cached: bool) {
-+        if !bun_paths::is_absolute(path) {
-+            return;
-+        }
 +        let Some(file) = self.file.as_mut() else {
 +            self.unattributed += 1;
 +            return;
 +        };
++        if !bun_paths::is_absolute(path) {
++            // A module that is no file (a plugin's `namespace:path`, or anything else without a
++            // path) can't be hashed again, so the record is not reusable. Builtins load no source.
++            let builtin = path.starts_with(b"node:") || path.starts_with(b"bun:");
++            if !builtin {
++                file.mark(b"module-without-file");
++            }
++            return;
++        }
 +        if !file.module_index.contains_key(path) && file.own.generated(path) {
 +            file.generated += 1;
 +            return;
@@ -656,6 +782,12 @@ index 000000000..3a6fd8d67
 +}
 +
 +impl FileState {
++    fn mark(&mut self, name: &[u8]) {
++        if !self.marks.iter().any(|it| &**it == name) {
++            self.marks.push(Box::from(name));
++        }
++    }
++
 +    /// A question asked from a module the file's own code wrote, or answered by one, is left out:
 +    /// that module is the product of the file's code and recorded inputs, and its path may never
 +    /// exist again (a temporary directory), so the question can't be asked again. What such a
@@ -1338,7 +1470,7 @@ index 000000000..3a6fd8d67
 +}
 diff --git a/src/jsc/TestInputStore.rs b/src/jsc/TestInputStore.rs
 new file mode 100644
-index 000000000..f42771178
+index 000000000..df5a546b9
 --- /dev/null
 +++ b/src/jsc/TestInputStore.rs
 @@ -0,0 +1,882 @@
@@ -1689,13 +1821,13 @@ index 000000000..f42771178
 +// ── Files and locks ──
 +
 +#[cfg(unix)]
-+fn os_path(path: &[u8]) -> std::path::PathBuf {
++pub fn os_path(path: &[u8]) -> std::path::PathBuf {
 +    use std::os::unix::ffi::OsStrExt as _;
 +    std::path::PathBuf::from(std::ffi::OsStr::from_bytes(path))
 +}
 +
 +#[cfg(not(unix))]
-+fn os_path(path: &[u8]) -> std::path::PathBuf {
++pub fn os_path(path: &[u8]) -> std::path::PathBuf {
 +    std::path::PathBuf::from(String::from_utf8_lossy(path).into_owned())
 +}
 +
@@ -2226,10 +2358,10 @@ index 000000000..f42771178
 +}
 diff --git a/src/jsc/TestOwnReads.rs b/src/jsc/TestOwnReads.rs
 new file mode 100644
-index 000000000..e163093d0
+index 000000000..fde229cf6
 --- /dev/null
 +++ b/src/jsc/TestOwnReads.rs
-@@ -0,0 +1,432 @@
+@@ -0,0 +1,514 @@
 +//! What a test file's own code read from the file system, as part of its input record.
 +//!
 +//! The JavaScript-facing file APIs (`node:fs` in all three forms, `Bun.file` and `Bun.write`,
@@ -2252,12 +2384,14 @@ index 000000000..e163093d0
 +pub enum Look {
 +    /// The bytes.
 +    Content,
-+    /// Type and size, following a symbolic link.
++    /// Type, size and the owner's permission bits, following a symbolic link.
 +    Stat,
-+    /// Type and size of the path itself.
++    /// The same, of the path itself.
 +    Lstat,
 +    /// Whether it exists.
 +    Exists,
++    /// Whether `access` with the mode in `extra` (decimal) succeeds.
++    Access,
 +    /// A symbolic link's target.
 +    Readlink,
 +    /// The canonical path.
@@ -2272,11 +2406,12 @@ index 000000000..e163093d0
 +    Glob,
 +}
 +
-+const LOOKS: [(Look, &str); 10] = [
++const LOOKS: [(Look, &str); 11] = [
 +    (Look::Content, "content"),
 +    (Look::Stat, "stat"),
 +    (Look::Lstat, "lstat"),
 +    (Look::Exists, "exists"),
++    (Look::Access, "access"),
 +    (Look::Readlink, "readlink"),
 +    (Look::Realpath, "realpath"),
 +    (Look::List, "list"),
@@ -2315,8 +2450,6 @@ index 000000000..e163093d0
 +    /// Removed the path, made it a new directory, or moved or copied a tree to it: whatever is at
 +    /// or below it afterwards is the file's own product.
 +    Tree,
-+    /// `fs.mkdtemp`: every path that starts with these bytes is new.
-+    Prefix,
 +    /// Changed only metadata, or made a directory that may have been there already: what is at or
 +    /// below it is not the file's product.
 +    Meta,
@@ -2329,6 +2462,9 @@ index 000000000..e163093d0
 +    /// Absolute paths the file wrote, created or removed, as given and with the symbolic links of
 +    /// their parent resolved (a module's path is the resolved one, as `/private/tmp` on macOS).
 +    written: Vec<(Box<[u8]>, Wrote)>,
++    /// Symbolic links the file made, and the absolute target of each: a look through one is a look
++    /// at what it points to, which is an input unless that is the file's product too.
++    links: Vec<(Box<[u8]>, Box<[u8]>)>,
 +}
 +
 +/// `path` with the symbolic links of its parent directory resolved, when that changes it.
@@ -2408,12 +2544,33 @@ index 000000000..e163093d0
 +        self.written.iter().any(|(written, wrote)| match wrote {
 +            Wrote::File => **written == *path,
 +            Wrote::Tree => under(path, written),
-+            Wrote::Prefix => path.starts_with(written),
 +            Wrote::Meta => false,
 +        })
 +    }
 +
++    /// `path` with the links the file made resolved, when it goes through one.
++    fn through_links(&self, path: &[u8]) -> Option<Vec<u8>> {
++        let mut out: Option<Vec<u8>> = None;
++        // A cycle of links fails the look itself; a bound keeps this from looping on it.
++        for _ in 0..8 {
++            let now = out.as_deref().unwrap_or(path);
++            let Some((at, target)) = self.links.iter().rev().find(|(at, _)| under(now, at)) else {
++                break;
++            };
++            let mut next = target.to_vec();
++            next.extend_from_slice(&now[at.len()..]);
++            out = Some(next);
++        }
++        out
++    }
++
 +    pub fn read(&mut self, look: Look, path: &[u8], extra: &[u8]) {
++        // `lstat` and `readlink` look at a link itself, which the file made.
++        let followed = match look {
++            Look::Lstat | Look::Readlink => None,
++            _ => self.through_links(path),
++        };
++        let path = followed.as_deref().unwrap_or(path);
 +        if self.generated(path) {
 +            return;
 +        }
@@ -2435,20 +2592,33 @@ index 000000000..e163093d0
 +        });
 +    }
 +
++    /// [`Self::before_write`] and [`Self::wrote`] at once, for a write that is not undone when it fails.
++    pub fn write(&mut self, root: &Root, path: &[u8], wrote: Wrote) {
++        self.before_write(root, path);
++        self.wrote(path, wrote);
++    }
++
 +    /// Before the file writes to `path`: what it looked at there, below it, or above it is observed
 +    /// now, so the record keeps what was there before the write.
-+    pub fn write(&mut self, root: &Root, path: &[u8], wrote: Wrote) {
-+        let prefix = wrote == Wrote::Prefix;
++    pub fn before_write(&mut self, root: &Root, path: &[u8]) {
 +        for read in self.reads.iter_mut().filter(|read| read.value.is_none()) {
-+            let touched = if prefix {
-+                read.path.starts_with(path) || under(path, &read.path)
-+            } else {
-+                under(&read.path, path) || under(path, &read.path)
-+            };
-+            if touched {
++            if under(&read.path, path) || under(path, &read.path) {
 +                read.value = Some(observe(root, read.look, &read.path, &read.extra));
 +            }
 +        }
++    }
++
++    /// The file made a symbolic link at `at` to `target`, both absolute.
++    pub fn linked(&mut self, at: &[u8], target: &[u8]) {
++        self.wrote(at, Wrote::File);
++        let real = real_parent(at);
++        for at in core::iter::once(at).chain(real.as_deref()) {
++            self.links.push((Box::from(at), Box::from(target)));
++        }
++    }
++
++    /// After a write to `path` succeeded: what it left there is the file's product, as `wrote` says.
++    pub fn wrote(&mut self, path: &[u8], wrote: Wrote) {
 +        if wrote == Wrote::Meta {
 +            return;
 +        }
@@ -2479,10 +2649,7 @@ index 000000000..e163093d0
 +    let zpath = bun_core::ZBox::from_vec(path.to_vec());
 +    let error = |err: bun_sys::Error| -> Box<[u8]> { Box::from(err.name()) };
 +    let value: Vec<u8> = match look {
-+        Look::Content => match bun_sys::File::read_from(bun_sys::Fd::cwd(), path) {
-+            Ok(contents) => hex(&crate::test_input_recorder::source_hash(&contents)),
-+            Err(err) => return error(err),
-+        },
++        Look::Content => content(&zpath),
 +        Look::Stat | Look::Lstat => {
 +            let stat = if look == Look::Stat {
 +                bun_sys::stat(&zpath)
@@ -2491,6 +2658,16 @@ index 000000000..e163093d0
 +            };
 +            match stat {
 +                Ok(stat) => describe(stat.st_mode as u32, stat.st_size as u64),
++                Err(err) => return error(err),
++            }
++        }
++        Look::Access => {
++            let mode = core::str::from_utf8(extra)
++                .ok()
++                .and_then(|it| it.parse::<i32>().ok())
++                .unwrap_or(0);
++            match bun_sys::access(&zpath, mode) {
++                Ok(()) => b"yes".to_vec(),
 +                Err(err) => return error(err),
 +            }
 +        }
@@ -2539,18 +2716,60 @@ index 000000000..e163093d0
 +    value.into_boxed_slice()
 +}
 +
++/// A content look: the SHA-256 of a regular file's bytes, read in chunks so that memory stays
++/// bounded whatever the size. Anything else (a device such as `/dev/stdout` or `/dev/urandom`, a
++/// pipe, a directory) is never opened: its kind is the value. There is no size cap: a large file
++/// costs time to hash, once per record and once per validation, not memory.
++fn content(path: &bun_core::ZStr) -> Vec<u8> {
++    let stat = match bun_sys::stat(path) {
++        Ok(stat) => stat,
++        Err(err) => return err.name().to_vec(),
++    };
++    let kind = stat.st_mode as u32 & bun_sys::S::IFMT as u32;
++    if kind != bun_sys::S::IFREG as u32 {
++        return if kind == bun_sys::S::IFDIR as u32 {
++            b"directory".to_vec()
++        } else {
++            b"not a file".to_vec()
++        };
++    }
++    // Non-blocking, in case the path became a pipe since the `stat`.
++    let fd = match bun_sys::open(path, bun_sys::O::RDONLY | bun_sys::O::NONBLOCK, 0) {
++        Ok(fd) => fd,
++        Err(err) => return err.name().to_vec(),
++    };
++    let file = bun_sys::File::from_fd(fd);
++    let mut hasher = bun_sha_hmac::sha::hashers::SHA256::init();
++    let mut chunk = vec![0u8; 64 * 1024];
++    loop {
++        match bun_sys::read(file.handle, &mut chunk) {
++            Ok(0) => break,
++            Ok(n) => hasher.update(&chunk[..n]),
++            Err(err) => return err.name().to_vec(),
++        }
++    }
++    let mut sha256 = [0u8; 32];
++    hasher.r#final(&mut sha256);
++    hex(&sha256)
++}
++
 +fn hex(bytes: &[u8]) -> Vec<u8> {
 +    let mut out = Vec::with_capacity(64);
 +    crate::test_input_recorder::write_hex(&mut out, bytes);
 +    out
 +}
 +
++/// Type, size and the owner's permission bits: what a test asserts with `stat().mode` or
++/// `access`, such as an executable bit, which git keeps. The group's and others' bits come from the
++/// umask of the checkout, not from the repository, so they are left out and a record holds on a
++/// machine with another umask. Times are never compared.
 +fn describe(mode: u32, size: u64) -> Vec<u8> {
 +    let kind = mode & bun_sys::S::IFMT as u32;
++    let owner = mode & 0o700;
 +    if kind == bun_sys::S::IFREG as u32 {
-+        format!("file {size}").into_bytes()
++        format!("file {size} {owner:o}").into_bytes()
 +    } else if kind == bun_sys::S::IFDIR as u32 {
-+        b"directory".to_vec()
++        format!("directory {owner:o}").into_bytes()
 +    } else if kind == bun_sys::S::IFLNK as u32 {
 +        b"symlink".to_vec()
 +    } else {
@@ -2593,12 +2812,7 @@ index 000000000..e163093d0
 +        let is_dir = matches!(kind, bun_sys::EntryKind::Directory);
 +        if look == Look::Tree && matches!(kind, bun_sys::EntryKind::File) {
 +            line.push(b'\t');
-+            match bun_sys::File::read_from(bun_sys::Fd::cwd(), &child) {
-+                Ok(contents) => line.extend_from_slice(&hex(
-+                    &crate::test_input_recorder::source_hash(&contents),
-+                )),
-+                Err(err) => line.extend_from_slice(err.name()),
-+            }
++            line.extend_from_slice(&content(&bun_core::ZBox::from_vec(child.clone())));
 +        }
 +        line.push(b'\n');
 +        lines.push(line);
@@ -2768,26 +2982,29 @@ index e3814a0b2..4d0e5bc59 100644
  
  #if OS(WINDOWS)
 diff --git a/src/jsc/bindings/IsolatedModuleCache.cpp b/src/jsc/bindings/IsolatedModuleCache.cpp
-index c4b307258..c1105f6e1 100644
+index c4b307258..28b286edb 100644
 --- a/src/jsc/bindings/IsolatedModuleCache.cpp
 +++ b/src/jsc/bindings/IsolatedModuleCache.cpp
-@@ -27,6 +27,7 @@ bool IsolatedModuleCache::canUse(JSC::VM&, void* bunVM, const BunString* typeAtt
+@@ -27,6 +27,8 @@ bool IsolatedModuleCache::canUse(JSC::VM&, void* bunVM, const BunString* typeAtt
  
  extern "C" uint64_t Bun__hashPluginContents(const EncodedSlice* contents, BunLoaderType loader);
  extern "C" bool Bun__VM__hasGlobalsOfVitest(void* bunVM);
 +extern "C" void Bun__TestInputRecorder__didServeCachedSource(void* bunVM, const BunString* key);
++extern "C" bool Bun__TestInputRecorder__enabled;
  
  static uint64_t madeFromHash(JSC::VM& vm, const WTF::String& key, const CodeString* pluginContents)
  {
-@@ -47,7 +48,11 @@ Zig::SourceProvider* IsolatedModuleCache::lookup(JSC::VM& vm, const WTF::String&
+@@ -47,7 +49,13 @@ Zig::SourceProvider* IsolatedModuleCache::lookup(JSC::VM& vm, const WTF::String&
          return nullptr;
      ASSERT(it->value);
      auto* provider = static_cast<Zig::SourceProvider*>(it->value.get());
 -    return provider->m_madeFromHash == madeFromHash(vm, key, pluginContents) ? provider : nullptr;
 +    if (provider->m_madeFromHash != madeFromHash(vm, key, pluginContents))
 +        return nullptr;
-+    BunString borrowedKey = Bun::toString(key);
-+    Bun__TestInputRecorder__didServeCachedSource(WebCore::clientData(vm)->bunVM, &borrowedKey);
++    if (Bun__TestInputRecorder__enabled) {
++        BunString borrowedKey = Bun::toString(key);
++        Bun__TestInputRecorder__didServeCachedSource(WebCore::clientData(vm)->bunVM, &borrowedKey);
++    }
 +    return provider;
  }
  
@@ -3031,10 +3248,10 @@ index e523f3302..788966678 100644
      pub(crate) mod shards_by_reach;
 diff --git a/src/runtime/cli/test/InputReuse.rs b/src/runtime/cli/test/InputReuse.rs
 new file mode 100644
-index 000000000..35240ba41
+index 000000000..13e54e286
 --- /dev/null
 +++ b/src/runtime/cli/test/InputReuse.rs
-@@ -0,0 +1,1143 @@
+@@ -0,0 +1,1174 @@
 +//! `BUN_TEST_INPUT_REUSE=1` with `BUN_TEST_INPUT_RECORD_DIR` under `bun test --isolate`: before the
 +//! run, a test file whose record still holds is not run, and its recorded counts go into the summary.
 +//!
@@ -3065,25 +3282,37 @@ index 000000000..35240ba41
 +use bun_sys::{Fd, File};
 +
 +/// What tells two builds of the recorder apart when `bun=` is the same: every build of a patched
-+/// Bun reports its base revision. The recorder's and validator's own sources, as compiled in, and
-+/// `BUN_TEST_INPUT_BUILD_ID` from the build's environment, for a packager to pass its patch level.
-+/// A change to a hook outside these files alone does not change it; such a change bumps
-+/// `RECORD_VERSION` or comes with a new build id.
-+fn recorder_build() -> [u8; 32] {
-+    const SOURCES: [&[u8]; 4] = [
++/// Bun reports its base revision. `BUN_TEST_INPUT_BUILD_ID` from the build's environment is the
++/// identity a packager must set to its patch level, since hooks live in many files. The recorder's
++/// and validator's own sources are hashed too, at compile time, so the hash costs nothing at run
++/// time and no source is kept in the binary; that alone misses a change to a hook elsewhere.
++const RECORDER_BUILD: u64 = {
++    const SOURCES: [&[u8]; 5] = [
 +        include_bytes!("../../../jsc/TestInputRecorder.rs"),
 +        include_bytes!("../../../jsc/TestInputStore.rs"),
 +        include_bytes!("../../../jsc/TestOwnReads.rs"),
 +        include_bytes!("InputReuse.rs"),
++        match option_env!("BUN_TEST_INPUT_BUILD_ID") {
++            Some(id) => id.as_bytes(),
++            None => b"",
++        },
 +    ];
-+    let mut all = Vec::with_capacity(SOURCES.iter().map(|it| it.len()).sum::<usize>() + 64);
-+    for source in SOURCES {
-+        all.extend_from_slice(&(source.len() as u64).to_le_bytes());
-+        all.extend_from_slice(source);
++    // FNV-1a over each source and its length: not a defence against a crafted collision, which
++    // the build would have to be made for.
++    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
++    let mut i = 0;
++    while i < SOURCES.len() {
++        let source = SOURCES[i];
++        let mut j = 0;
++        while j < source.len() {
++            hash = (hash ^ source[j] as u64).wrapping_mul(0x100_0000_01b3);
++            j += 1;
++        }
++        hash = (hash ^ source.len() as u64).wrapping_mul(0x100_0000_01b3);
++        i += 1;
 +    }
-+    all.extend_from_slice(option_env!("BUN_TEST_INPUT_BUILD_ID").unwrap_or("").as_bytes());
-+    recorder::source_hash(&all)
-+}
++    hash
++};
 +
 +/// What the run was started with that can change a test file's outcome, one `name=value` per line.
 +/// Paths under the record root (`recorder::record_root`) are relative to it, and the root itself is
@@ -3098,6 +3327,10 @@ index 000000000..35240ba41
 +        "project={}",
 +        bstr::BStr::new(&relative(vm.top_level_dir()))
 +    );
++    // Under `--aot` loads that compiled code refuses fail the run, so the same inputs can give
++    // another outcome. Such a run does not record (see `test_command`); the line keeps the two
++    // kinds of record apart if that changes.
++    let _ = writeln!(out, "aot={}", ctx.bundler_options.aot.is_some());
 +    let list = |out: &mut Vec<u8>, name: &str, items: &mut dyn Iterator<Item = Vec<u8>>| {
 +        let _ = write!(out, "{name}=");
 +        for (i, item) in items.enumerate() {
@@ -3120,7 +3353,7 @@ index 000000000..35240ba41
 +        recorder::RECORD_VERSION,
 +        bun_jsc::test_input_store::STORE_VERSION
 +    );
-+    recorder::write_hex(&mut out, &recorder_build());
++    recorder::write_hex(&mut out, &RECORDER_BUILD.to_be_bytes());
 +    out.push(b'\n');
 +    let _ = writeln!(
 +        out,
@@ -3399,10 +3632,9 @@ index 000000000..35240ba41
 +    // JSC options and feature flags are read from the process environment, before any `.env` file.
 +    let mut process: Vec<(Vec<u8>, Vec<u8>)> = std::env::vars_os()
 +        .filter_map(|(name, value)| {
-+            use std::os::unix::ffi::OsStrExt as _;
-+            let name = name.as_bytes();
++            let name = name.as_encoded_bytes();
 +            (name.starts_with(b"BUN_JSC_") || name.starts_with(b"BUN_FEATURE_FLAG_"))
-+                .then(|| (name.to_vec(), value.as_bytes().to_vec()))
++                .then(|| (name.to_vec(), value.as_encoded_bytes().to_vec()))
 +        })
 +        .collect();
 +    process.sort();
@@ -3504,12 +3736,29 @@ index 000000000..35240ba41
 +    vm: &VirtualMachine,
 +    files: &mut [Interned],
 +) -> Option<(usize, Vec<Reused>)> {
-+    let mode = match bun_core::env_var::BUN_TEST_INPUT_REUSE.get_not_empty()? {
-+        b"0" => return None,
++    let setting = bun_core::env_var::BUN_TEST_INPUT_REUSE.get_not_empty()?;
++    // The store's safety with `--parallel` and two runs at once rests on `flock`.
++    if cfg!(not(unix)) {
++        pretty_error!(
++            "<r><yellow>warn<r><d>:<r> BUN_TEST_INPUT_REUSE is not available on this platform; every file runs\n"
++        );
++        return None;
++    }
++    let mode = match setting {
++        b"0" | b"false" | b"no" | b"off" => return None,
++        b"1" | b"true" => Mode::Reuse,
 +        b"explain" => Mode::Explain,
 +        b"check" => Mode::Check,
 +        b"list" => Mode::List,
-+        _ => Mode::Reuse,
++        other => {
++            // A mistyped off switch must not skip files.
++            pretty_error!(
++                "<r><red>error<r><d>:<r> BUN_TEST_INPUT_REUSE={} is not one of 1, true, explain, check, list, or 0, false, no, off\n",
++                bstr::BStr::new(other)
++            );
++            bun_core::Output::flush();
++            Global::exit(1);
++        }
 +    };
 +    let (Some(fingerprint), Some(dir)) = (recorder::fingerprint_hash(vm), recorder::record_dir(vm))
 +    else {
@@ -3810,9 +4059,8 @@ index 000000000..35240ba41
 +    } else {
 +        options.write(true).truncate(true);
 +    }
-+    use std::os::unix::ffi::OsStrExt as _;
 +    let written = options
-+        .open(std::ffi::OsStr::from_bytes(path))
++        .open(store::os_path(path))
 +        .and_then(|mut file| std::io::Write::write_all(&mut file, lines));
 +    if let Err(err) = written {
 +        pretty_error!(
@@ -4209,7 +4457,7 @@ index c7c428215..be5bb6bd6 100644
      for i in 0..k {
          let mut id = Vec::new();
 diff --git a/src/runtime/cli/test_command.rs b/src/runtime/cli/test_command.rs
-index b1b1aa282..9db7074ba 100644
+index b1b1aa282..c2d7b8106 100644
 --- a/src/runtime/cli/test_command.rs
 +++ b/src/runtime/cli/test_command.rs
 @@ -5,6 +5,7 @@ use bun_io::Write as _;
@@ -4240,24 +4488,44 @@ index b1b1aa282..9db7074ba 100644
      pub(crate) fn update_summary(&self, update: impl FnOnce(&mut Summary)) {
          self.jest.summary.with_taken(update);
      }
-@@ -2819,6 +2833,11 @@ impl TestCommand {
+@@ -2819,6 +2833,30 @@ impl TestCommand {
          if ctx.test_options.isolate {
              vm.test_isolation_enabled.set(true);
              vm.auto_killer.enabled.set(true);
-+            let fingerprint = match env_var::BUN_TEST_INPUT_RECORD_FINGERPRINT.get_not_empty() {
-+                Some(given) if ctx.test_options.test_worker => given.to_vec(),
-+                _ => InputReuse::fingerprint(ctx, vm),
-+            };
-+            jsc::test_input_recorder::enable(vm, &fingerprint);
++            // The fingerprint is made only when recording, so a plain `--isolate` run pays nothing.
++            // Recording needs `flock` for its store, so it is Unix only. Code compiled with
++            // `--aot` loads its modules from the compiled graph, which no hook sees, so such a run
++            // neither records nor reuses.
++            let compiled = ctx.bundler_options.aot.is_some() || run_compiled::runs_compiled_code();
++            if compiled
++                && !run_compiled::is_second_process()
++                && env_var::BUN_TEST_INPUT_RECORD_DIR.get_not_empty().is_some()
++            {
++                pretty_error!(
++                    "<r><yellow>warn<r><d>:<r> BUN_TEST_INPUT_RECORD_DIR is not available with --aot; nothing is recorded or reused\n"
++                );
++            }
++            if cfg!(unix)
++                && !compiled
++                && env_var::BUN_TEST_INPUT_RECORD_DIR.get_not_empty().is_some()
++            {
++                let fingerprint =
++                    match env_var::BUN_TEST_INPUT_RECORD_FINGERPRINT.get_not_empty() {
++                        Some(given) if ctx.test_options.test_worker => given.to_vec(),
++                        _ => InputReuse::fingerprint(ctx, vm),
++                    };
++                jsc::test_input_recorder::enable(vm, &fingerprint);
++            }
          }
          vm.test_isolation_state
              .shares_global
-@@ -3035,6 +3054,40 @@ impl TestCommand {
-         } else {
-             &mut all_test_files[..]
-         };
+@@ -3093,6 +3131,41 @@ impl TestCommand {
+             }
+         }
+ 
 +        // `BUN_TEST_INPUT_REUSE`: files whose record holds are counted as it says and not run. Under
-+        // --parallel this is the coordinator; workers never see them. Coverage would miss them.
++        // --parallel this is the coordinator; workers never see them. Coverage would miss them. After
++        // --shard, so every shard deals the same list whatever its store holds, and reports only its own.
 +        if !ctx.test_options.coverage.enabled
 +            && let Some((kept, reused)) = InputReuse::take_reusable(vm, test_files)
 +        {
@@ -4290,10 +4558,10 @@ index b1b1aa282..9db7074ba 100644
 +            }
 +            test_files = &mut test_files[..kept];
 +        }
-         // --shard=M/N: sort the test files for determinism, then keep only
-         // every Nth file starting at M-1. This round-robin distribution
-         // keeps shards roughly balanced regardless of how many files there
-@@ -3395,6 +3448,14 @@ impl TestCommand {
+         // Normally the watcher is only enabled when there are test files to
+         // run; `bun test --watch` with nothing matching should still exit.
+         // With --changed we always want to keep watching as long as any test
+@@ -3395,6 +3468,14 @@ impl TestCommand {
                  }
  
                  pretty_error!("{}{:5>} fail<r>\n", &indenter, summary.fail);
@@ -4308,7 +4576,7 @@ index b1b1aa282..9db7074ba 100644
                  if unhandled_errors > 0 {
                      pretty_error!(
                          "{}<r><red>{:5>} error{}<r>\n",
-@@ -3596,6 +3657,11 @@ impl TestCommand {
+@@ -3596,6 +3677,11 @@ impl TestCommand {
          if vm.hot_reload.get() == jsc::virtual_machine::HotReload::Watch {
              vm.run_with_api_lock(|| Self::run_event_loop_for_watch(vm));
          }
@@ -4320,7 +4588,7 @@ index b1b1aa282..9db7074ba 100644
          let summary = reporter.summary();
  
          let should_fail_on_no_tests = !ctx.test_options.pass_with_no_tests
-@@ -3724,6 +3790,13 @@ impl TestCommand {
+@@ -3724,6 +3810,13 @@ impl TestCommand {
          let resolution = vm
              .transpiler
              .with_mut(|t| t.resolve_entry_point(file_name, &dot_slash))?;
@@ -4334,7 +4602,7 @@ index b1b1aa282..9db7074ba 100644
          // `append_slice` interns into the process-static `FilenameStore` and
          // returns `&'static [u8]`.
          Ok(FileSystem::get()
-@@ -3816,6 +3889,8 @@ impl TestCommand {
+@@ -3816,6 +3909,8 @@ impl TestCommand {
          first_last: bun_test::FirstLast,
      ) -> crate::Result<()> {
          let _print_log = PrintLogAfterFile(vm.log.get());
@@ -4343,7 +4611,7 @@ index b1b1aa282..9db7074ba 100644
  
          let file_path = Self::resolve_test_file(vm, file_name)?;
          vm.clear_entry_point()?;
-@@ -4076,6 +4151,7 @@ impl TestCommand {
+@@ -4076,6 +4171,7 @@ impl TestCommand {
                  environment.teardown(vm);
              }
          }
@@ -4388,7 +4656,7 @@ index d4002e44d..d3287dfef 100644
      }
      if let Some(ab) = value.as_array_buffer(global) {
 diff --git a/src/runtime/jsc_hooks.rs b/src/runtime/jsc_hooks.rs
-index 94077e431..c5b530a34 100644
+index 94077e431..9a6811887 100644
 --- a/src/runtime/jsc_hooks.rs
 +++ b/src/runtime/jsc_hooks.rs
 @@ -627,6 +627,13 @@ fn load_preloads(vm: &VirtualMachine) -> bun_jsc::CrateResult<*mut JSInternalPro
@@ -4419,7 +4687,17 @@ index 94077e431..c5b530a34 100644
  
                  // SAFETY: `transpiler.log` was swapped to non-null `args.log` above.
                  if unsafe { (*(*transpiler).log).errors > 0 } {
-@@ -3756,6 +3770,7 @@ fn transpile_file<const DATA_ONLY: bool>(
+@@ -2629,6 +2643,9 @@ fn transpile_source_code_of_any_provenance<const DATA_ONLY: bool>(
+                     ..Default::default()
+                 });
+             }
++            // The bundle reads the scripts and styles the page names through the bundler's own
++            // resolver and file layer, which no record sees.
++            bun_jsc::test_input_recorder::mark(global_object.bun_vm(), b"html-bundle");
+             let html_bundle = bun_removable_features::call_removable_or!(
+                 Bundler,
+                 Throw,
+@@ -3756,6 +3773,7 @@ fn transpile_file<const DATA_ONLY: bool>(
      } else if is_commonjs_require && jsc_vm.has_mutated_built_in_extensions.get() > 0 {
          use bun_jsc::node_module_module::{CustomLoader, find_longest_registered_extension};
          if let Some(entry) = find_longest_registered_extension(jsc_vm, _specifier.slice()) {
@@ -4427,7 +4705,7 @@ index 94077e431..c5b530a34 100644
              match entry {
                  CustomLoader::Loader(loader) => lr.loader = Some(*loader),
                  CustomLoader::Custom(strong) => {
-@@ -3894,6 +3909,7 @@ fn transpile_file<const DATA_ONLY: bool>(
+@@ -3894,6 +3912,7 @@ fn transpile_file<const DATA_ONLY: bool>(
                      && jsc_vm.has_mutated_built_in_extensions.get() == 0
                  {
                      if let Some(entry) = find_longest_registered_extension(jsc_vm, lr.path.text) {
@@ -4436,7 +4714,7 @@ index 94077e431..c5b530a34 100644
                              CustomLoader::Loader(loader) => break 'loader *loader,
                              CustomLoader::Custom(strong) => {
 diff --git a/src/runtime/node/node_fs.rs b/src/runtime/node/node_fs.rs
-index 5779aacff..6fdc55c33 100644
+index 5779aacff..d8b979820 100644
 --- a/src/runtime/node/node_fs.rs
 +++ b/src/runtime/node/node_fs.rs
 @@ -262,7 +262,9 @@ pub(crate) fn note_found_on_disk() {
@@ -4449,25 +4727,199 @@ index 5779aacff..6fdc55c33 100644
      if let Some(graph) = compiled_program_graph() {
          graph.note_process_start();
      }
+@@ -1234,13 +1236,15 @@ mod _async_tasks {
+             self.global_object.get()
+         }
+ 
+-        /// `callback`: as for [`AsyncFSTask::create`].
++        /// `callback`: as for [`AsyncFSTask::create`]. What the call writes is not applied on this
++        /// path, so later looks there stay inputs.
+         pub(crate) fn create(
+             cx: &bun_jsc::JsThread<'_>,
+             binding: &Binding,
+             task_args: ThreadIsolated<A>,
+             vm: &VirtualMachine,
+             callback: Option<JSValue>,
++            _own: Option<bun_jsc::test_input_recorder::OwnWrites>,
+         ) -> JSValue {
+             let task = Box::new(Self {
+                 completion: FsCompletion::new(cx.global(), callback),
+@@ -1735,6 +1739,11 @@ mod _async_tasks {
+         fn bytes_read(&self) -> u64 {
+             0
+         }
++        /// The path the call returns, as `fs.mkdtemp` does.
++        #[inline]
++        fn returned_path(&self) -> Option<&[u8]> {
++            None
++        }
+     }
+     impl FsReturn for JSValue {
+         #[inline]
+@@ -1777,6 +1786,10 @@ mod _async_tasks {
+         fn fs_to_js(self, global: &JSGlobalObject) -> JsResult<JSValue> {
+             self.into_js(global)
+         }
++        #[inline]
++        fn returned_path(&self) -> Option<&[u8]> {
++            Some(self.slice())
++        }
+     }
+     impl FsReturn for StringOrUndefined {
+         #[inline]
+@@ -1967,6 +1980,8 @@ mod _async_tasks {
+     pub(crate) struct AsyncFSJs {
+         pub(crate) completion: FsCompletion,
+         pub(crate) tracker: AsyncTaskTracker,
++        /// What the call writes, for the test input recorder once it succeeded.
++        pub(crate) own: Option<bun_jsc::test_input_recorder::OwnWrites>,
+     }
+ 
+     impl<R: FsReturn + 'static, A: FsArgument + 'static, const F: NodeFSFunctionEnum>
+@@ -1995,6 +2010,13 @@ mod _async_tasks {
+             if let Ok(result) = &result {
+                 args.write_back(result.bytes_read());
+             }
++            if let (Ok(result), Some(own)) = (&result, js.own) {
++                bun_jsc::test_input_recorder::own_wrote(
++                    global_object.bun_vm(),
++                    own,
++                    result.returned_path(),
++                );
++            }
+             let success = result.is_ok();
+             let completion = &js.completion;
+             let converted = match result {
+@@ -2039,8 +2061,9 @@ mod _async_tasks {
+             args: ThreadIsolated<A>,
+             vm: &VirtualMachine,
+             callback: Option<JSValue>,
++            own: Option<bun_jsc::test_input_recorder::OwnWrites>,
+         ) -> JSValue {
+-            Self::schedule(cx, args, vm, callback)
++            Self::schedule_with(cx, args, vm, callback, own)
+         }
+ 
+         /// [`Self::create`] for a caller that has no `Binding`.
+@@ -2049,6 +2072,16 @@ mod _async_tasks {
+             args: ThreadIsolated<A>,
+             vm: &VirtualMachine,
+             callback: Option<JSValue>,
++        ) -> JSValue {
++            Self::schedule_with(cx, args, vm, callback, None)
++        }
++
++        fn schedule_with(
++            cx: &bun_jsc::JsThread<'_>,
++            args: ThreadIsolated<A>,
++            vm: &VirtualMachine,
++            callback: Option<JSValue>,
++            own: Option<bun_jsc::test_input_recorder::OwnWrites>,
+         ) -> JSValue {
+             let tracker = AsyncTaskTracker::init(vm);
+             tracker.did_schedule(cx.global());
+@@ -2065,6 +2098,7 @@ mod _async_tasks {
+                 AsyncFSJs {
+                     completion,
+                     tracker,
++                    own,
+                 },
+             );
+             value
+@@ -2120,6 +2154,9 @@ mod _async_tasks {
+         pub(crate) subtask_count: AtomicUsize,
+         /// `Some` iff `IS_SHELL`, until the copy is reported to it.
+         pub(crate) shelltask: Option<Box<ShellCpTask>>,
++        /// What `fs.cp` writes, for the test input recorder once it succeeded. Touched on the JS
++        /// thread only, when the task is made and when it completes.
++        own: core::cell::Cell<Option<bun_jsc::test_input_recorder::OwnWrites>>,
+     }
+ 
+     bun_threading::intrusive_work_task!([const IS_SHELL: bool] NewAsyncCpTask<IS_SHELL>, task);
+@@ -2288,6 +2325,7 @@ mod _async_tasks {
+             _binding: &Binding,
+             cp_args: ThreadIsolated<args::Cp<'static>>,
+             vm: &VirtualMachine,
++            own: Option<bun_jsc::test_input_recorder::OwnWrites>,
+         ) -> JSValue {
+             let tracker = AsyncTaskTracker::init(vm);
+             tracker.did_schedule(cx.global());
+@@ -2301,6 +2339,7 @@ mod _async_tasks {
+                 tracker,
+                 cx.context().id(),
+                 None,
++                own,
+             );
+             value
+         }
+@@ -2322,6 +2361,7 @@ mod _async_tasks {
+                 // As `ShellCpTask`, which is waiting for this.
+                 bun_event_loop::ContextId::NONE,
+                 Some(shelltask),
++                None,
+             )
+         }
+ 
+@@ -2333,8 +2373,10 @@ mod _async_tasks {
+             tracker: AsyncTaskTracker,
+             context: bun_event_loop::ContextId,
+             shelltask: Option<Box<ShellCpTask>>,
++            own: Option<bun_jsc::test_input_recorder::OwnWrites>,
+         ) {
+             let task = Box::new(Self {
++                own: core::cell::Cell::new(own),
+                 promise,
+                 context,
+                 args: cp_args,
+@@ -2453,6 +2495,9 @@ mod _async_tasks {
+             // SAFETY: non-null erased *mut JSGlobalObject from the JS event loop vtable.
+             let global_object: &JSGlobalObject = unsafe { &*go_ptr.cast::<JSGlobalObject>() };
+             let success = (*self.result.get_mut()).is_ok();
++            if let Some(own) = self.own.take().filter(|_| success) {
++                bun_jsc::test_input_recorder::own_wrote(global_object.bun_vm(), own, None);
++            }
+             let promise_value = self.promise.value();
+             let promise = self.promise.get();
+             let result = match core::mem::replace(self.result.get_mut(), Ok(())) {
+@@ -2932,6 +2977,7 @@ mod _async_tasks {
+                 AsyncFSJs {
+                     completion,
+                     tracker,
++                    own: None,
+                 },
+             );
+             value
 diff --git a/src/runtime/node/node_fs_binding.rs b/src/runtime/node/node_fs_binding.rs
-index 30e3de54e..89e265571 100644
+index 30e3de54e..ce7603f80 100644
 --- a/src/runtime/node/node_fs_binding.rs
 +++ b/src/runtime/node/node_fs_binding.rs
-@@ -20,15 +20,150 @@ use crate::node::fs::{
+@@ -7,6 +7,7 @@ use bun_sys_jsc::SystemErrorJsc as _;
+ 
+ use crate::generated_bindgen::node_fs_binding::RmOptions;
+ use crate::node::ThreadIsolated;
++use bun_jsc::test_input_recorder::OwnWrites;
+ use crate::node::fs::{
+     self, AsyncCpTask, AsyncReaddirRecursiveTask, Flavor, FsArgument, FsReturn, NodeFS,
+     NodeFSDispatch, NodeFSFunctionEnum, Op, args, async_, move_waiting_descriptors, ret,
+@@ -20,24 +21,197 @@ use crate::node::fs::{
  /// Returns bindings to call jsc.Node.fs.NodeFS.<function>.
  /// Async calls use a thread pool.
  
 -fn run_sync_with<R: FsReturn, A: FsArgument>(
 +/// What a `node:fs` call looks at and writes, for the test input recorder (`bun test --isolate`
 +/// with `BUN_TEST_INPUT_RECORD_DIR`). Called on the JS thread with the parsed arguments, before the
-+/// operation runs or is scheduled. Calls on a file descriptor are covered by the `open` that made it.
-+fn note_own<A: FsArgument + 'static>(vm: &VirtualMachine, function: NodeFSFunctionEnum, args: &A) {
-+    use bun_jsc::test_input_recorder as recorder;
++/// operation runs or is scheduled: looks are noted then, and what the call writes is returned, to be
++/// applied with `own_wrote` once it succeeded. Calls on a file descriptor are covered by the `open`
++/// that made it.
++fn note_own<A: FsArgument + 'static>(
++    vm: &VirtualMachine,
++    function: NodeFSFunctionEnum,
++    args: &A,
++) -> Option<bun_jsc::test_input_recorder::OwnWrites> {
++    use bun_jsc::test_input_recorder::{self as recorder, OwnWrites, Wrote};
 +    use bun_jsc::test_own_reads::Look;
 +    use NodeFSFunctionEnum as F;
-+    if !recorder::is_recording(vm) {
-+        return;
-+    }
++    let mut own = OwnWrites::new(vm)?;
 +    let [first, second] = args.paths();
 +    let (first, second) = (first.map(|it| it.slice()), second.map(|it| it.slice()));
 +    let read = |look: Look, path: Option<&[u8]>| {
@@ -4475,16 +4927,15 @@ index 30e3de54e..89e265571 100644
 +            recorder::own_read(vm, look, path);
 +        }
 +    };
-+    use bun_jsc::test_input_recorder::Wrote;
-+    let write = |path: Option<&[u8]>, wrote: Wrote| {
++    let write = |own: &mut OwnWrites, path: Option<&[u8]>, wrote: Wrote| {
 +        if let Some(path) = path {
-+            recorder::own_write(vm, path, wrote);
++            own.write(vm, path, wrote);
 +        }
 +    };
 +    let any: &dyn core::any::Any = args;
 +    // What an open (or a whole-file write) with these flags depends on: the bytes when it reads
 +    // them or keeps some of them, else whether the path is there when that decides failure.
-+    let open_like = |flags: i32, path: Option<&[u8]>| {
++    let open_like = |own: &mut OwnWrites, flags: i32, path: Option<&[u8]>| {
 +        use bun_sys::O;
 +        let access = flags & (O::RDONLY | O::WRONLY | O::RDWR);
 +        if access != O::WRONLY || flags & O::APPEND != 0 || flags & O::TRUNC == 0 {
@@ -4493,11 +4944,24 @@ index 30e3de54e..89e265571 100644
 +            read(Look::Exists, path);
 +        }
 +        if access != O::RDONLY || flags & (O::CREAT | O::TRUNC | O::APPEND) != 0 {
-+            write(path, Wrote::File);
++            write(own, path, Wrote::File);
 +        }
 +    };
 +    match function {
-+        F::Access | F::Exists => read(Look::Exists, first),
++        F::Exists => read(Look::Exists, first),
++        F::Access => {
++            // `F_OK` asks only whether the path is there.
++            let mode = any
++                .downcast_ref::<args::Access<'static>>()
++                .map_or(0, |it| it.mode.as_int());
++            match (mode, first) {
++                (0, _) => read(Look::Exists, first),
++                (mode, Some(path)) => {
++                    recorder::own_read_with(vm, Look::Access, path, mode.to_string().as_bytes())
++                }
++                (_, None) => {}
++            }
++        }
 +        F::Stat => read(Look::Stat, first),
 +        F::Lstat => read(Look::Lstat, first),
 +        F::Readlink => read(Look::Readlink, first),
@@ -4513,7 +4977,7 @@ index 30e3de54e..89e265571 100644
 +            let flags = any
 +                .downcast_ref::<args::Open<'static>>()
 +                .map_or(0, |it| it.flags.as_int());
-+            open_like(flags, first);
++            open_like(&mut own, flags, first);
 +        }
 +        F::WriteFile | F::AppendFile => {
 +            let flags = match any.downcast_ref::<args::WriteFile<'static>>() {
@@ -4522,7 +4986,7 @@ index 30e3de54e..89e265571 100644
 +                    .downcast_ref::<args::AppendFile<'static>>()
 +                    .map_or(0, |it| it.0.flag.as_int()),
 +            };
-+            open_like(flags, first);
++            open_like(&mut own, flags, first);
 +        }
 +        F::CopyFile => {
 +            read(Look::Content, first);
@@ -4532,27 +4996,43 @@ index 30e3de54e..89e265571 100644
 +            if exclusive {
 +                read(Look::Exists, second);
 +            }
-+            write(second, Wrote::File);
++            write(&mut own, second, Wrote::File);
 +        }
 +        F::Rename => {
 +            read(Look::Exists, first);
-+            write(first, Wrote::Tree);
-+            write(second, Wrote::Tree);
-+        }
-+        F::Link | F::Symlink => {
-+            if function == F::Link {
-+                read(Look::Exists, first);
++            // What moves to the new name is the file's product only if the old name held one;
++            // otherwise what it held is looked at now, before it moves.
++            if let Some(from) = first
++                && !recorder::own_generated(vm, from)
++            {
++                let zfrom = bun_core::ZBox::from_vec(from.to_vec());
++                let is_file = bun_sys::lstat(&zfrom).is_ok_and(|st| {
++                    st.st_mode as u32 & bun_sys::S::IFMT as u32 == bun_sys::S::IFREG as u32
++                });
++                read(if is_file { Look::Content } else { Look::Tree }, first);
 +            }
++            write(&mut own, first, Wrote::Tree);
++            write(&mut own, second, Wrote::Tree);
++        }
++        F::Link => {
++            // The new name shares the old one's bytes, so they are looked at now.
++            read(Look::Content, first);
++            write(&mut own, first, Wrote::Meta);
 +            // The new name must not be there yet.
-+            let new = if function == F::Link { second } else { first };
-+            read(Look::Exists, new);
-+            write(new, Wrote::File);
++            read(Look::Exists, second);
++            write(&mut own, second, Wrote::File);
 +        }
-+        F::Mkdtemp => {
-+            if let Some(prefix) = first {
-+                recorder::own_write(vm, prefix, Wrote::Prefix);
++        F::Symlink => {
++            // The new name must not be there yet.
++            read(Look::Exists, first);
++            let target = any
++                .downcast_ref::<args::Symlink<'static>>()
++                .map(|it| it.target_path.slice());
++            if let (Some(at), Some(target)) = (first, target) {
++                own.link(vm, at, target);
 +            }
 +        }
++        F::Mkdtemp => own.created(),
 +        F::Mkdir => {
 +            let recursive = any
 +                .downcast_ref::<args::Mkdir<'static>>()
@@ -4561,7 +5041,7 @@ index 30e3de54e..89e265571 100644
 +            if !recursive {
 +                read(Look::Exists, first);
 +            }
-+            write(first, if recursive { Wrote::Meta } else { Wrote::Tree });
++            write(&mut own, first, if recursive { Wrote::Meta } else { Wrote::Tree });
 +        }
 +        F::Rm => {
 +            let force = any
@@ -4570,25 +5050,26 @@ index 30e3de54e..89e265571 100644
 +            if !force {
 +                read(Look::Exists, first);
 +            }
-+            write(first, Wrote::Tree);
++            write(&mut own, first, Wrote::Tree);
 +        }
 +        F::Truncate => {
 +            // What is left of the bytes is still there afterwards.
 +            read(Look::Content, first);
-+            write(first, Wrote::File);
++            write(&mut own, first, Wrote::File);
 +        }
 +        F::Unlink | F::Rmdir => {
 +            // These fail when the path is missing.
 +            read(Look::Exists, first);
-+            write(first, Wrote::Tree);
++            write(&mut own, first, Wrote::Tree);
 +        }
 +        F::Chmod | F::Chown | F::Lchmod | F::Lchown | F::Utimes | F::Lutimes => {
 +            read(Look::Exists, first);
-+            write(first, Wrote::Meta);
++            write(&mut own, first, Wrote::Meta);
 +        }
 +        F::Statfs | F::Close | F::Fchmod | F::Fchown | F::Fdatasync | F::Fstat | F::Fsync
 +        | F::Ftruncate | F::Futimes | F::Read | F::Readv | F::Write | F::Writev => {}
 +    }
++    Some(own)
 +}
 +
 +fn run_sync_with<R: FsReturn, A: FsArgument + 'static>(
@@ -4601,11 +5082,18 @@ index 30e3de54e..89e265571 100644
      let vm: &VirtualMachine = global.bun_vm();
      let mut slice = ArgumentsSlice::init(vm, JsLocal::to_js_slice(args));
      let args = <A as FsArgument>::from_js(global, &mut slice)?;
-+    note_own(vm, function, &args);
++    let own = note_own(vm, function, &args);
      move_waiting_descriptors();
      match dispatch(&args) {
          Err(err) => Err(global.throw_value(err.to_js(global))),
-@@ -37,7 +172,7 @@ fn run_sync_with<R: FsReturn, A: FsArgument>(
+-        Ok(res) => res.fs_to_js(global),
++        Ok(res) => {
++            if let Some(own) = own {
++                bun_jsc::test_input_recorder::own_wrote(vm, own, res.returned_path());
++            }
++            res.fs_to_js(global)
++        }
+     }
  }
  
  /// `Bindings(FunctionEnum).runSync`.
@@ -4614,7 +5102,7 @@ index 30e3de54e..89e265571 100644
      this: &Binding,
      cx: &mut JsScope<'_>,
      args: &[JsLocal<'_>],
-@@ -48,14 +183,14 @@ where
+@@ -48,14 +222,14 @@ where
      // R-2: `JsCell::with_mut` scopes the `&mut NodeFS` to the blocking
      // syscall; `dispatch` never re-enters JS, and `Maybe<R>` is fully owned
      // (`sys::Error.path` is `Box<[u8]>`, not a borrow into `sync_error_buf`).
@@ -4631,7 +5119,7 @@ index 30e3de54e..89e265571 100644
      cx: &mut JsScope<'_>,
      args: &[JsLocal<'_>],
  ) -> JsResult<JSValue>
-@@ -63,7 +198,7 @@ where
+@@ -63,7 +237,7 @@ where
      Op<{ F }>: NodeFSDispatch<R, A>,
  {
      let vm = cx.global().bun_vm();
@@ -4640,7 +5128,7 @@ index 30e3de54e..89e265571 100644
          crate::jsc_hooks::with_node_fs(vm, |node_fs| {
              node_fs.vm = Some(vm);
              NodeFS::dispatch::<R, A, F>(node_fs, args, Flavor::Sync)
-@@ -125,10 +260,11 @@ fn split_callback<'a>(
+@@ -125,10 +299,11 @@ fn split_callback<'a>(
  /// Windows path picks `UVFSRequest` for a handful of fds-only ops while
  /// everything else uses `AsyncFSTask`, and that choice is encoded in the
  /// `async_::*` type aliases rather than derivable from `F` alone.
@@ -4653,39 +5141,73 @@ index 30e3de54e..89e265571 100644
      arm: AsyncArm,
      create_task: fn(
          &bun_jsc::JsThread<'_>,
-@@ -146,6 +282,7 @@ fn run_async<A: FsArgument>(
+@@ -136,6 +311,7 @@ fn run_async<A: FsArgument>(
+         ThreadIsolated<A>,
+         &VirtualMachine,
+         Option<JSValue>,
++        Option<OwnWrites>,
+     ) -> JSValue,
+ ) -> JsResult<JSValue> {
+     let cx = cx.js_thread();
+@@ -146,8 +322,9 @@ fn run_async<A: FsArgument>(
          ParsedAsyncArgs::Rejected(error) => return reject_before_schedule(global, callback, error),
      };
      let vm: &VirtualMachine = global.bun_vm();
-+    note_own(vm, function, &*args);
++    let own = note_own(vm, function, &*args);
      move_waiting_descriptors();
-     Ok(create_task(&cx, this, args, vm, callback))
+-    Ok(create_task(&cx, this, args, vm, callback))
++    Ok(create_task(&cx, this, args, vm, callback, own))
  }
-@@ -230,6 +367,7 @@ impl Binding {
+ 
+ enum ParsedAsyncArgs<A> {
+@@ -230,7 +407,8 @@ impl Binding {
              ParsedAsyncArgs::Rejected(error) => return reject_before_schedule(global, None, error),
          };
          let vm: &VirtualMachine = global.bun_vm();
-+        note_cp(vm, &cp_args);
-         Ok(AsyncCpTask::create(&cx, self, cp_args, vm))
+-        Ok(AsyncCpTask::create(&cx, self, cp_args, vm))
++        let own = note_cp(vm, &cp_args);
++        Ok(AsyncCpTask::create(&cx, self, cp_args, vm, own))
      }
  
-@@ -241,6 +379,7 @@ impl Binding {
+     /// `callSync(.cp)`.
+@@ -241,11 +419,17 @@ impl Binding {
  
          // `defer args.deinit()` → `Drop` on `cp_args` (its `PathLike` fields).
          let cp_args = args::Cp::from_js(global, &mut slice)?;
-+        note_cp(vm, &cp_args);
++        let own = note_cp(vm, &cp_args);
  
          // R-2: blocking syscall — `&mut NodeFS` scoped to the call, no JS re-entry.
          match self.node_fs.with_mut(|nfs| nfs.cp(&cp_args, Flavor::Sync)) {
-@@ -279,6 +418,7 @@ impl Binding {
+             Err(ref err) => Err(global.throw_value(err.to_js(global))),
+-            Ok(()) => Ok(JSValue::UNDEFINED),
++            Ok(()) => {
++                if let Some(own) = own {
++                    bun_jsc::test_input_recorder::own_wrote(vm, own, None);
++                }
++                Ok(JSValue::UNDEFINED)
++            }
+         }
+     }
+ 
+@@ -279,6 +463,8 @@ impl Binding {
              }
          };
          let vm: &VirtualMachine = global.bun_vm();
-+        note_own(vm, NodeFSFunctionEnum::Readdir, &*rd_args);
++        // A listing writes nothing.
++        let _ = note_own(vm, NodeFSFunctionEnum::Readdir, &*rd_args);
          // /$bunfs/ is in-memory; readdir_inner handles it (recursive included).
          let is_bunfs = bun_standalone_graph::Graph::get_ref()
              .is_some_and(|graph| graph.owns_directory(rd_args.path.slice()));
-@@ -298,6 +438,11 @@ impl Binding {
+@@ -287,7 +473,7 @@ impl Binding {
+                 &cx, &rd_args, vm, callback,
+             ));
+         }
+-        Ok(async_::Readdir::create(&cx, self, rd_args, vm, callback))
++        Ok(async_::Readdir::create(&cx, self, rd_args, vm, callback, None))
+     }
+ 
+     /// `callSync(.watch)` — `args::Watch` borrows `globalThis` so it can't go
+@@ -298,6 +484,11 @@ impl Binding {
          let mut slice = ArgumentsSlice::init(cx.vm(), JsLocal::to_js_slice(args));
  
          let watch_args = fs::Watcher::Arguments::from_js(&cx, &mut slice)?;
@@ -4697,7 +5219,7 @@ index 30e3de54e..89e265571 100644
  
          // R-2: `NodeFS::watch` only reads `self.vm` (no scratch-buffer write);
          // scoped via `with_mut` so the borrow cannot outlive the call.
-@@ -321,6 +466,11 @@ impl Binding {
+@@ -321,6 +512,11 @@ impl Binding {
          let mut slice = ArgumentsSlice::init(cx.vm(), JsLocal::to_js_slice(args));
  
          let wf_args = fs::StatWatcher::Arguments::from_js(&cx, &mut slice)?;
@@ -4709,7 +5231,7 @@ index 30e3de54e..89e265571 100644
  
          match self
              .node_fs
-@@ -350,14 +500,14 @@ macro_rules! node_fs_bindings {
+@@ -350,14 +546,14 @@ macro_rules! node_fs_bindings {
                      cx: &mut JsScope<'_>,
                      args: &[JsLocal<'_>],
                  ) -> JsResult<JSValue> {
@@ -4726,23 +5248,29 @@ index 30e3de54e..89e265571 100644
                  }
              )*
          }
-@@ -424,6 +574,21 @@ impl Binding {
+@@ -424,6 +620,27 @@ impl Binding {
      // pub const statfsSync = callSync(.statfs);
  }
  
-+/// `fs.cp`: what is below the source, and the destination, for the test input recorder.
-+fn note_cp(vm: &VirtualMachine, args: &args::Cp<'static>) {
-+    use bun_jsc::test_input_recorder as recorder;
++/// `fs.cp`: what is below the source, and the destination, for the test input recorder. A copy
++/// into a directory that is there and is not the file's product merges into it, so what was there
++/// stays an input; otherwise everything at the destination is the file's product.
++fn note_cp(vm: &VirtualMachine, args: &args::Cp<'static>) -> Option<OwnWrites> {
++    use bun_jsc::test_input_recorder::{self as recorder, Wrote};
 +    use bun_jsc::test_own_reads::Look;
-+    if !recorder::is_recording(vm) {
-+        return;
-+    }
++    let mut own = OwnWrites::new(vm)?;
 +    let look = if args.flags.recursive { Look::Tree } else { Look::Content };
 +    recorder::own_read(vm, look, args.src.slice());
 +    if args.flags.error_on_exist && !args.flags.force {
 +        recorder::own_read(vm, Look::Exists, args.dest.slice());
 +    }
-+    recorder::own_write(vm, args.dest.slice(), recorder::Wrote::Tree);
++    let dest = args.dest.slice();
++    let merges = !recorder::own_generated(vm, dest)
++        && bun_sys::stat(&bun_core::ZBox::from_vec(dest.to_vec())).is_ok_and(|st| {
++            st.st_mode as u32 & bun_sys::S::IFMT as u32 == bun_sys::S::IFDIR as u32
++        });
++    own.write(vm, dest, if merges { Wrote::Meta } else { Wrote::Tree });
++    Some(own)
 +}
 +
  pub(crate) fn binding<'a>(cx: &mut JsScope<'a>) -> JsWrapper<'a, Binding> {
@@ -4915,10 +5443,10 @@ index de7a45703..d31843aae 100644
  
      let event_loop = EventLoopHandle::init(vm.event_loop_ptr());
 diff --git a/test/cli/test/isolation.test.ts b/test/cli/test/isolation.test.ts
-index 6d0d65721..f3bbacdf1 100644
+index 6d0d65721..e501ba838 100644
 --- a/test/cli/test/isolation.test.ts
 +++ b/test/cli/test/isolation.test.ts
-@@ -3510,3 +3510,689 @@ describe.concurrent("mocks and spies do not outlive their test file", () => {
+@@ -3510,3 +3510,998 @@ describe.concurrent("mocks and spies do not outlive their test file", () => {
      });
    });
  });
@@ -5112,6 +5640,315 @@ index 6d0d65721..f3bbacdf1 100644
 +      reused: ["a.test.ts", "b.test.ts", "c.test.ts"],
 +      exitCode: 0,
 +    });
++  });
++
++  test("--shard deals the files before reuse, so shards with their own stores each reuse and report only their own", async () => {
++    const four = Object.fromEntries(
++      ["a", "b", "c", "d"].map(name => [
++        `${name}.test.ts`,
++        `import { expect, test } from "bun:test";\ntest("${name}", () => expect(1).toBe(1));\n`,
++      ]),
++    );
++    using dir = tempDir("input-reuse-shard", { "package.json": `{ "name": "sharded" }`, ...four });
++    const all = ["./a.test.ts", "./b.test.ts", "./c.test.ts", "./d.test.ts"];
++    const shard = (n: number, mode?: string) =>
++      runTests(String(dir), ["--isolate", `--shard=${n}/2`], all, {
++        ...bunEnv,
++        BUN_TEST_INPUT_RECORD_DIR: `records-${n}`,
++        BUN_TEST_INPUT_REUSE: mode,
++      });
++    await shard(1);
++    await shard(2);
++    const [one, two] = [await shard(1, "explain"), await shard(2, "explain")];
++    const runs = (stderr: string) => [...stderr.matchAll(/^reuse: (\S+) runs: /gm)].map(m => m[1]);
++    expect({
++      one: reusedFiles(one.stderr),
++      oneRuns: runs(one.stderr),
++      two: reusedFiles(two.stderr),
++      twoRuns: runs(two.stderr),
++    }).toEqual({ one: ["a.test.ts", "c.test.ts"], oneRuns: [], two: ["b.test.ts", "d.test.ts"], twoRuns: [] });
++    expect(one.stderr).toMatch(/2 pass/);
++    expect(two.stderr).toMatch(/2 pass/);
++  });
++
++  test("a write that fails leaves what is there an input", async () => {
++    using dir = tempDir("input-reuse-failed-write", {
++      "package.json": `{ "name": "failed-write" }`,
++      "fixtures/data.json": `{ "v": 1 }`,
++      "fixtures/mod.ts": `export const m = 1;\n`,
++      "w.test.ts": `
++        import { expect, test } from "bun:test";
++        import { mkdirSync, readFileSync, rmdirSync, symlinkSync, linkSync, promises } from "node:fs";
++        test("ensure the directory, then use it", async () => {
++          const dir = import.meta.dir + "/fixtures";
++          try { mkdirSync(dir); } catch {}
++          try { rmdirSync(dir); } catch {}
++          try { symlinkSync("elsewhere", dir + "/data.json"); } catch {}
++          try { linkSync(dir + "/mod.ts", dir + "/data.json"); } catch {}
++          await promises.mkdir(dir).catch(() => {});
++          expect(JSON.parse(readFileSync(dir + "/data.json", "utf8")).v).toBe(1);
++          const { m } = await import("./fixtures/mod.ts");
++          expect(m).toBe(1);
++        });
++      `,
++    });
++    const one = ["./w.test.ts"];
++    await runTests(String(dir), ["--isolate"], one, record);
++    const unchanged = await runTests(String(dir), ["--isolate"], one, reuse);
++    fs.writeFileSync(join(String(dir), "fixtures", "data.json"), `{ "v": 2 }`);
++    const data = await runTests(String(dir), ["--isolate"], one, reuse);
++    fs.writeFileSync(join(String(dir), "fixtures", "data.json"), `{ "v": 1 }`);
++    await runTests(String(dir), ["--isolate"], one, record);
++    fs.writeFileSync(join(String(dir), "fixtures", "mod.ts"), `export const m = 2;\n`);
++    const mod = await runTests(String(dir), ["--isolate"], one, reuse);
++    expect({
++      unchanged: reusedFiles(unchanged.stderr),
++      data: reusedFiles(data.stderr),
++      mod: reusedFiles(mod.stderr),
++    }).toEqual({ unchanged: ["w.test.ts"], data: [], mod: [] });
++    expect(data.stderr).toContain("reuse: w.test.ts runs: own-read content fixtures/data.json");
++    expect(mod.stderr).toContain("reuse: w.test.ts runs: changed fixtures/mod.ts");
++  });
++
++  test("what a link, a rename or a merging copy brings into the file's own paths is still an input", async () => {
++    const body = (name: string, code: string) => `
++      import { expect, test } from "bun:test";
++      import * as fs from "node:fs";
++      import { tmpdir } from "node:os";
++      import { join, relative } from "node:path";
++      test("${name}", async () => {
++        const fixtures = join(import.meta.dir, "fixtures");
++        ${code}
++      });
++    `;
++    using dir = tempDir("input-reuse-links", {
++      "package.json": `{ "name": "links" }`,
++      "fixtures/sym.txt": "sym-v1",
++      "fixtures/hard.txt": "hard-v1",
++      "fixtures/moved.txt": "moved-v1",
++      "fixtures/merge/pre.txt": "pre-v1",
++      "fixtures/copied/other.txt": "other",
++      "fixtures/linked-dir/inner.txt": "inner-v1",
++      "fixtures/into/pre.txt": "into-v1",
++      "sym.test.ts": body(
++        "symlink into a temp directory",
++        `const tmp = fs.mkdtempSync(join(tmpdir(), "sym-"));
++        fs.symlinkSync(join(fixtures, "sym.txt"), join(tmp, "data.txt"));
++        fs.symlinkSync(relative(tmp, join(fixtures, "linked-dir")), join(tmp, "dir"));
++        expect(fs.readFileSync(join(tmp, "data.txt"), "utf8")).toBe("sym-v1");
++        expect(fs.readFileSync(join(tmp, "dir", "inner.txt"), "utf8")).toBe("inner-v1");`,
++      ),
++      "hard.test.ts": body(
++        "hard link into a temp directory",
++        `const tmp = fs.mkdtempSync(join(tmpdir(), "hard-"));
++        fs.linkSync(join(fixtures, "hard.txt"), join(tmp, "x"));
++        expect(fs.readFileSync(join(tmp, "x"), "utf8")).toBe("hard-v1");`,
++      ),
++      "rename.test.ts": body(
++        "rename there and back",
++        `fs.renameSync(join(fixtures, "moved.txt"), join(fixtures, "moved2.txt"));
++        const text = fs.readFileSync(join(fixtures, "moved2.txt"), "utf8");
++        fs.renameSync(join(fixtures, "moved2.txt"), join(fixtures, "moved.txt"));
++        expect(text).toBe("moved-v1");`,
++      ),
++      "cp.test.ts": body(
++        "copy into a directory that is there",
++        `await fs.promises.cp(join(fixtures, "copied"), join(fixtures, "merge"), { recursive: true });
++        fs.cpSync(join(fixtures, "copied"), join(fixtures, "merge"), { recursive: true });
++        expect(fs.readFileSync(join(fixtures, "merge", "pre.txt"), "utf8")).toBe("pre-v1");
++        fs.rmSync(join(fixtures, "merge", "other.txt"));`,
++      ),
++      "extract.test.ts": body(
++        "extract into a directory that is there",
++        `await new Bun.Archive({ "new.txt": "new" }).extract(join(fixtures, "into"));
++        expect(fs.readFileSync(join(fixtures, "into", "pre.txt"), "utf8")).toBe("into-v1");
++        fs.rmSync(join(fixtures, "into", "new.txt"));`,
++      ),
++    });
++    const five = ["./sym.test.ts", "./hard.test.ts", "./rename.test.ts", "./cp.test.ts", "./extract.test.ts"];
++    await runTests(String(dir), ["--isolate"], five, record);
++    const unchanged = await runTests(String(dir), ["--isolate"], five, reuse);
++    const edit = (file: string, text: string) => fs.writeFileSync(join(String(dir), "fixtures", file), text);
++    edit("sym.txt", "sym-v2");
++    edit("hard.txt", "hard-v2");
++    edit("moved.txt", "moved-v2");
++    edit("merge/pre.txt", "pre-v2");
++    edit("into/pre.txt", "into-v2");
++    const edited = await runTests(String(dir), ["--isolate"], five, reuse);
++    edit("sym.txt", "sym-v1");
++    edit("hard.txt", "hard-v1");
++    edit("moved.txt", "moved-v1");
++    edit("merge/pre.txt", "pre-v1");
++    edit("into/pre.txt", "into-v1");
++    await runTests(String(dir), ["--isolate"], five, record);
++    edit("linked-dir/inner.txt", "inner-v2");
++    const inner = await runTests(String(dir), ["--isolate"], five, reuse);
++    expect({
++      unchanged: reusedFiles(unchanged.stderr),
++      edited: reusedFiles(edited.stderr),
++      inner: reusedFiles(inner.stderr),
++    }).toEqual({
++      // What an extract writes into a directory that was there stays an input too, so that file
++      // runs every time; it must not be reused when what was there changed.
++      unchanged: ["cp.test.ts", "hard.test.ts", "rename.test.ts", "sym.test.ts"],
++      edited: [],
++      inner: ["cp.test.ts", "hard.test.ts", "rename.test.ts"],
++    });
++  });
++
++  test("mkdtemp marks the directory it made, not every path that starts with its prefix", async () => {
++    using dir = tempDir("input-reuse-mkdtemp", {
++      "package.json": `{ "name": "mkdtemp" }`,
++      "late.ts": `export const late = 1;\n`,
++      "run-old/data.txt": "old-v1",
++      "t.test.ts": `
++        import { expect, test } from "bun:test";
++        import { mkdtempSync, readFileSync } from "node:fs";
++        import { dirname, sep } from "node:path";
++        test("a prefix that is a directory, and a prefix of siblings", async () => {
++          mkdtempSync(dirname(import.meta.dir) + sep);
++          mkdtempSync(import.meta.dir + sep + "run-");
++          expect(readFileSync(import.meta.dir + "/run-old/data.txt", "utf8")).toBe("old-v1");
++          const { late } = await import("./late.ts");
++          expect(late).toBe(1);
++        });
++      `,
++    });
++    const one = ["./t.test.ts"];
++    await runTests(String(dir), ["--isolate"], one, record);
++    const unchanged = await runTests(String(dir), ["--isolate"], one, reuse);
++    fs.writeFileSync(join(String(dir), "late.ts"), `export const late = 2;\n`);
++    const late = await runTests(String(dir), ["--isolate"], one, reuse);
++    fs.writeFileSync(join(String(dir), "late.ts"), `export const late = 1;\n`);
++    await runTests(String(dir), ["--isolate"], one, record);
++    fs.writeFileSync(join(String(dir), "run-old", "data.txt"), "old-v2");
++    const sibling = await runTests(String(dir), ["--isolate"], one, reuse);
++    expect({
++      unchanged: reusedFiles(unchanged.stderr),
++      late: reusedFiles(late.stderr),
++      sibling: reusedFiles(sibling.stderr),
++    }).toEqual({ unchanged: ["t.test.ts"], late: [], sibling: [] });
++  });
++
++  test("a content look at a device is its kind: nothing is read from it", async () => {
++    using dir = tempDir("input-reuse-devices", {
++      "package.json": `{ "name": "devices" }`,
++      "dev.test.ts": `
++        import { expect, test } from "bun:test";
++        import { appendFileSync } from "node:fs";
++        test("devices", async () => {
++          await Bun.write(Bun.file("/dev/stdout"), "to stdout\\n");
++          appendFileSync("/dev/stderr", "to stderr\\n");
++          expect(Bun.file("/dev/urandom").name).toBe("/dev/urandom");
++        });
++      `,
++    });
++    const one = ["./dev.test.ts"];
++    const first = await runTests(String(dir), ["--isolate"], one, { ...record, BUN_TEST_INPUT_RECORD_JSON: "1" });
++    const again = await runTests(String(dir), ["--isolate"], one, reuse);
++    const json = JSON.parse(fs.readFileSync(join(String(dir), "records", "dev.test.ts.json"), "utf8"));
++    expect({
++      first: first.exitCode,
++      reused: reusedFiles(again.stderr),
++      reads: json.reads.filter((it: any) => it.look === "content").map((it: any) => [it.path, it.value]).sort(),
++    }).toEqual({
++      first: 0,
++      reused: ["dev.test.ts"],
++      reads: [
++        ["/dev/stderr", "not a file"],
++        ["/dev/stdout", "not a file"],
++        ["/dev/urandom", "not a file"],
++      ],
++    });
++  });
++
++  test("an HTML import, a module with no file and a resolution that throws make the record not reusable", async () => {
++    using dir = tempDir("input-reuse-unseen", {
++      "package.json": `{ "name": "unseen" }`,
++      "index.html": `<!doctype html><html><head><script type="module" src="./app.ts"></script></head></html>`,
++      "app.ts": `console.log("app");\n`,
++      "html.test.ts": `
++        import { expect, test } from "bun:test";
++        import page from "./index.html";
++        test("html", () => expect(page).toBeDefined());
++      `,
++      "ns.test.ts": `
++        import { expect, test } from "bun:test";
++        Bun.plugin({
++          name: "virtual namespace",
++          setup(build) {
++            build.onLoad({ filter: /.*/, namespace: "virt" }, () => ({ contents: "export default 1;", loader: "js" }));
++          },
++        });
++        test("namespace", async () => expect((await import("virt:thing")).default).toBe(1));
++      `,
++      "throws.test.ts": `
++        import { expect, test } from "bun:test";
++        Bun.plugin({
++          name: "throws",
++          setup(build) {
++            build.onResolve({ filter: /^boom$/ }, () => { throw new Error("boom"); });
++          },
++        });
++        test("throws", async () => expect(import("boom")).rejects.toThrow("boom"));
++      `,
++    });
++    const three = ["./html.test.ts", "./ns.test.ts", "./throws.test.ts"];
++    const first = await runTests(String(dir), ["--isolate"], three, record);
++    const again = await runTests(String(dir), ["--isolate"], three, reuse);
++    expect({ first: first.exitCode, reused: reusedFiles(again.stderr) }).toEqual({ first: 0, reused: [] });
++    expect(again.stderr).toContain("reuse: html.test.ts runs: mark html-bundle");
++    expect(again.stderr).toContain("reuse: ns.test.ts runs: mark module-without-file");
++    expect(again.stderr).toContain("reuse: throws.test.ts runs: mark resolve-threw");
++  });
++
++  test("the owner's permission bits and access() with a mode are inputs", async () => {
++    using dir = tempDir("input-reuse-mode", {
++      "package.json": `{ "name": "mode" }`,
++      "bin/cli.sh": "#!/bin/sh\n",
++      "stat.test.ts": `
++        import { expect, test } from "bun:test";
++        import { statSync } from "node:fs";
++        test("executable by mode", () => expect(statSync(import.meta.dir + "/bin/cli.sh").mode & 0o100).toBe(0o100));
++      `,
++      "access.test.ts": `
++        import { expect, test } from "bun:test";
++        import { accessSync, constants } from "node:fs";
++        test("executable by access", () => expect(() => accessSync(import.meta.dir + "/bin/cli.sh", constants.X_OK)).not.toThrow());
++      `,
++    });
++    const cli = join(String(dir), "bin", "cli.sh");
++    fs.chmodSync(cli, 0o755);
++    const two = ["./access.test.ts", "./stat.test.ts"];
++    await runTests(String(dir), ["--isolate"], two, record);
++    const unchanged = await runTests(String(dir), ["--isolate"], two, reuse);
++    fs.chmodSync(cli, 0o644);
++    const dropped = await runTests(String(dir), ["--isolate"], two, reuse);
++    expect({
++      unchanged: reusedFiles(unchanged.stderr),
++      dropped: [reusedFiles(dropped.stderr), dropped.exitCode],
++    }).toEqual({ unchanged: ["access.test.ts", "stat.test.ts"], dropped: [[], 1] });
++    expect(dropped.stderr).toContain("reuse: stat.test.ts runs: own-read stat bin/cli.sh");
++    expect(dropped.stderr).toContain("reuse: access.test.ts runs: own-read access bin/cli.sh");
++  });
++
++  test("BUN_TEST_INPUT_REUSE off values reuse nothing, and an unknown value is an error", async () => {
++    using dir = tempDir("input-reuse-switch", files);
++    await runTests(String(dir), ["--isolate"], names, record);
++    const off = await Promise.all(
++      ["0", "false", "no", "off"].map(async value => {
++        const { stderr } = await runTests(String(dir), ["--isolate"], names, { ...record, BUN_TEST_INPUT_REUSE: value });
++        return reusedFiles(stderr).length;
++      }),
++    );
++    const on = await runTests(String(dir), ["--isolate"], names, { ...record, BUN_TEST_INPUT_REUSE: "true" });
++    const typo = await runTests(String(dir), ["--isolate"], names, { ...record, BUN_TEST_INPUT_REUSE: "flase" });
++    expect({
++      off,
++      on: reusedFiles(on.stderr),
++      typo: typo.exitCode,
++    }).toEqual({ off: [0, 0, 0, 0], on: ["a.test.ts", "b.test.ts", "c.test.ts"], typo: 1 });
++    expect(typo.stderr).toContain("BUN_TEST_INPUT_REUSE=flase is not one of");
 +  });
 +
 +  test("paths are kept from the repository root, so imports and reads outside the package hold in another checkout", async () => {
