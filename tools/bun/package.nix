@@ -70,6 +70,20 @@ let
     builtins.substring 0 16 (builtins.hashString "sha256" (lib.concatMapStrings builtins.readFile effectPatches + patchlevel))
   }";
 
+  # Bun links its C++ runtime statically, but native addons such as sharp need the shared
+  # libstdc++, and Nix's loader never searches the system's. This library exports nothing
+  # and only needs libstdc++; Bun is linked against it, so libstdc++ is loaded at start and an
+  # addon then finds it by name. An addon's own runpath decides where its dependencies are
+  # searched, so a runpath on Bun alone does not help. Rewriting the finished binary with
+  # patchelf left it crashing in ld.so's version check, depending on its layout.
+  cxxPreload = pkgs.runCommandCC "bun-libstdcxx-preload" { } ''
+    mkdir -p "$out/lib"
+    : > empty.c
+    $CC -shared -o "$out/lib/libbun-libstdcxx-preload.so" empty.c \
+      -Wl,-soname,libbun-libstdcxx-preload.so -Wl,--no-as-needed -lstdc++ \
+      -Wl,-rpath,${lib.getLib pkgs.stdenv.cc.cc}/lib
+  '';
+
   buildBun =
     patched:
     llvm.stdenv.mkDerivation {
@@ -80,6 +94,9 @@ let
       postPatch = ''
         # This nixpkgs LLVM build has no zstd support for debug sections.
         substituteInPlace scripts/build/flags.ts --replace-fail ', "-gz=zstd"' ""
+        substituteInPlace scripts/build/flags.ts --replace-fail \
+          'flag: ["-static-libstdc++", "-static-libgcc"],' \
+          'flag: ["-static-libstdc++", "-static-libgcc", "-Wl,--push-state,--no-as-needed", "${cxxPreload}/lib/libbun-libstdcxx-preload.so", "-Wl,--pop-state", "-Wl,-rpath,${cxxPreload}/lib"],'
       '';
       strictDeps = true;
       dontUseCmakeConfigure = true;
@@ -137,6 +154,11 @@ let
         runHook preInstall
         install -Dm755 build/toolbox/bun "$out/bin/bun"
         runHook postInstall
+      '';
+
+      doInstallCheck = true;
+      installCheckPhase = ''
+        "$out/bin/bun" --revision
       '';
 
       passthru = {
