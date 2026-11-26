@@ -103,9 +103,11 @@ so it needs no fix-ups.
 
 `BUN_TEST_INPUT_RECORD_FINGERPRINT` is internal: a `--parallel` coordinator
 hands its fingerprint to its workers with it. `BUN_TEST_INPUT_BUILD_ID` is read
-when Bun is compiled and hashed with the recorder's sources into a 64-bit build identity, for a packager to pass its patch level; the patched package sets it to its patch level, so every release
-makes the records of an older one stale. It reaches rustc because Bun's Rust
-runner starts each rustc with the build's own environment.
+when Bun is compiled and hashed with the recorder's sources into a 64-bit build
+identity. The patched package sets it to `<patch level>-<first 16 hex of the
+SHA-256 of patches 01 to 07 and the patch level>`, so a record never outlives
+the level or a byte of the series that made it. It reaches rustc because Bun's
+Rust runner starts each rustc with the build's own environment.
 
 The fingerprint covers the Bun build, the flags that change how tests run,
 the transpiler's options and the environment Bun itself acts on, so a Bun
