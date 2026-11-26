@@ -95,6 +95,7 @@ let
         python3
         unzip
         rust
+        patchelf
       ];
       env = lib.optionalAttrs patched {
         # Read by the recorder's option_env! when its crate is compiled.
@@ -137,6 +138,16 @@ let
         runHook preInstall
         install -Dm755 build/toolbox/bun "$out/bin/bun"
         runHook postInstall
+      '';
+
+      # Bun links libstdc++ statically, but native addons such as sharp need the
+      # shared one, and Nix's loader never searches the system's. An addon's own
+      # runpath decides where its dependencies are searched, so Bun's runpath
+      # alone does not help: Bun loads libstdc++ at start, and an addon then
+      # finds it by name. Runs after fixup's rpath shrinking, which would drop it.
+      postFixup = ''
+        patchelf --add-needed libstdc++.so.6 \
+          --add-rpath ${lib.getLib pkgs.stdenv.cc.cc}/lib "$out/bin/bun"
       '';
 
       passthru = {

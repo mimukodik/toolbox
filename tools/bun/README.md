@@ -9,12 +9,12 @@ Move the pin to the first Bun release that includes `bun lint`.
 
 ## Install
 
-Use the `bun-1.4.6-canary.1-0966e99-p1` release. Copy `sha256` from the
+Use the `bun-1.4.6-canary.1-0966e99-p2` release. Copy `sha256` from the
 release's `.tar.zst.sha256` file and run [the Toolbox installer](../../README.md)
 from the same tag.
 
 ```sh
-tag=bun-1.4.6-canary.1-0966e99-p1
+tag=bun-1.4.6-canary.1-0966e99-p2
 url="https://github.com/mimukodik/toolbox/releases/download/$tag/$tag-x86_64-linux.tar.zst"
 sudo sh ./install.sh "$url" "$sha256"
 bun --version
@@ -24,8 +24,11 @@ bun lint --help
 ## Build and use the rules
 
 Both packages use the same release build with LTO and AOT disabled. The
-patched package applies the patches in this directory at patch level `p1`.
-The unpatched package is the control.
+patched package applies the patches in this directory at patch level `p2`.
+The unpatched package is the control. Both load Nix's shared libstdc++ at
+start, so native addons built against it, such as `sharp`, load. Patch level
+`p1` could not load them, and the release's Ubuntu smoke test now loads
+`sharp`.
 
 ```sh
 nix build .#bun

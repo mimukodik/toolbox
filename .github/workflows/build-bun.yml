@@ -151,6 +151,12 @@ jobs:
               test "$actual_revision" = "$3+$4"
               bun lint --help
 
+              mkdir /tmp/sharp-smoke
+              cd /tmp/sharp-smoke
+              printf "%s\n" "{\"name\":\"sharp-smoke\",\"private\":true}" > package.json
+              bun add sharp@0.35.3
+              bun -e "require(\"sharp\")({ create: { width: 2, height: 2, channels: 3, background: \"red\" } }).png().toBuffer().then((png) => console.log(\"sharp loads: png \" + png.length + \" bytes\"))"
+
               git init --quiet /tmp/slack-listener
               cd /tmp/slack-listener
               git fetch --no-tags --depth=1 https://github.com/mimukodik/slack-listener.git "$5"
