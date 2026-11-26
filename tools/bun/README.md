@@ -9,12 +9,12 @@ Move the pin to the first Bun release that includes `bun lint`.
 
 ## Install
 
-Use the `bun-1.4.6-canary.1-0966e99-p2` release. Copy `sha256` from the
+Use the `bun-1.4.6-canary.1-0966e99-p3` release. Copy `sha256` from the
 release's `.tar.zst.sha256` file and run [the Toolbox installer](../../README.md)
 from the same tag.
 
 ```sh
-tag=bun-1.4.6-canary.1-0966e99-p2
+tag=bun-1.4.6-canary.1-0966e99-p3
 url="https://github.com/mimukodik/toolbox/releases/download/$tag/$tag-x86_64-linux.tar.zst"
 sudo sh ./install.sh "$url" "$sha256"
 bun --version
@@ -24,11 +24,12 @@ bun lint --help
 ## Build and use the rules
 
 Both packages use the same release build with LTO and AOT disabled. The
-patched package applies the patches in this directory at patch level `p2`.
+patched package applies the patches in this directory at patch level `p3`.
 The unpatched package is the control. Both load Nix's shared libstdc++ at
 start, so native addons built against it, such as `sharp`, load. Patch level
 `p1` could not load them, and the release's Ubuntu smoke test now loads
-`sharp`.
+`sharp`. Patch level `p3` fixes the recorder's wrong reuses found in review
+(see below).
 
 ```sh
 nix build .#bun
@@ -90,14 +91,14 @@ patches at the new commit and run the Blacksmith proof for both variants.
 `patches/07-test-input-recorder.patch` adds a native recorder to
 `bun test --isolate`. It is off unless you set a variable below, and then it
 only adds work around the resolver and the transpiler. It is the difference
-between this pin and the `native-recorder` branch of our Bun checkout
-(commit `4707c1b64bec439157e5cac4bc7aa524a9b309ab`), which starts at this pin,
+between this pin and the `native-recorder-p2` branch of our Bun checkout
+(commit `819c1243295aa8d82f3db6da62c7b01d3d456816`), which starts at this pin,
 so it needs no fix-ups.
 
 | Variable | Effect |
 | --- | --- |
-| `BUN_TEST_INPUT_RECORD_DIR=<dir>` | Records what each test file's pass depended on into one store in `<dir>` (`store.btis`, with `segments/` for the processes still running). A record lists the file's resolutions (question and answer), the modules it loaded with a SHA-256 of their source, what its own code read through `node:fs`, `Bun.file`, `Bun.Glob`, snapshots and `Bun.mmap`, what it did that a record cannot replay (spawn, FFI, workers, SQLite, macros), and its outcome counts. A file keeps its last four distinct states. A module that the file's own code wrote before it imported it is not an input. A module loaded with a query such as `?raw` is hashed as its file. Paths in a record are relative to the repository root, so records hold in another checkout of the same files (store format version 2; an older store is ignored with a line saying so). Needs `--isolate`; `--parallel` implies it. |
-| `BUN_TEST_INPUT_REUSE=1` | With a record directory, skips every test file whose record still holds and counts its recorded results in the summary. `explain` also says why each other file runs. `check` runs every file anyway and fails the run when a file whose record held ends with other pass, skip or todo counts; a different number of `expect()` calls alone is only reported, because it is not deterministic in every test. `list` says for each file whether it would run and why, and runs none. Unset, `0`, `false`, `no` and `off` are off; any other unknown value is an error, so a mistyped off switch cannot skip files. A run with coverage or `--aot` never records or reuses. With `--shard`, the files are dealt to shards before reuse is decided, so every shard deals the same list whatever its store holds. Recording and reuse are unavailable off Unix. |
+| `BUN_TEST_INPUT_RECORD_DIR=<dir>` | Records what each test file's pass depended on into one store in `<dir>` (`store.btis`, with `segments/` for the processes still running). A record lists the file's resolutions (question and answer), the modules it loaded with a SHA-256 of their source, what its own code read through `node:fs`, `Bun.file`, `Bun.Glob`, snapshots and `Bun.mmap`, what it did that a record cannot replay (spawn, FFI, workers, SQLite, macros), and its outcome counts. When a file ends, what each path its own code wrote now holds is recorded too, so a file is reused only while its outputs are still on disk as it left them; otherwise it runs with the reason `own-write` (paths under a directory `fs.mkdtemp` made are left out). A file that writes different bytes to a fixed path on every run is therefore never reused. A file keeps its last four distinct states. A module that the file's own code wrote before it imported it is not an input. A module loaded with a query such as `?raw` is hashed as its file. Paths in a record are relative to the repository root, so records hold in another checkout of the same files (store format version 2; an older store is ignored with a line saying so). Needs `--isolate`; `--parallel` implies it. |
+| `BUN_TEST_INPUT_REUSE=1` | With a record directory, skips every test file whose record still holds and counts its recorded results in the summary. `explain` also says why each other file runs. `check` runs every file anyway and fails the run when a file whose record held ends with other pass, skip or todo counts; a different number of `expect()` calls alone is only reported, because it is not deterministic in every test. `list` says for each file whether it would run and why, and runs none. Unset, `0`, `false`, `no` and `off` are off; any other unknown value is an error, so a mistyped off switch cannot skip files. A run with coverage or `--aot` never records or reuses. With `--shard`, the files are dealt to shards before reuse is decided, so every shard deals the same list whatever its store holds. After `--bail` stops a run, each file that was to be reused but whose record no longer holds prints `<file>: not run after --bail: <why>`. Recording and reuse are unavailable off Unix. |
 | `BUN_TEST_INPUT_REUSE_REPORT=<file>` | Writes one JSON line per file saying whether its record held and why not. |
 | `BUN_TEST_INPUT_RECORD_SALT=<text>` | Part of every record's fingerprint, for what you know changes outcomes, such as a database version. |
 | `BUN_TEST_INPUT_RECORD_ENV=<A,B>` | Environment variables whose values are part of the fingerprint. |
