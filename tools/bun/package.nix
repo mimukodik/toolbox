@@ -95,7 +95,6 @@ let
         python3
         unzip
         rust
-        patchelf
       ];
       env = lib.optionalAttrs patched {
         # Read by the recorder's option_env! when its crate is compiled.
@@ -145,8 +144,10 @@ let
       # runpath decides where its dependencies are searched, so Bun's runpath
       # alone does not help: Bun loads libstdc++ at start, and an addon then
       # finds it by name. Runs after fixup's rpath shrinking, which would drop it.
+      # stdenv's patchelf 0.15 moves .dynstr out of its segment in this binary,
+      # and the loader then crashes in its version check; 0.18 and later do not.
       postFixup = ''
-        patchelf --add-needed libstdc++.so.6 \
+        ${pkgs.patchelfUnstable}/bin/patchelf --add-needed libstdc++.so.6 \
           --add-rpath ${lib.getLib pkgs.stdenv.cc.cc}/lib "$out/bin/bun"
       '';
 
