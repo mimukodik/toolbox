@@ -70,6 +70,16 @@ let
     builtins.substring 0 16 (builtins.hashString "sha256" (lib.concatMapStrings builtins.readFile effectPatches + patchlevel))
   }";
 
+  # stdenv's patchelf 0.15.2 and nixpkgs' patchelfUnstable 0.19.2 both leave this binary
+  # crashing in ld.so's version check after the rewrite below; 0.18.0 does not.
+  patchelf = pkgs.patchelf.overrideAttrs (old: {
+    version = "0.18.0";
+    src = pkgs.fetchurl {
+      url = "https://github.com/NixOS/patchelf/releases/download/0.18.0/patchelf-0.18.0.tar.bz2";
+      sha256 = "1952b2a782ba576279c211ee942e341748fdb44997f704dd53def46cd055470b";
+    };
+  });
+
   buildBun =
     patched:
     llvm.stdenv.mkDerivation {
@@ -143,12 +153,14 @@ let
       # shared one, and Nix's loader never searches the system's. An addon's own
       # runpath decides where its dependencies are searched, so Bun's runpath
       # alone does not help: Bun loads libstdc++ at start, and an addon then
-      # finds it by name. Runs after fixup's rpath shrinking, which would drop it.
-      # stdenv's patchelf 0.15 moves .dynstr out of its segment in this binary,
-      # and the loader then crashes in its version check; 0.18 and later do not.
+      # finds it by name.
       postFixup = ''
-        ${pkgs.patchelfUnstable}/bin/patchelf --add-needed libstdc++.so.6 \
+        ${patchelf}/bin/patchelf --add-needed libstdc++.so.6 \
           --add-rpath ${lib.getLib pkgs.stdenv.cc.cc}/lib "$out/bin/bun"
+      '';
+      doInstallCheck = true;
+      installCheckPhase = ''
+        "$out/bin/bun" --revision
       '';
 
       passthru = {
