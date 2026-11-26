@@ -1,9 +1,8 @@
 {
-  "https://github.com/c-ares/c-ares/archive/0b88066f79ac9745d6819899f1794df91b73c873.tar.gz": "3707c13c56a164ca84d18d7800c7efb5fc23ab73b74a67a34063667ebfbae96e",
   "https://github.com/google/highway/archive/2607d3b5b0113992fe84d3848859eae13b3b52c1.tar.gz": "741d705781e0b3e406beda8f1f994fbae01321237ce8023a1ad90fbaf7940c25",
   "https://github.com/litespeedtech/ls-qpack/archive/91567706c41c0d97ab8dc576873ecd472d7869fa.tar.gz": "1e8f7a69a9aee3970cb3fa8fbc22e2df00b7daf8f2b51daf35f50001e6c6943c",
   "https://github.com/litespeedtech/lsquic/archive/f52c00172e04f9b889ab9e28d21e5d1805133cfb.tar.gz": "c569b3c48b59f3dfa0b8e8efde181c599317b7b969e9818ad7b7c37931e3b514",
-  "https://github.com/oven-sh/WebKit/releases/download/autobuild-499846f18f75962fd6e2ba01065d00305ce72c4a/bun-webkit-linux-amd64.tar.gz": "3b9d0ff69e88de2f3d3c90e0e6fd98a21919211fe239379da72c8d6f8d4b8d14",
+  "https://github.com/oven-sh/WebKit/releases/download/autobuild-32300d4d274b67f5cd3b3f109da0f0589aff742f/bun-webkit-linux-amd64.tar.gz": "baeb88e6ed2952a9e0e0508042aff7ef6cba2028eb496252de7cbae63cf2bdb0",
   "https://github.com/oven-sh/boringssl/archive/fe703e9faa3bfd22b04eb192066856557b7e015c.tar.gz": "a528428eca361764a60a3f82f637239bf46dc36b7d5b03500ad870675e3cd02f",
   "https://github.com/oven-sh/libuv/archive/8023581113b276e7c1aee3f82da57ca0893faab1.tar.gz": "93bb95e613d8c324e673607282fac0ae25a07368eabcc12c0e2539eaa95b0ecc",
   "https://github.com/oven-sh/lol-html/archive/725ce499aa9b71e38b7a2d0a9fbb6d7294a4079e.tar.gz": "afd83edbe1a2d4accb72e869cd4218bb8665fda2b7cb2c5106fc4be80001a748",
