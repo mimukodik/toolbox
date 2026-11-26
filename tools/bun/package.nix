@@ -70,15 +70,19 @@ let
     builtins.substring 0 16 (builtins.hashString "sha256" (lib.concatMapStrings builtins.readFile effectPatches + patchlevel))
   }";
 
-  # stdenv's patchelf 0.15.2 and nixpkgs' patchelfUnstable 0.19.2 both leave this binary
-  # crashing in ld.so's version check after the rewrite below; 0.18.0 does not.
-  patchelf = pkgs.patchelf.overrideAttrs (old: {
-    version = "0.18.0";
-    src = pkgs.fetchurl {
-      url = "https://github.com/NixOS/patchelf/releases/download/0.18.0/patchelf-0.18.0.tar.bz2";
-      sha256 = "1952b2a782ba576279c211ee942e341748fdb44997f704dd53def46cd055470b";
-    };
-  });
+  # Bun links its C++ runtime statically, but native addons such as sharp need the shared
+  # libstdc++, and Nix's loader never searches the system's. This library exports nothing
+  # and only needs libstdc++; Bun is linked against it, so libstdc++ is loaded at start and an
+  # addon then finds it by name. An addon's own runpath decides where its dependencies are
+  # searched, so a runpath on Bun alone does not help. Rewriting the finished binary with
+  # patchelf left it crashing in ld.so's version check, depending on its layout.
+  cxxPreload = pkgs.runCommandCC "bun-libstdcxx-preload" { } ''
+    mkdir -p "$out/lib"
+    : > empty.c
+    $CC -shared -o "$out/lib/libbun-libstdcxx-preload.so" empty.c \
+      -Wl,-soname,libbun-libstdcxx-preload.so -Wl,--no-as-needed -lstdc++ \
+      -Wl,-rpath,${lib.getLib pkgs.stdenv.cc.cc}/lib
+  '';
 
   buildBun =
     patched:
@@ -90,6 +94,9 @@ let
       postPatch = ''
         # This nixpkgs LLVM build has no zstd support for debug sections.
         substituteInPlace scripts/build/flags.ts --replace-fail ', "-gz=zstd"' ""
+        substituteInPlace scripts/build/flags.ts --replace-fail \
+          'flag: ["-static-libstdc++", "-static-libgcc"],' \
+          'flag: ["-static-libstdc++", "-static-libgcc", "-Wl,--push-state,--no-as-needed", "${cxxPreload}/lib/libbun-libstdcxx-preload.so", "-Wl,--pop-state", "-Wl,-rpath,${cxxPreload}/lib"],'
       '';
       strictDeps = true;
       dontUseCmakeConfigure = true;
@@ -149,15 +156,6 @@ let
         runHook postInstall
       '';
 
-      # Bun links libstdc++ statically, but native addons such as sharp need the
-      # shared one, and Nix's loader never searches the system's. An addon's own
-      # runpath decides where its dependencies are searched, so Bun's runpath
-      # alone does not help: Bun loads libstdc++ at start, and an addon then
-      # finds it by name.
-      postFixup = ''
-        ${patchelf}/bin/patchelf --add-needed libstdc++.so.6 \
-          --add-rpath ${lib.getLib pkgs.stdenv.cc.cc}/lib "$out/bin/bun"
-      '';
       doInstallCheck = true;
       installCheckPhase = ''
         "$out/bin/bun" --revision
