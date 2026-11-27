@@ -90,7 +90,12 @@ cp "$release/$asset" "$release/$asset.sha256" "$release/manifest-aarch64-darwin.
 python3 "$root/tools/bun/fake-github-release.py" "$work" 8765 "$tag" nodigest 2> "$work/api.log" &
 api=$!
 trap 'kill $api 2>/dev/null || true' EXIT
-sleep 2
+ready=
+for _ in $(seq 20); do
+  if curl --silent --fail -o /dev/null "http://127.0.0.1:8765/repos/mimukodik/toolbox/releases"; then ready=1; break; fi
+  sleep 0.5
+done
+test -n "$ready"
 mkdir "$work/mise-project"
 cat > "$work/mise-project/mise.toml" <<TOML
 [tools]
