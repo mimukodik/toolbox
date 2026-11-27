@@ -216,7 +216,7 @@ jobs:
 
   release:
     if: github.ref == 'refs/heads/main' && !inputs.darwin && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
-    needs: bun-lint-proof
+    needs: [bun-lint-proof, darwin-test]
     runs-on: blacksmith-8vcpu-ubuntu-2404
     permissions:
       contents: write
@@ -229,33 +229,72 @@ jobs:
           name: bun-release
           path: release
 
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: bun-darwin-release
+          path: release-darwin
+
       - name: Publish the immutable release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-        working-directory: release
         run: |
-          tag=$(jq -er '"bun-" + .version + "-" + .bun_commit[:7] + "-" + .patchlevel' manifest.json)
-          asset="$tag-x86_64-linux.tar.zst"
-          read -r sha256 checksummed_asset < "$asset.sha256"
-          test "$checksummed_asset" = "$asset"
-          sha256sum --check "$asset.sha256"
-          test "$(jq -er .sha256 manifest.json)" = "$sha256"
-          test "$(jq -er .source_commit manifest.json)" = "$GITHUB_SHA"
+          # Both builds passed their tests in this run. The release carries both or neither: a new release is
+          # created as a draft with every file and published last. A published release that lacks the darwin
+          # files (the Linux-only p3) gets them added, and the digests are checked again.
+          tag=$(jq -er '"bun-" + .version + "-" + .bun_commit[:7] + "-" + .patchlevel' release/manifest.json)
+          darwin_tag=$(jq -er '"bun-" + .version + "-" + .bun_commit[:7] + "-" + .patchlevel' release-darwin/manifest.json)
+          test "$tag" = "$darwin_tag"
+          linux_asset="$tag-x86_64-linux.tar.zst"
+          darwin_asset="$tag-aarch64-darwin.tar.zst"
 
-          releases=$(gh api --paginate "repos/$GH_REPO/releases" \
-            --jq ".[] | select(.tag_name == \"$tag\")")
+          for pair in "release:$linux_asset:manifest.json" "release-darwin:$darwin_asset:manifest.json"; do
+            IFS=: read -r dir asset manifest <<< "$pair"
+            (
+              cd "$dir"
+              read -r sha256 checksummed_asset < "$asset.sha256"
+              test "$checksummed_asset" = "$asset"
+              sha256sum --check "$asset.sha256"
+              test "$(jq -er .sha256 "$manifest")" = "$sha256"
+              test "$(jq -er .source_commit "$manifest")" = "$GITHUB_SHA"
+            )
+          done
+          linux_sha=$(cut -d' ' -f1 "release/$linux_asset.sha256")
+          darwin_sha=$(cut -d' ' -f1 "release-darwin/$darwin_asset.sha256")
+          cp release-darwin/manifest.json release/manifest-aarch64-darwin.json
+          cp "release-darwin/$darwin_asset" "release-darwin/$darwin_asset.sha256" release/
+          cd release
+
+          digest_of() { # releases-json asset
+            jq -r --arg asset "$2" 'select(.draft == false) | .assets[] | select(.name == $asset) | .digest // ""' <<< "$1"
+          }
+
+          releases=$(gh api --paginate "repos/$GH_REPO/releases" --jq ".[] | select(.tag_name == \"$tag\")")
           if [[ -n "$releases" ]]; then
-            digest=$(jq -r --arg asset "$asset" \
-              'select(.draft == false) | .assets[] | select(.name == $asset) | .digest // ""' \
-              <<< "$releases")
-            if [[ "$digest" == "sha256:$sha256" ]]; then
-              printf 'Release %s already has SHA-256 %s. Skipping.\n' "$tag" "$sha256"
+            if [[ $(jq -s 'map(select(.draft == false)) | length' <<< "$releases") == 0 ]]; then
+              echo "::error::Release $tag exists only as a draft. Delete the draft or bump PATCHLEVEL."
+              exit 1
+            fi
+            if [[ "$(digest_of "$releases" "$linux_asset")" != "sha256:$linux_sha" ]]; then
+              echo "::error::Release $tag exists without the matching Linux asset. Bump PATCHLEVEL."
+              exit 1
+            fi
+            current=$(digest_of "$releases" "$darwin_asset")
+            if [[ "$current" == "sha256:$darwin_sha" ]]; then
+              printf 'Release %s already has both assets. Skipping.\n' "$tag"
               exit 0
             fi
-            echo "::error::Release $tag exists without the matching published asset. Resolve the draft or bump PATCHLEVEL."
-            exit 1
+            if [[ -n "$current" ]]; then
+              echo "::error::Release $tag has a different $darwin_asset. Bump PATCHLEVEL."
+              exit 1
+            fi
+            gh release upload "$tag" "$darwin_asset" "$darwin_asset.sha256" manifest-aarch64-darwin.json
+            releases=$(gh api --paginate "repos/$GH_REPO/releases" --jq ".[] | select(.tag_name == \"$tag\")")
+            test "$(digest_of "$releases" "$darwin_asset")" = "sha256:$darwin_sha"
+            test "$(digest_of "$releases" "$linux_asset")" = "sha256:$linux_sha"
+            printf 'Added the darwin files to release %s.\n' "$tag"
+            exit 0
           fi
 
           tags=$(gh api --paginate "repos/$GH_REPO/git/matching-refs/tags/$tag" \
@@ -265,12 +304,19 @@ jobs:
             exit 1
           fi
 
-          gh release create "$tag" "$asset" "$asset.sha256" manifest.json \
-            --target "$GITHUB_SHA" --title "$tag" \
-            --notes "Bun runtime closure for Linux x86_64. [Build and measurements](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID})."
+          gh release create "$tag" "$linux_asset" "$linux_asset.sha256" manifest.json \
+            "$darwin_asset" "$darwin_asset.sha256" manifest-aarch64-darwin.json \
+            --draft --target "$GITHUB_SHA" --title "$tag" \
+            --notes "Bun for Linux x86_64 (runtime closure) and macOS aarch64 (single binary). [Build and measurements](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID})."
+          drafted=$(gh api --paginate "repos/$GH_REPO/releases" --jq ".[] | select(.tag_name == \"$tag\" and .draft == true)")
+          for pair in "$linux_asset:$linux_sha" "$darwin_asset:$darwin_sha"; do
+            asset=${pair%%:*}; sha=${pair##*:}
+            test "$(jq -r --arg asset "$asset" '.assets[] | select(.name == $asset) | .digest // ""' <<< "$drafted")" = "sha256:$sha"
+          done
+          gh release edit "$tag" --draft=false
 
   darwin-build:
-    if: inputs.darwin
+    if: inputs.darwin || github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main'
     runs-on: blacksmith-8vcpu-ubuntu-2404
     timeout-minutes: 150
     steps:
@@ -293,7 +339,7 @@ jobs:
           compression-level: 0
 
   darwin-test:
-    if: inputs.darwin
+    if: inputs.darwin || github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main'
     needs: darwin-build
     runs-on: macos-15
     timeout-minutes: 60
