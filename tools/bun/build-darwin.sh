@@ -60,6 +60,7 @@ endphase
 phase 'cmake, Node, host Bun'
 fetch "https://github.com/Kitware/CMake/releases/download/v$cmake_version/cmake-$cmake_version-linux-x86_64.sh" \
   "$cmake_sha256" "$work/cmake.sh"
+mkdir -p "$tools/cmake"
 sh "$work/cmake.sh" --skip-license --prefix="$tools/cmake" > /dev/null
 fetch "https://nodejs.org/download/release/v$node_version/node-v$node_version-linux-x64.tar.xz" \
   "$node_sha256" "$work/node.tar.xz"
