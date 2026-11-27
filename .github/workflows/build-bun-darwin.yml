@@ -1,0 +1,52 @@
+name: Build Bun for macOS
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+
+      - name: Cross-compile Bun for aarch64-darwin
+        run: bash tools/bun/build-darwin.sh
+
+      - name: Package the release files
+        run: bash tools/bun/package-darwin.sh
+
+      - name: Save the release files
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: bun-darwin-release
+          path: ${{ runner.temp }}/bun-darwin-package/
+          if-no-files-found: error
+          compression-level: 0
+
+  test:
+    needs: build
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      SLACK_LISTENER_REV: 8132eccf4db7799dc3647e467ddc08f7384aa9a8
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: bun-darwin-release
+          path: release
+
+      - name: Install zstd
+        run: command -v zstd || brew install zstd
+
+      - name: Test the downloaded binary
+        run: bash tools/bun/test-darwin.sh "$PWD/release"
