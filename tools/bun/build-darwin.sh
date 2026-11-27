@@ -62,10 +62,10 @@ fetch "https://github.com/Kitware/CMake/releases/download/v$cmake_version/cmake-
   "$cmake_sha256" "$work/cmake.sh"
 mkdir -p "$tools/cmake"
 sh "$work/cmake.sh" --skip-license --prefix="$tools/cmake" > /dev/null
-fetch "https://nodejs.org/download/release/v$node_version/node-v$node_version-linux-x64.tar.xz" \
-  "$node_sha256" "$work/node.tar.xz"
+fetch "https://nodejs.org/download/release/v$node_version/node-v$node_version-linux-x64.tar.gz" \
+  "$node_sha256" "$work/node.tar.gz"
 mkdir -p "$tools/node"
-tar -xf "$work/node.tar.xz" -C "$tools/node" --strip-components=1
+tar -xzf "$work/node.tar.gz" -C "$tools/node" --strip-components=1
 fetch "https://github.com/oven-sh/bun/releases/download/bun-v$hostbun_version/bun-linux-x64.zip" \
   "$hostbun_sha256" "$work/hostbun.zip"
 unzip -q -o "$work/hostbun.zip" -d "$work/hostbun"
