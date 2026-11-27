@@ -20,12 +20,17 @@ on:
         description: Build the unpatched Bun control even if its inputs are unchanged
         type: boolean
         default: false
+      darwin:
+        description: Build and test the aarch64-darwin Bun only (skips the Linux jobs)
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 jobs:
   bun-lint-proof:
+    if: ${{ !inputs.darwin }}
     runs-on: blacksmith-8vcpu-ubuntu-2404
     timeout-minutes: 150
     env:
@@ -210,56 +215,114 @@ jobs:
           if-no-files-found: warn
 
   release:
-    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
-    needs: bun-lint-proof
+    if: github.ref == 'refs/heads/main' && !inputs.darwin && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    needs: [bun-lint-proof, darwin-test]
     runs-on: blacksmith-8vcpu-ubuntu-2404
+    outputs:
+      tag: ${{ steps.publish.outputs.tag }}
     permissions:
       contents: write
     concurrency:
       group: bun-release
       cancel-in-progress: false
     steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: bun-release
           path: release
 
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: bun-darwin-release
+          path: release-darwin
+
       - name: Publish the immutable release
+        id: publish
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-        working-directory: release
+        # The release carries both platforms or neither: a new release is a draft with all six files, published
+        # last. A published release with the Linux files only (p3) gets the darwin files added. A release with
+        # some but not all of the darwin files, or any digest that differs, stops the job.
+        run: bash tools/bun/publish-release.sh
+
+  darwin-build:
+    if: inputs.darwin || github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main'
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+
+      - name: Cross-compile Bun for aarch64-darwin
+        run: bash tools/bun/build-darwin.sh
+
+      - name: Package the release files
+        run: bash tools/bun/package-darwin.sh
+
+      - name: Save the release files
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: bun-darwin-release
+          path: ${{ runner.temp }}/bun-darwin-package/
+          if-no-files-found: error
+          compression-level: 0
+
+  darwin-test:
+    if: inputs.darwin || github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main'
+    needs: darwin-build
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      SLACK_LISTENER_REV: 8132eccf4db7799dc3647e467ddc08f7384aa9a8
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: bun-darwin-release
+          path: release
+
+      - name: Install zstd
+        run: command -v zstd || brew install zstd
+
+      - name: Test the downloaded binary
+        run: bash tools/bun/test-darwin.sh "$PWD/release"
+
+  darwin-mise-proof:
+    if: needs.release.result == 'success' && needs.release.outputs.tag != ''
+    needs: release
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - name: Install the published release with mise, from GitHub
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.release.outputs.tag }}
         run: |
-          tag=$(jq -er '"bun-" + .version + "-" + .bun_commit[:7] + "-" + .patchlevel' manifest.json)
-          asset="$tag-x86_64-linux.tar.zst"
-          read -r sha256 checksummed_asset < "$asset.sha256"
-          test "$checksummed_asset" = "$asset"
-          sha256sum --check "$asset.sha256"
-          test "$(jq -er .sha256 manifest.json)" = "$sha256"
-          test "$(jq -er .source_commit manifest.json)" = "$GITHUB_SHA"
-
-          releases=$(gh api --paginate "repos/$GH_REPO/releases" \
-            --jq ".[] | select(.tag_name == \"$tag\")")
-          if [[ -n "$releases" ]]; then
-            digest=$(jq -r --arg asset "$asset" \
-              'select(.draft == false) | .assets[] | select(.name == $asset) | .digest // ""' \
-              <<< "$releases")
-            if [[ "$digest" == "sha256:$sha256" ]]; then
-              printf 'Release %s already has SHA-256 %s. Skipping.\n' "$tag" "$sha256"
-              exit 0
-            fi
-            echo "::error::Release $tag exists without the matching published asset. Resolve the draft or bump PATCHLEVEL."
-            exit 1
-          fi
-
-          tags=$(gh api --paginate "repos/$GH_REPO/git/matching-refs/tags/$tag" \
-            --jq ".[] | select(.ref == \"refs/tags/$tag\") | .ref")
-          if [[ -n "$tags" ]]; then
-            echo "::error::Tag $tag already exists without a release. Bump PATCHLEVEL."
-            exit 1
-          fi
-
-          gh release create "$tag" "$asset" "$asset.sha256" manifest.json \
-            --target "$GITHUB_SHA" --title "$tag" \
-            --notes "Bun runtime closure for Linux x86_64. [Build and measurements](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID})."
+          mise_version=2026.9.17
+          curl --fail --silent --show-error --location --retry 3 -o mise.tar.gz \
+            "https://github.com/jdx/mise/releases/download/v$mise_version/mise-v$mise_version-macos-arm64.tar.gz"
+          echo "63deaba3321800014feb6a92f1fed38680edf8deccbe972beebcdae7b67f3172  mise.tar.gz" | shasum -a 256 -c
+          tar -xzf mise.tar.gz
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern manifest.json
+          expected="$(jq -er .version manifest.json)+$(jq -er '.bun_commit[:9]' manifest.json)"
+          mkdir proof && cd proof
+          cat > mise.toml <<TOML
+          [tools]
+          "github:$GITHUB_REPOSITORY" = { version = "${TAG#bun-}", version_prefix = "bun-", platforms.macos-arm64.asset_pattern = "*-aarch64-darwin.tar.zst" }
+          TOML
+          export MISE_TRUSTED_CONFIG_PATHS="$PWD" MISE_YES=1 MISE_USE_VERSIONS_HOST=0
+          ../mise/bin/mise install
+          revision=$(../mise/bin/mise exec -- bun --revision)
+          printf 'mise installed %s from the release: bun --revision %s (expected %s)\n' "$TAG" "$revision" "$expected" | tee -a "$GITHUB_STEP_SUMMARY"
+          test "$revision" = "$expected"
