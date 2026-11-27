@@ -13,13 +13,14 @@ asset=$(cd "$release" && ls ./*.tar.zst | head -n1)
 asset=${asset#./}
 (cd "$release" && shasum -a 256 -c "$asset.sha256")
 read -r sha256 _ < "$release/$asset.sha256"
-test "$(jq -er .sha256 "$release/manifest.json")" = "$sha256"
+test "$(jq -er .sha256 "$release/manifest-aarch64-darwin.json")" = "$sha256"
 mkdir "$work/bin"
 zstd -dc "$release/$asset" | tar -x -C "$work/bin"
+test "$(ls "$work/bin")" = bun
 bun="$work/bin/bun"
 chmod +x "$bun"
-version=$(jq -er .version "$release/manifest.json")
-commit=$(jq -er .bun_commit "$release/manifest.json")
+version=$(jq -er .version "$release/manifest-aarch64-darwin.json")
+commit=$(jq -er .bun_commit "$release/manifest-aarch64-darwin.json")
 say '### Darwin test'
 say ''
 say "- binary: $(stat -f %z "$bun") bytes, $(file "$bun")"
@@ -73,3 +74,33 @@ test "$(git rev-parse HEAD)" = "$SLACK_LISTENER_REV"
 "$bun" install --frozen-lockfile
 "$bun" test 2>&1 | tee "$work/slack.log"
 say "- slack-listener $SLACK_LISTENER_REV: $(grep -E '^[[:space:]]*[0-9]+ (pass|fail)$' "$work/slack.log" | tr -s ' ' | tr '\n' ' ')"
+
+# What a Mac does: mise's github backend installs the release asset by its tag and checksum file. The release
+# is served by a local stand-in for GitHub's API (mise takes api_url), because this run has no release yet.
+mise_version=2026.9.17
+mise_sha256=63deaba3321800014feb6a92f1fed38680edf8deccbe972beebcdae7b67f3172
+curl --fail --silent --show-error --location --retry 3 -o "$work/mise.tar.gz" \
+  "https://github.com/jdx/mise/releases/download/v$mise_version/mise-v$mise_version-macos-arm64.tar.gz"
+printf '%s  %s\n' "$mise_sha256" "$work/mise.tar.gz" | shasum -a 256 -c
+tar -xzf "$work/mise.tar.gz" -C "$work"
+mise_bin="$work/mise/bin/mise"
+tag=$(jq -er '"bun-" + .version + "-" + .bun_commit[:7] + "-" + .patchlevel' "$release/manifest-aarch64-darwin.json")
+mkdir -p "$work/files"
+cp "$release/$asset" "$release/$asset.sha256" "$release/manifest-aarch64-darwin.json" "$work/files/"
+python3 "$root/tools/bun/fake-github-release.py" "$work" 8765 "$tag" nodigest 2> "$work/api.log" &
+api=$!
+trap 'kill $api 2>/dev/null || true' EXIT
+sleep 2
+mkdir "$work/mise-project"
+cat > "$work/mise-project/mise.toml" <<TOML
+[tools]
+"github:mimukodik/toolbox" = { version = "${tag#bun-}", version_prefix = "bun-", api_url = "http://127.0.0.1:8765", platforms.macos-arm64.asset_pattern = "*-aarch64-darwin.tar.zst" }
+TOML
+export MISE_DATA_DIR="$work/mise-data" MISE_CACHE_DIR="$work/mise-cache" MISE_CONFIG_DIR="$work/mise-config" \
+  MISE_TRUSTED_CONFIG_PATHS="$work/mise-project" MISE_USE_VERSIONS_HOST=0 MISE_YES=1
+cd "$work/mise-project"
+"$mise_bin" install
+mise_revision=$("$mise_bin" exec -- bun --revision)
+say "- mise $mise_version install of ${tag#bun-} and bun --revision: $mise_revision"
+test "$mise_revision" = "$version+${commit:0:9}"
+grep -q '\.sha256 HTTP' "$work/api.log" && say '- mise fetched the .sha256 asset'

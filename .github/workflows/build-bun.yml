@@ -244,12 +244,12 @@ jobs:
           # created as a draft with every file and published last. A published release that lacks the darwin
           # files (the Linux-only p3) gets them added, and the digests are checked again.
           tag=$(jq -er '"bun-" + .version + "-" + .bun_commit[:7] + "-" + .patchlevel' release/manifest.json)
-          darwin_tag=$(jq -er '"bun-" + .version + "-" + .bun_commit[:7] + "-" + .patchlevel' release-darwin/manifest.json)
+          darwin_tag=$(jq -er '"bun-" + .version + "-" + .bun_commit[:7] + "-" + .patchlevel' release-darwin/manifest-aarch64-darwin.json)
           test "$tag" = "$darwin_tag"
           linux_asset="$tag-x86_64-linux.tar.zst"
           darwin_asset="$tag-aarch64-darwin.tar.zst"
 
-          for pair in "release:$linux_asset:manifest.json" "release-darwin:$darwin_asset:manifest.json"; do
+          for pair in "release:$linux_asset:manifest.json" "release-darwin:$darwin_asset:manifest-aarch64-darwin.json"; do
             IFS=: read -r dir asset manifest <<< "$pair"
             (
               cd "$dir"
@@ -262,8 +262,7 @@ jobs:
           done
           linux_sha=$(cut -d' ' -f1 "release/$linux_asset.sha256")
           darwin_sha=$(cut -d' ' -f1 "release-darwin/$darwin_asset.sha256")
-          cp release-darwin/manifest.json release/manifest-aarch64-darwin.json
-          cp "release-darwin/$darwin_asset" "release-darwin/$darwin_asset.sha256" release/
+          cp "release-darwin/$darwin_asset" "release-darwin/$darwin_asset.sha256" release-darwin/manifest-aarch64-darwin.json release/
           cd release
 
           digest_of() { # releases-json asset
@@ -360,3 +359,32 @@ jobs:
 
       - name: Test the downloaded binary
         run: bash tools/bun/test-darwin.sh "$PWD/release"
+
+  darwin-mise-proof:
+    if: needs.release.result == 'success'
+    needs: release
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - name: Install the published release with mise, from GitHub
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mise_version=2026.9.17
+          curl --fail --silent --show-error --location --retry 3 -o mise.tar.gz \
+            "https://github.com/jdx/mise/releases/download/v$mise_version/mise-v$mise_version-macos-arm64.tar.gz"
+          echo "63deaba3321800014feb6a92f1fed38680edf8deccbe972beebcdae7b67f3172  mise.tar.gz" | shasum -a 256 -c
+          tar -xzf mise.tar.gz
+          tag=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 50 --json tagName,targetCommitish \
+            --jq "map(select(.tagName | startswith(\"bun-\")) | select(.targetCommitish == \"$GITHUB_SHA\")) | .[0].tagName")
+          test -n "$tag"
+          mkdir proof && cd proof
+          cat > mise.toml <<TOML
+          [tools]
+          "github:$GITHUB_REPOSITORY" = { version = "${tag#bun-}", version_prefix = "bun-", platforms.macos-arm64.asset_pattern = "*-aarch64-darwin.tar.zst" }
+          TOML
+          export MISE_TRUSTED_CONFIG_PATHS="$PWD" MISE_YES=1 MISE_USE_VERSIONS_HOST=0
+          ../mise/bin/mise install
+          revision=$(../mise/bin/mise exec -- bun --revision)
+          printf 'mise installed %s from the release: bun --revision %s\n' "$tag" "$revision" | tee -a "$GITHUB_STEP_SUMMARY"
