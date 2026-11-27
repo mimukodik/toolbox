@@ -106,8 +106,9 @@ lap source
 
 phase 'Build bun for aarch64-darwin'
 cd "$src"
-# CI and GITHUB_ACTIONS would switch the build script to its CI mode.
-env -u CI -u GITHUB_ACTIONS \
+# CI and GITHUB_ACTIONS would switch the build script to its CI mode, and GITHUB_SHA (the toolbox commit)
+# is read before GIT_SHA for the revision string.
+env -u CI -u GITHUB_ACTIONS -u GITHUB_SHA -u BUILDKITE_COMMIT \
   BUN_TEST_INPUT_BUILD_ID="$build_id" \
   BUN_TOOLCHAIN_LLVM="$tools/llvm" \
   BUN_TOOLCHAIN_RUST="$rust_sysroot" \
